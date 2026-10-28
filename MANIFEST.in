@@ -1,0 +1,19 @@
+include pyproject.toml MANIFEST.in README.md LICENSE
+include docs/development.md docs/desktop-review-workflow.md docs/command-line.md
+include boss_architecture_resources/__init__.py
+include boss_architecture_resources/_build.py
+recursive-include tests test_*.py
+
+# These are the only publishable configuration/prompt sources.  The build
+# command also applies an explicit allowlist to the complete source archive.
+prune config
+include config/architecture_collection.json
+prune prompts
+include prompts/jd_semantic_review.md
+prune job-result
+prune results
+prune chrome-profile
+prune edge-profile
+prune build
+prune dist
+global-exclude __pycache__ *.py[cod] *.log .env

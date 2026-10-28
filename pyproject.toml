@@ -1,0 +1,51 @@
+[project]
+name = "boss-architecture-collector"
+version = "0.1.0"
+description = "Configurable, resumable BOSS architecture-job collection orchestrator"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = ["tomli>=2; python_version < '3.11'"]
+
+[project.scripts]
+boss-architecture-collect = "collect_architecture:main"
+boss-architecture-process = "process_architecture:main"
+boss-architecture-desktop = "desktop_app:main"
+
+[tool.setuptools]
+packages = ["boss_architecture_resources"]
+py-modules = [
+    "browser_setup",
+    "collect_architecture",
+    "collection_plan",
+    "collection_sources",
+    "desktop_app",
+    "desktop_collection",
+    "desktop_data",
+    "desktop_preferences",
+    "desktop_review_ui",
+    "desktop_routing",
+    "desktop_tasks",
+    "desktop_theme",
+    "desktop_tk_lifecycle",
+    "desktop_ui",
+    "jd_parallel",
+    "llm_client",
+    "process_architecture",
+    "project_llm_settings",
+    "project_resources",
+    "rescreen_saved_run",
+    "review_cache",
+    "review_pipeline",
+    "review_rules",
+    "screening_policy",
+]
+include-package-data = false
+
+[tool.setuptools.cmdclass]
+build_py = "boss_architecture_resources._build.BuildPy"
+sdist = "boss_architecture_resources._build.Sdist"
+
+[build-system]
+# This release includes bdist_wheel; offline builds need no separate wheel package.
+requires = ["setuptools>=70.1"]
+build-backend = "setuptools.build_meta"

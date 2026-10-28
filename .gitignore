@@ -1,0 +1,51 @@
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Generated build and coverage artifacts
+build/
+dist/
+*.egg-info/
+.coverage
+.coverage.*
+htmlcov/
+ci-artifacts/
+
+# Local browser state and secrets
+chrome-profile/
+edge-profile/
+.env
+.env.*
+!.env.example
+.codex/
+.boss-zhipin-scraper/
+auth.json
+llm-provider.json
+desktop-settings.json
+cookies*.json
+
+# Collection outputs can contain personal/job data and are intentionally local
+job-result/
+results/
+/raw/
+/prepared/
+/runs/
+/review-tasks/
+/runtime/
+/logs/
+/collection-plans/
+/review-source-catalogs/
+*.log
+*.sqlite
+*.sqlite3
+*.db
+*.partial.json
+*.corrupt
+
+# Only the shipped default belongs in Git; personal configuration stays local.
+/config/*
+!/config/architecture_collection.json

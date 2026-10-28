@@ -1,0 +1,53 @@
+{
+  "schema_version": "1.0",
+  "degree": {
+    "id": "203",
+    "name": "本科"
+  },
+  "cities": [
+    {"id": "shanghai", "name": "上海"},
+    {"id": "shenzhen", "name": "深圳"},
+    {"id": "hangzhou", "name": "杭州"},
+    {"id": "guangzhou", "name": "广州"},
+    {"id": "chengdu", "name": "成都"}
+  ],
+  "salaries": [
+    {"id": "10_20", "label": "10-20K", "code": "405"},
+    {"id": "20_50", "label": "20-50K", "code": "406"}
+  ],
+  "current": {
+    "keywords": [
+      {"id": "solarch", "query": "AI解决方案架构师"},
+      {"id": "apparch", "query": "AI应用架构师"},
+      {"id": "llmarch", "query": "大模型应用架构师"},
+      {"id": "soleng", "query": "AI解决方案工程师"},
+      {"id": "presales", "query": "AI售前解决方案"},
+      {"id": "prodarch", "query": "AI产品架构师"},
+      {"id": "prodmanager", "query": "AI产品经理"},
+      {"id": "fde", "query": "FDE"},
+      {"id": "aiarch", "query": "AI架构师"},
+      {"id": "agentarch", "query": "智能体架构师"},
+      {"id": "solconsult", "query": "解决方案顾问"}
+    ],
+    "experiences": [
+      {"id": "unlimited", "label": "经验不限", "code": "101"},
+      {"id": "fresh", "label": "应届", "code": "102"},
+      {"id": "under1", "label": "1年以内", "code": "103"},
+      {"id": "1_3", "label": "1-3年", "code": "104"}
+    ]
+  },
+  "target": {
+    "keywords": [
+      {"id": "solarch", "query": "AI解决方案架构师"},
+      {"id": "apparch", "query": "AI应用架构师"},
+      {"id": "llmarch", "query": "大模型应用架构师"},
+      {"id": "aiarch", "query": "AI架构师"},
+      {"id": "agentarch", "query": "智能体架构师"},
+      {"id": "solconsult", "query": "解决方案顾问"}
+    ],
+    "experiences": [
+      {"id": "3_5", "label": "3-5年", "code": "105"},
+      {"id": "5_10", "label": "5-10年", "code": "106"}
+    ]
+  }
+}
