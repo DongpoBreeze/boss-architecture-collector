@@ -1074,6 +1074,57 @@ class ReviewTkTests(unittest.TestCase):
             self.assertNotIn("visible-only-test-key", app._model_config_status.get())
             self.assertEqual(self.calls, [], "configuration checks must not run a review stage")
 
+    def test_responses_stream_setting_reaches_connection_and_survives_save(self):
+        app = self.app
+        app._select_stage("llm")
+        app.model_config_button.invoke()
+        dialog = app._model_config_dialog
+        variables = app._model_config_vars
+        variables["base_url"].set("https://responses-provider.example/v1")
+        variables["model"].set("fixture-responses-model")
+        variables["reasoning_effort"].set("high")
+        variables["api_key"].set("fixture-responses-key")
+        self.assertEqual(variables["api_mode"].get(), "Responses API")
+        widgets = list(dialog.winfo_children())
+        stream_check = None
+        while widgets:
+            widget = widgets.pop()
+            widgets.extend(widget.winfo_children())
+            if isinstance(widget, ui.ttk.Checkbutton) and widget.cget("text") == "使用流式响应":
+                stream_check = widget
+                break
+        self.assertIsNotNone(stream_check)
+        self.assertFalse(stream_check.instate(["disabled"]))
+        stream_check.invoke()
+        self.assertTrue(variables["chat_stream"].get())
+        client = Mock()
+        with patch.object(ui, "CodexResponsesClient", return_value=client) as factory:
+            app._run_model_config_check(dialog, "connection")
+            self.wait_model_check()
+            requested = factory.call_args.args[0]
+            self.assertEqual(requested["api_mode"], "responses")
+            self.assertTrue(requested["chat_stream"])
+            self.assertEqual(requested["timeout"], 120)
+            client.test_connection.assert_called_once_with(
+                model="fixture-responses-model", reasoning_effort="high",
+            )
+        app._model_config_buttons["save"].invoke()
+        saved = project_llm_settings.load_settings()
+        self.assertEqual(saved["api_mode"], "responses")
+        self.assertTrue(saved["chat_stream"])
+        self.assertEqual(saved["model"], "fixture-responses-model")
+        self.assertEqual(saved["reasoning_effort"], "high")
+        self.assertIn("流式", app.model_config_label.cget("text"))
+        self.assertNotIn("非流式", app.model_config_label.cget("text"))
+        self.assertEqual(self.calls, [], "configuration changes must not run a review stage")
+        app.model_config_button.invoke()
+        variables = app._model_config_vars
+        self.assertEqual(variables["api_mode"].get(), "Responses API")
+        self.assertTrue(variables["chat_stream"].get())
+        for protocol in ("Chat Completions", "Responses API"):
+            variables["api_mode"].set(protocol)
+            self.assertTrue(variables["chat_stream"].get())
+
     def test_chat_protocol_selection_tests_and_saves_without_starting_review(self):
         app = self.app
         app._select_stage("llm")

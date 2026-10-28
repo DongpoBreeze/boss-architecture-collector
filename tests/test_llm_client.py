@@ -66,6 +66,14 @@ def chat_sse(*chunks, done=True):
     return "".join(events).encode("utf-8")
 
 
+def responses_sse(*chunks, done=False):
+    events = ["event: " + chunk["type"] + "\ndata: " + json.dumps(chunk, ensure_ascii=False) + "\n\n"
+              for chunk in chunks]
+    if done:
+        events.append("data: [DONE]\n\n")
+    return "".join(events).encode("utf-8")
+
+
 def review_result(job_id="job-1"):
     """A complete, deliberately uncertain review accepted by the wire schema."""
     return {
@@ -834,9 +842,13 @@ class DefaultTransportTests(unittest.TestCase):
                     result = {"判断": "符合", "理由": "离线复核。"}
                     if stream:
                         headers["Content-Type"] = "text/event-stream"
-                        raw = chat_sse({"choices": [{"index": 0, "delta": {
-                            "role": "assistant", "content": json.dumps(result, ensure_ascii=False),
-                        }, "finish_reason": "stop"}]})
+                        if mode == API_MODE_RESPONSES:
+                            raw = responses_sse({"type": "response.completed",
+                                                 "response": review_envelope(mode, result)})
+                        else:
+                            raw = chat_sse({"choices": [{"index": 0, "delta": {
+                                "role": "assistant", "content": json.dumps(result, ensure_ascii=False),
+                            }, "finish_reason": "stop"}]})
                     else:
                         raw = json.dumps(review_envelope(mode, result), ensure_ascii=False).encode("utf-8")
                 response = urllib.response.addinfourl(io.BytesIO(raw), headers, request.full_url,
@@ -901,8 +913,9 @@ class DefaultTransportTests(unittest.TestCase):
                 self.assertEqual(len(requests), 1)
                 self.assertTrue(all(response.closed for response in responses))
 
-    def test_default_transport_still_accepts_each_api_and_chat_stream(self):
-        for mode, stream in ((API_MODE_RESPONSES, False), (API_MODE_CHAT_COMPLETIONS, False),
+    def test_default_transport_still_accepts_each_api_and_stream(self):
+        for mode, stream in ((API_MODE_RESPONSES, False), (API_MODE_RESPONSES, True),
+                             (API_MODE_CHAT_COMPLETIONS, False),
                              (API_MODE_CHAT_COMPLETIONS, True)):
             for operation in self.operations(mode):
                 with self.subTest(mode=mode, stream=stream, operation=operation):
@@ -1439,6 +1452,11 @@ class LLMClientTests(unittest.TestCase):
             {"status": "incomplete", "output_text": ""},
             {"error": {"message": "private-token"}},
             {"object": "unexpected"},
+            {"status": "completed"},
+            {"status": "completed", "output": []},
+            {"status": "completed", "output_text": "  "},
+            {"status": "completed", "output_text": "OK",
+             "incomplete_details": {"reason": "max_output_tokens"}},
         ):
             client = CodexResponsesClient(
                 {"base_url": "https://provider.test/v1", "api_key": "private-token", "max_retries": 0},
@@ -1985,6 +2003,310 @@ class LLMClientTests(unittest.TestCase):
         )
         with self.assertRaises(ConfigurationError):
             client._request({"model": "x", "input": "x"})
+
+
+class ResponsesStreamingTests(unittest.TestCase):
+    result = {"判断": "符合", "理由": "负责AI应用方案与交付。"}
+    private = "fixture-only-private-provider-data"
+
+    @classmethod
+    def envelope(cls, text=None):
+        return {
+            "id": "fixture-response", "status": "completed", "error": None,
+            "incomplete_details": None,
+            "output": [{"id": "fixture-message", "type": "message", "role": "assistant",
+                        "status": "completed", "content": [{"type": "output_text", "text": (
+                            json.dumps(cls.result, ensure_ascii=False) if text is None else text),
+                            "annotations": []}]}],
+        }
+
+    @classmethod
+    def complete(cls, response=None, *, done=False):
+        return responses_sse({"type": "response.completed",
+                              "response": cls.envelope() if response is None else response}, done=done)
+
+    def client(self, transport, **kwargs):
+        return CodexResponsesClient(
+            {"model": "fixture-model", "reasoning_effort": "high", "api_mode": API_MODE_RESPONSES,
+             "base_url": "https://provider.invalid/v1", "api_key": "fixture-only-key",
+             "chat_stream": True, "max_retries": 3, "backoff_factor": 0},
+            transport=transport, **kwargs,
+        )
+
+    def test_stream_flag_reaches_review_and_probe_preserving_the_legacy_payload(self):
+        for operation in ("review_job", "test_connection"):
+            bodies = []
+            for stream in (False, True):
+                requests = []
+                response = self.envelope() if operation == "review_job" else self.envelope("OK")
+                client = self.client(lambda request, timeout: (
+                    requests.append(request) or FakeResponse(self.complete(response) if stream else response)),
+                    chat_stream=stream)
+                value = (client.review_job("JD", prompt="Return JSON") if operation == "review_job"
+                         else client.test_connection())
+                self.assertEqual(value, self.result if operation == "review_job" else True)
+                self.assertEqual(len(requests), 1)
+                request = requests[0]
+                self.assertEqual(request.full_url, "https://provider.invalid/v1/responses")
+                self.assertEqual(request.get_header("Accept"), "text/event-stream" if stream else "application/json")
+                body = json.loads(request.data)
+                if stream:
+                    self.assertIs(body.pop("stream"), True)
+                else:
+                    self.assertNotIn("stream", body)
+                self.assertEqual(body["reasoning"], {"effort": "high"})
+                self.assertIs(body["store"], False)
+                self.assertNotIn("messages", body)
+                self.assertNotIn("reasoning_effort", body)
+                bodies.append(body)
+            self.assertEqual(bodies[0], bodies[1])
+
+    def test_public_request_entry_point_does_not_mutate_its_caller_or_models_request(self):
+        requests = []
+        client = self.client(lambda request, timeout: requests.append(request) or FakeResponse(
+            {"data": [{"id": "fixture-model"}]} if request.get_method() == "GET" else self.complete()))
+        body = {"model": "fixture-model", "input": "JD", "store": False}
+        before = dict(body)
+        self.assertEqual(client._request(body)["id"], "fixture-response")
+        self.assertEqual(body, before)
+        self.assertTrue(json.loads(requests[0].data)["stream"])
+        self.assertEqual(client.list_models(), ["fixture-model"])
+        self.assertEqual(requests[1].full_url, "https://provider.invalid/v1/models")
+        self.assertIsNone(requests[1].data)
+        self.assertEqual(requests[1].get_header("Accept"), "application/json")
+
+    def test_sse_final_response_is_authoritative_and_reasoning_never_enters_results_or_history(self):
+        final = self.envelope()
+        final["output"].insert(0, {"id": "fixture-reasoning", "type": "reasoning", "status": "completed",
+                                    "summary": [{"type": "summary_text", "text": self.private}]})
+        events = (
+            {"type": "response.created", "response": {"id": "fixture-response", "status": "in_progress",
+                                                       "output": []}},
+            {"type": "response.output_item.added", "output_index": 0, "item": {
+                "id": "fixture-message", "type": "message", "status": "in_progress",
+                "role": "assistant", "content": []}},
+            {"type": "response.content_part.added", "part": {"type": "output_text", "text": ""}},
+            {"type": "response.reasoning_summary_text.delta", "delta": self.private},
+            {"type": "response.output_text.delta", "delta": "partial text must not become final JSON"},
+            {"type": "response.output_text.done", "text": '{"判断":"不符合","理由":"obsolete partial"}'},
+            {"type": "response.completed", "response": final},
+        )
+        for done, headers in product((False, True), ({}, {"Content-Type": "text/event-stream; charset=utf-8"})):
+            with self.subTest(done=done, headers=headers):
+                raw = (b"\xef\xbb\xbf: heartbeat\n\nid: fixture\nretry: 1000\n" + responses_sse(*events, done=done))
+                raw = raw.replace(b"\n", b"\r\n")
+                requests = []
+                state = {}
+                client = self.client(lambda request, timeout: requests.append(request) or FakeResponse(raw, headers=headers))
+                value = client.review_job({"job_id": "fixture-job"}, prompt="Return JSON", conversation=state)
+                self.assertEqual(simple_review_payload(value), self.result)
+                self.assertEqual(state["previous_response_id"], "fixture-response")
+                self.assertNotIn(self.private, json.dumps(value, ensure_ascii=False) + json.dumps(state, ensure_ascii=False))
+                self.assertEqual(len(requests), 1)
+                self.assertEqual(json.loads(requests[0].data)["store"], True)
+
+    def test_provider_metadata_is_advisory_and_never_a_completion_signal(self):
+        metadata = {"type": "response.metadata", "metadata": {"provider_note": self.private}}
+        client = self.client(lambda request, timeout: FakeResponse(responses_sse(
+            metadata, {"type": "response.completed", "response": self.envelope()})))
+        self.assertEqual(client.review_job("JD", prompt="Return JSON"), self.result)
+        for payload in (
+            responses_sse(metadata),
+            responses_sse(metadata, done=True),
+            self.complete() + responses_sse(metadata),
+            responses_sse({"type": "response.unknown_advisory"}) + self.complete(),
+            *[responses_sse({**metadata, **failure}) + self.complete() for failure in (
+                {"error": {"message": self.private}}, {"status": "incomplete"},
+                {"incomplete_details": {"reason": "max_output_tokens"}},
+                {"refusal": self.private}, {"tool_calls": [self.private]},
+                {"function_call": {"name": self.private}},
+            )],
+        ):
+            with self.subTest(payload=payload), self.assertRaises(LLMRequestError) as raised:
+                self.client(lambda request, timeout: FakeResponse(payload)).test_connection()
+            self.assertNotIn(self.private, "".join(traceback.format_exception(raised.exception)))
+
+    def test_explicit_final_answer_excludes_progress_reasoning_and_convenience_text(self):
+        for phase in (None, "commentary"):
+            final = self.envelope()
+            final["output"][0]["phase"] = "final_answer"
+            progress = {"id": "fixture-progress", "type": "message", "role": "assistant",
+                        "status": "completed", "content": [{"type": "output_text", "text": self.private}]}
+            if phase is not None:
+                progress["phase"] = phase
+            final["output"].insert(0, progress)
+            final["output"].insert(1, {"type": "reasoning", "summary": [{
+                "type": "summary_text", "text": self.private}]})
+            final["output_text"] = self.private + json.dumps(self.result)
+            requests = []
+            state = {}
+            client = self.client(lambda request, timeout: requests.append(request) or FakeResponse(self.complete(final)))
+            self.assertEqual(simple_review_payload(client.review_job(
+                "JD", prompt="Return JSON", conversation=state)), self.result)
+            self.assertEqual(len(requests), 1, "progress text must not cause a billable format correction")
+            self.assertNotIn(self.private, json.dumps(state))
+        final = self.envelope()
+        final["output"][0]["phase"] = "commentary"
+        final["output_text"] = json.dumps(self.result)
+        with self.assertRaises(LLMRequestError):
+            self.client(lambda request, timeout: FakeResponse(self.complete(final))).test_connection()
+
+    def test_data_only_and_standard_multiline_events_accept_completed_text(self):
+        chunk = {"type": "response.completed", "response": self.envelope()}
+        data_only = ("data: " + json.dumps(chunk, ensure_ascii=False) + "\n\n").encode("utf-8")
+        multiline = ("event: response.completed\n" + "\n".join(
+            "data: " + line for line in json.dumps(chunk, ensure_ascii=False, indent=2).splitlines()) + "\n\n").encode("utf-8")
+        for raw in (data_only, multiline):
+            with self.subTest(raw=raw):
+                self.assertEqual(self.client(lambda request, timeout: FakeResponse(raw)).review_job(
+                    "JD", prompt="Return JSON"), self.result)
+
+    def test_unicode_line_separators_inside_json_are_not_sse_frame_boundaries(self):
+        result = {"判断": "符合", "理由": "中文前段\u2028中段\u2029后段\u0085末段"}
+        payload = self.complete(self.envelope(json.dumps(result, ensure_ascii=False)))
+        for delimiter in (b"\n", b"\r\n", b"\r"):
+            with self.subTest(delimiter=delimiter):
+                raw = payload.replace(b"\n", delimiter)
+                value = self.client(lambda request, timeout: FakeResponse(raw)).review_job("JD", prompt="Return JSON")
+                self.assertEqual(value, result)
+
+    def test_incomplete_errors_refusals_tools_and_corruption_never_promote_partial_text(self):
+        prefix = responses_sse({"type": "response.output_text.delta", "delta": json.dumps(self.result)})
+        streams = [
+            b"", b"data: [DONE]\n\n", prefix,
+            responses_sse({"type": "response.output_text.done", "text": json.dumps(self.result)}),
+            responses_sse({"type": "response.created", "response": {"status": "in_progress"}}),
+            b"event: response.completed\n\n", b"data: []\n\n", b"data: null\n\n",
+            b"data: {private}\n\n", b"data: \xff\n\n", b"private\n\n",
+            self.complete() + b"data: {private}\n\n", self.complete() + self.complete(),
+            self.complete(done=True) + b"data: [DONE]\n\n",
+            self.complete(done=True) + prefix,
+            b"event: response.failed\ndata: " + json.dumps({
+                "type": "response.completed", "response": self.envelope()}).encode("utf-8") + b"\n\n",
+            responses_sse({"type": "response.completed", "response": None}),
+            responses_sse({"type": "response.output_text.delta", "delta": []}) + self.complete(),
+            responses_sse({"type": "response.output_item.done", "item": []}) + self.complete(),
+            responses_sse({"type": "response.content_part.added", "part": {"type": "refusal", "refusal": self.private}})
+            + self.complete(),
+            responses_sse({"type": "response.output_item.added", "item": {
+                "type": "function_call", "arguments": self.private}}) + self.complete(),
+            responses_sse({"type": "response.created", "response": {
+                "id": "fixture-other-response", "status": "in_progress"}}) + self.complete(),
+            chat_sse({"choices": [{"delta": {"content": "{}"}, "finish_reason": "stop"}]}),
+        ]
+        for kind in ("error", "response.failed", "response.incomplete", "response.cancelled",
+                     "response.refusal.delta", "response.refusal.done", "response.function_call_arguments.delta",
+                     "response.web_search_call.completed", "response.content_filter.done"):
+            streams.append(prefix + responses_sse({"type": kind, "message": self.private,
+                                                  "delta": self.private}) + self.complete())
+        for change in (
+            {"status": None}, {"status": "in_progress"}, {"status": "failed"}, {"status": "incomplete"},
+            {"error": {"message": self.private}}, {"incomplete_details": {"reason": "max_output_tokens"}},
+            {"refusal": self.private}, {"tool_calls": [{"id": self.private}]},
+            {"choices": []}, {"output": []}, {"output": None}, {"output": self.private},
+            {"output": [self.private]}, {"output_text": "", "output": []},
+            {"output": [{"type": "reasoning", "text": json.dumps(self.result)}]},
+            {"output": [{"type": "reasoning", "content": [{"text": json.dumps(self.result)}]}]},
+            {"output": [{"type": "function_call", "arguments": self.private}], "output_text": json.dumps(self.result)},
+            {"output": [{"type": "message", "status": "incomplete", "content": []}],
+             "output_text": json.dumps(self.result)},
+            {"output": [{"type": "message", "role": "user", "content": []}]},
+            {"output": [{"type": "message", "content": [{"type": "refusal", "refusal": self.private}]}],
+             "output_text": json.dumps(self.result)},
+            {"output": [{"type": "message", "content": [{"type": "output_text", "text": 0}]}]},
+        ):
+            streams.append(self.complete({**self.envelope(), **change}))
+        for payload, operation in product(streams, ("review_job", "test_connection")):
+            with self.subTest(payload=payload, operation=operation):
+                requests = []
+                state = {"previous_response_id": "fixture-committed-id", "messages": [{
+                    "role": "assistant", "content": "fixture-committed-result"}]}
+                before = json.dumps(state, sort_keys=True)
+                client = self.client(lambda request, timeout: requests.append(request) or FakeResponse(
+                    payload, headers={"content-type": "text/event-stream"}))
+                with patch("llm_client.time.sleep") as sleep, self.assertRaises(LLMRequestError) as caught:
+                    if operation == "review_job":
+                        client.review_job("JD", prompt="Return JSON", conversation=state)
+                    else:
+                        client.test_connection()
+                self.assertEqual(len(requests), 1, "bad streams must not trigger a new billable or format request")
+                self.assertEqual(json.dumps(state, sort_keys=True), before)
+                self.assertNotIn(self.private, "".join(traceback.format_exception(caught.exception)))
+                sleep.assert_not_called()
+
+    def test_format_correction_uses_streaming_and_preserves_semantic_validation(self):
+        for first_text in ("not-json-" + self.private, "{}"):
+            with self.subTest(first_text=first_text):
+                requests = []
+
+                def transport(request, timeout):
+                    requests.append(request)
+                    return FakeResponse(self.complete(self.envelope(first_text) if len(requests) == 1 else None))
+
+                value = self.client(transport).review_job({"job_id": "fixture-job"}, prompt="Return JSON")
+                self.assertEqual(simple_review_payload(value), self.result)
+                self.assertEqual(value["_format_repair_attempts"], 1)
+                self.assertEqual(len(requests), 2)
+                for request in requests:
+                    body = json.loads(request.data)
+                    self.assertTrue(body["stream"])
+                    self.assertFalse(body["store"])
+                    self.assertNotIn("previous_response_id", body)
+                    self.assertEqual(request.get_header("Accept"), "text/event-stream")
+                    self.assertNotIn(self.private, request.data.decode("utf-8"))
+        requests = []
+        client = self.client(lambda request, timeout: requests.append(request) or FakeResponse(
+            self.complete(self.envelope("{}"))))
+        with self.assertRaises(JsonSchemaValidationError):
+            client.review_job("JD", prompt="Return JSON")
+        self.assertEqual(len(requests), 2)
+
+    def test_streaming_http_failures_keep_existing_retry_and_probe_policies(self):
+        for operation, failure, expected, count in (
+            ("review_job", 403, LLMHTTPError, 1),
+            ("test_connection", 429, LLMRateLimitError, 1),
+            ("test_connection", 503, LLMServerError, 1),
+        ):
+            with self.subTest(operation=operation, status=failure):
+                requests = []
+                client = self.client(lambda request, timeout: requests.append(request) or FakeResponse(
+                    {"error": self.private}, status=failure))
+                with self.assertRaises(expected) as caught:
+                    (client.review_job("JD", prompt="Return JSON") if operation == "review_job"
+                     else client.test_connection())
+                self.assertEqual(caught.exception.status_code, failure)
+                self.assertEqual(len(requests), count)
+                self.assertNotIn(self.private, "".join(traceback.format_exception(caught.exception)))
+        for status in (429, 503):
+            with self.subTest(retry_status=status):
+                requests = []
+
+                def transport(request, timeout):
+                    requests.append(request)
+                    return (FakeResponse({"error": self.private}, status=status) if len(requests) == 1
+                            else FakeResponse(self.complete()))
+
+                with patch("llm_client.time.sleep") as sleep:
+                    self.assertEqual(self.client(transport).review_job("JD", prompt="Return JSON"), self.result)
+                self.assertEqual(len(requests), 2)
+                self.assertEqual(sleep.call_count, 1)
+                self.assertTrue(all(json.loads(request.data)["stream"] for request in requests))
+
+    def test_interrupted_reads_close_the_response_and_cannot_commit_a_partial_result(self):
+        for failure in (http.client.IncompleteRead(b"partial JSON"), ConnectionResetError(self.private)):
+            with self.subTest(failure=type(failure).__name__):
+                response = FakeResponse({})
+                response.read = lambda: (_ for _ in ()).throw(failure)
+                response.close = lambda: setattr(response, "closed", True)
+                requests = []
+                state = {}
+                client = self.client(lambda request, timeout: requests.append(request) or response)
+                with self.assertRaises(LLMRequestError) as caught:
+                    client.review_job("JD", prompt="Return JSON", conversation=state)
+                self.assertEqual(state, {})
+                self.assertEqual(len(requests), 1)
+                self.assertTrue(response.closed)
+                self.assertNotIn(self.private, "".join(traceback.format_exception(caught.exception)))
 
 
 if __name__ == "__main__":

@@ -108,9 +108,13 @@ AI 页面“AI 并发（每岗独立）”控制同时复核的岗位数。每�
 
 每岗单独校验并保存检查点；普通继续跳过输入和配置仍有效的成功结果，只处理未完成岗位。恢复独立请求不删除已有结果，也不改变筛选规则、模型配置或人工名单。正在运行的旧进程不会热切换；暂停或停止并保存后，重启程序再继续本步即可使用独立请求。
 
+检查点先写独立临时文件，再原子发布；Windows 上界面读取等短暂文件占用只作有界退避，不截断上一次完整文件。工作线程收到本岗检查点保存确认后才处理下一岗。保存或结果消费发生不可恢复异常时，处理器发布脱敏失败状态并停止后续岗位；桌面监控据此结束本次自有请求进程，阶段显示失败并保留已发布结果，不允许确认成已完成。排除故障后使用“继续本步”复用成功检查点；“重置本阶段”会清空当前阶段，不能用来恢复本次断点。
+
 CLI 和 PowerShell 包装器也默认每岗独立（`--conversation-size 1` / `-ConversationSize 1`）；多岗会话参数仅保留为显式兼容选项，桌面始终传入 1。缓存签名仍代表当前岗位逻辑输入。详见[命令行参考](command-line.md)。
 
-GUI AI 并发 `workers` 默认 10（1–32），与 JD 并发独立；模型初始默认 `gpt-5.6-luna`、思考强度 `max`。AI 页面“修改模型配置”可编辑服务地址、API 协议、模型、强度和 API Key；API Key 使用 Windows Credential Manager，不改全局 Codex 设置。API 协议默认“Responses API”，旧配置缺少 `api_mode` 时也按 Responses 处理；服务仅提供 Chat 接口时可选择“Chat Completions”。Chat 使用 `/chat/completions`、`messages`，可勾选“Chat 使用流式响应”，不发送 Responses 的 `input`、`reasoning`、`store` 字段。Chat 强度可选，默认显示“未验证，不发送”；验证并保存后才发送顶层 `reasoning_effort`。CLI 使用项目配置，也可显式覆盖，见[命令行参考](command-line.md)。默认模型与强度统一定义于 `screening_policy.py`，实际请求与缓存提供方签名必须使用同一组配置。
+GUI AI 并发 `workers` 默认 10（1–32），与 JD 并发独立；模型初始默认 `gpt-5.6-luna`、思考强度 `max`。AI 页面“修改模型配置”可编辑服务地址、API 协议、模型、强度和 API Key；API Key 使用 Windows Credential Manager，不改全局 Codex 设置。API 协议默认“Responses API”，旧配置缺少 `api_mode` 时也按 Responses 处理；服务仅提供 Chat 接口时可选择“Chat Completions”。两种协议均可勾选“使用流式响应”，无需因流式要求切换协议。Chat 使用 `/chat/completions`、`messages`，不发送 Responses 的 `input`、`reasoning`、`store` 字段。Chat 强度可选，默认显示“未验证，不发送”；验证并保存后才发送顶层 `reasoning_effort`。CLI 使用项目配置，也可显式覆盖，见[命令行参考](command-line.md)。默认模型与强度统一定义于 `screening_policy.py`，实际请求与缓存提供方签名必须使用同一组配置。
+
+流式请求使用 SSE；Responses 必须收到 `response.completed` 内的完整成功响应，再校验最终岗位 JSON。仅收到文本片段、正文结束事件或 `[DONE]`，以及失败、未完成或异常断流，均不算复核成功。Chat 继续要求完成片段和 `[DONE]`。分类名单在每个岗位完整校验并落盘后更新，不把逐字片段显示为最终判断。协议事件参考 [官方 Responses 流式文档](https://developers.openai.com/api/docs/guides/streaming-responses)。
 
 配置窗口中先选协议、填入地址及密钥，可点“读取模型”查询 `/models`，也可手动输入模型名。两种协议共用模型列表接口；读取列表和普通连接成功都不启用思考强度。“测试连接”使用当前表单和有效参数发送短请求；未验证 Chat 输出上限 `max_tokens=16`，已验证 Chat 和“验证思考强度”使用 `1024` 给思考输出留空间。两种测试均不自动重试，可能产生少量用量。强度验证必须完整返回非空最终文本；HTTP 200、仅有思考内容、截断、错误或中断都不算成功。验证只确认参数被接受和响应完成，不能证明服务内部思考预算。修改地址、模型、强度、流式或密钥后需重新验证；验证期间改表单不能为新值授权。点“保存配置”后才生效，不运行复核或改写报告。[官方 Chat Completions 文档](https://developers.openai.com/api/docs/api-reference/chat/create)描述了消息和响应字段，具体服务的兼容范围仍以服务方支持为准。
 

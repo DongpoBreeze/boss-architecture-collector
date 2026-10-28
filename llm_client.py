@@ -115,13 +115,14 @@ class CodexConfig(Mapping[str, Any]):
     requires_auth: bool = True
     api_mode: str = API_MODE_RESPONSES
     chat_reasoning_verified_for: str = ""
+    # Preserve the persisted key while sharing the option across protocols.
     chat_stream: bool = False
 
     def __post_init__(self) -> None:
         # Dataclass callers and mapping callers receive the same validation.
         object.__setattr__(self, "api_mode", _normalize_api_mode(self.api_mode))
         if not isinstance(self.chat_stream, bool):
-            raise ConfigurationError("Chat 流式响应设置必须是布尔值")
+            raise ConfigurationError("流式响应设置必须是布尔值")
 
     def __getitem__(self, key: str) -> Any:
         if key == "api_key":
@@ -1225,6 +1226,174 @@ class CodexResponsesClient:
         return result
 
     @staticmethod
+    def _decode_responses_event_stream(raw: bytes) -> dict[str, Any]:
+        """Require a complete Responses envelope; never synthesize it from deltas.
+
+        Responses uses response.completed as its terminal success event. Chat's
+        optional gateway [DONE] marker cannot substitute for that response.
+        Reasoning is ignored, and provider data never appears in diagnostics.
+        """
+        try:
+            source = raw.decode("utf-8-sig")
+        except UnicodeError:
+            raise LLMRequestError("Responses API 流式响应编码无效") from None
+        completed: dict[str, Any] | None = None
+        response_id: str | None = None
+        done = False
+        data: list[str] = []
+        event = ""
+
+        def validate_output(value: Mapping[str, Any], *, final: bool) -> None:
+            if (value.get("error") is not None or value.get("incomplete_details") is not None
+                    or value.get("refusal") or value.get("tool_calls") or value.get("function_call")
+                    or value.get("status") not in ((None, "completed") if final
+                                                   else (None, "queued", "in_progress", "completed"))):
+                raise LLMRequestError("Responses API 流式响应包含错误或未完成的输出")
+            if value.get("type") not in (None, "message", "reasoning"):
+                raise LLMRequestError("Responses API 流式响应未返回可用的复核文本")
+            if value.get("type") == "reasoning":
+                return
+            if value.get("role") not in (None, "assistant"):
+                raise LLMRequestError("Responses API 流式响应角色无效")
+            content = value.get("content")
+            if content is not None:
+                if not isinstance(content, list):
+                    raise LLMRequestError("Responses API 流式响应文本格式无效")
+                for part in content:
+                    if (not isinstance(part, Mapping) or part.get("type") not in (None, "output_text")
+                            or not isinstance(part.get("text"), str) or part.get("refusal")
+                            or part.get("error") is not None):
+                        raise LLMRequestError("Responses API 流式响应未返回可用的复核文本")
+
+        def validate_response(value: Mapping[str, Any], *, final: bool) -> None:
+            nonlocal response_id
+            if final and value.get("status") != "completed":
+                raise LLMRequestError("Responses API 流式响应未正常完成")
+            validate_output(value, final=final)
+            current_id = value.get("id")
+            if current_id is not None:
+                if not isinstance(current_id, str) or not current_id.strip():
+                    raise LLMRequestError("Responses API 流式响应标识无效")
+                if response_id is not None and current_id != response_id:
+                    raise LLMRequestError("Responses API 流式响应标识不一致")
+                response_id = current_id
+            if "choices" in value:
+                raise LLMRequestError("Responses API 流式响应格式无效")
+            output = value.get("output")
+            if output is not None:
+                if not isinstance(output, list):
+                    raise LLMRequestError("Responses API 流式响应输出格式无效")
+                for item in output:
+                    if not isinstance(item, Mapping):
+                        raise LLMRequestError("Responses API 流式响应输出格式无效")
+                    validate_output(item, final=final)
+
+        def consume() -> None:
+            nonlocal completed, done
+            if not data:
+                if event:
+                    raise LLMRequestError("Responses API 流式响应缺少事件数据")
+                return
+            payload = "\n".join(data)
+            if payload.strip() == "[DONE]":
+                if completed is None or done or event:
+                    raise LLMRequestError("Responses API 流式响应缺少完整完成事件")
+                done = True
+                return
+            if completed is not None or done:
+                raise LLMRequestError("Responses API 流式响应完成后仍有数据")
+            try:
+                chunk = json.loads(payload)
+            except (ValueError, TypeError):
+                raise LLMRequestError("Responses API 流式响应包含无效 JSON") from None
+            if not isinstance(chunk, Mapping):
+                raise LLMRequestError("Responses API 流式响应格式无效")
+            kind = chunk.get("type")
+            if not isinstance(kind, str) or not kind or event and event != kind:
+                raise LLMRequestError("Responses API 流式响应事件类型无效")
+            if (kind in {"error", "response.failed", "response.incomplete", "response.cancelled"}
+                    or chunk.get("error") is not None):
+                raise LLMRequestError("Responses API 流式响应失败或未完成")
+            if kind in {"response.created", "response.queued", "response.in_progress", "response.completed"}:
+                response = chunk.get("response")
+                if not isinstance(response, Mapping):
+                    raise LLMRequestError("Responses API 流式响应缺少响应对象")
+                final = kind == "response.completed"
+                validate_response(response, final=final)
+                if final:
+                    completed = dict(response)
+                    if isinstance(response.get("output"), list):
+                        # Reasoning and commentary are never review answers.
+                        # Some gateways send an unphased progress message before
+                        # an explicitly phased final answer, so the final phase
+                        # must also take precedence over those legacy messages.
+                        items = [item for item in response["output"]
+                                 if item.get("type") != "reasoning"
+                                 and item.get("phase") != "commentary"]
+                        final_items = [item for item in items if item.get("phase") == "final_answer"]
+                        completed["output"] = final_items or items
+                        # A gateway's convenience output_text can concatenate
+                        # progress and final messages. The completed structured
+                        # output is authoritative whenever it is present.
+                        completed.pop("output_text", None)
+                    try:
+                        text = extract_output_text(completed)
+                    except InvalidJsonResponseError:
+                        raise LLMRequestError("Responses API 流式响应缺少最终文本") from None
+                    if not text.strip():
+                        raise LLMRequestError("Responses API 流式响应返回空文本")
+            elif kind in {"response.output_item.added", "response.output_item.done"}:
+                item = chunk.get("item")
+                if not isinstance(item, Mapping):
+                    raise LLMRequestError("Responses API 流式响应缺少输出对象")
+                validate_output(item, final=kind.endswith(".done"))
+            elif kind in {"response.content_part.added", "response.content_part.done"}:
+                part = chunk.get("part")
+                validate_output({"content": [part]}, final=kind.endswith(".done"))
+            elif kind in {"response.output_text.delta", "response.output_text.done"}:
+                if not isinstance(chunk.get("delta" if kind.endswith(".delta") else "text"), str):
+                    raise LLMRequestError("Responses API 流式响应文本格式无效")
+            elif kind == "response.metadata":
+                # Observed compatible-provider advisory event. Its payload is
+                # never output or a terminal signal; a separate fully validated
+                # response.completed envelope is still mandatory. Do not allow
+                # error/incomplete markers to hide in this extension event.
+                if (chunk.get("status") not in (None, "completed")
+                        or chunk.get("incomplete_details") is not None
+                        or chunk.get("refusal") or chunk.get("tool_calls") or chunk.get("function_call")):
+                    raise LLMRequestError("Responses API 流式响应包含错误或未完成的输出")
+            elif kind not in {
+                "response.output_text.annotation.added",
+                "response.reasoning_summary_part.added", "response.reasoning_summary_part.done",
+                "response.reasoning_summary_text.delta", "response.reasoning_summary_text.done",
+                "response.reasoning_text.delta", "response.reasoning_text.done",
+            }:
+                # Refusals, filtering and tool output are never text-review success.
+                raise LLMRequestError("Responses API 流式响应未返回可用的复核文本")
+
+        # SSE line endings are CR/LF only. str.splitlines() would split valid
+        # JSON strings containing U+0085, U+2028 or U+2029 as well.
+        for line in source.replace("\r\n", "\n").replace("\r", "\n").split("\n"):
+            if not line:
+                consume()
+                data = []
+                event = ""
+            elif line.startswith(":"):
+                continue
+            elif line.startswith("data:"):
+                data.append(line[5:].removeprefix(" "))
+            elif line.startswith("event:"):
+                event = line[6:].strip()
+            elif line.startswith(("id:", "retry:")):
+                continue
+            else:
+                raise LLMRequestError("Responses API 流式响应包含无效事件")
+        consume()
+        if completed is None:
+            raise LLMRequestError("Responses API 流式响应中断或缺少完整完成事件")
+        return completed
+
+    @staticmethod
     def _http_error(status: int, operation: str = "Responses API") -> LLMRequestError:
         # Provider bodies, reason phrases and headers can contain credentials
         # or request material.  Report only our own status-specific guidance.
@@ -1275,11 +1444,15 @@ class CodexResponsesClient:
                         close()
                 if status >= 400:
                     raise self._http_error(status, operation)
-                if self.config.api_mode == API_MODE_CHAT_COMPLETIONS and (
+                if operation != "Models API" and (
                     "text/event-stream" in str(content_type).lower()
-                    or raw.removeprefix(b"\xef\xbb\xbf").lstrip().startswith(b"data:")
+                    or raw.removeprefix(b"\xef\xbb\xbf").lstrip().startswith(
+                        (b"data:", b"event:", b":", b"id:", b"retry:")
+                    )
                 ):
-                    return self._decode_chat_event_stream(raw)
+                    if self.config.api_mode == API_MODE_CHAT_COMPLETIONS:
+                        return self._decode_chat_event_stream(raw)
+                    return self._decode_responses_event_stream(raw)
                 try:
                     decoded = json.loads(raw.decode("utf-8-sig"))
                 except (UnicodeDecodeError, json.JSONDecodeError) as exc:
@@ -1326,9 +1499,13 @@ class CodexResponsesClient:
         return headers
 
     def _request(self, body: Mapping[str, Any], *, max_retries: int | None = None) -> dict[str, Any]:
+        if self.config.api_mode == API_MODE_RESPONSES and self.config.chat_stream:
+            # All review/correction/probe paths share this entry point. Preserve
+            # the legacy non-streaming envelope and the caller's original body.
+            body = {**body, "stream": True}
         encoded = json.dumps(body, ensure_ascii=False).encode("utf-8")
         headers = self._headers(json_body=True)
-        if self.config.api_mode == API_MODE_CHAT_COMPLETIONS and body.get("stream") is True:
+        if body.get("stream") is True:
             headers["Accept"] = "text/event-stream"
         request = urllib.request.Request(
             self.config.endpoint, data=encoded, headers=headers, method="POST"
@@ -1393,8 +1570,12 @@ class CodexResponsesClient:
             response_status is not None and response_status != "completed"
         ):
             raise LLMRequestError("Responses API 已连接，但模型未能完成测试请求")
-        if response_status is None and not (response.get("output_text") or response.get("output")):
-            raise LLMRequestError("Responses API 返回格式不完整，无法确认模型已完成测试请求")
+        try:
+            output = extract_output_text(response)
+        except InvalidJsonResponseError:
+            raise LLMRequestError("Responses API 已连接，但模型未能完成测试请求") from None
+        if not output.strip():
+            raise LLMRequestError("Responses API 返回空文本，无法确认模型已完成测试请求")
         return True
 
     @staticmethod

@@ -49,6 +49,10 @@ class PipelineError(RuntimeError):
     """An actionable, credential-free execution error."""
 
 
+class _AIWorkerFailed(PipelineError):
+    """Stop this run's owned child after a fatal processor checkpoint."""
+
+
 class _Interrupted(Exception):
     pass
 
@@ -501,6 +505,11 @@ def _run_child(task: ReviewTask | None, stage: str, command: list[str], control:
                 else:
                     last_output = time.monotonic()
                     emit.log(line)
+                    if stage == "llm" and line.startswith(processor.LLM_FATAL_MARKER):
+                        # The failed filesystem may prevent even the failure
+                        # manifest from being published. The processor emits
+                        # this fixed marker before waiting for network threads.
+                        raise _AIWorkerFailed("AI 处理器运行失败；已停止本次请求，保留已发布检查点，可重试本步。")
                     if any(term in line for term in ("[暂停]", "需要人工验证", "触发安全验证", "JD 批次已暂停", "请在专用 Chrome")):
                         emit.emit("waiting", "需要在专用浏览器中人工登录或完成验证；本步停止后可点击继续。")
             except queue.Empty:
@@ -1126,7 +1135,15 @@ def _run_reviews(task: ReviewTask, runtime: Path, workers: int, batch_size: int,
     def monitor() -> None:
         stats = statistics(review_map())
         emit.progress(stats["llm_success_count"] + stats["llm_failed_count"] + len(inputs) - len(eligible), len(inputs), stats)
+        manifest = _read_json(task, manifest_path, {})
+        if (not control.requested and isinstance(manifest, dict)
+                and manifest.get("status") in {"failed", "interrupted"}):
+            # The processor publishes this before waiting for in-flight network
+            # requests. Raising lets _run_child stop only its owned process tree
+            # instead of leaving the UI and requests running during shutdown.
+            raise _AIWorkerFailed("AI 处理器运行失败；已停止本次请求，保留已发布检查点，可重试本步。")
 
+    worker_failed = False
     initial_manifest = {"candidate_count": len(eligible), "completed_count": selection.hit_count,
                         "pending_count": len(eligible) - selection.hit_count, "failed_count": 0,
                         "fallback_count": 0, "workers": workers, **counts}
@@ -1145,7 +1162,13 @@ def _run_reviews(task: ReviewTask, runtime: Path, workers: int, batch_size: int,
         command.extend(("--prompt-file", str(prompt_path), "--conversation-size", "1"))
         emit.log(f"AI 使用 {workers} 个并发请求，每个岗位独立复核；不跨岗位续接会话或重放历史。"
                  "每岗单独校验并保存检查点，已有有效成功结果继续复用。")
-        code = _run_child(task, "llm", command, control, emit, monitor)
+        try:
+            code = _run_child(task, "llm", command, control, emit, monitor)
+        except _AIWorkerFailed:
+            # Still project durable results below, so the failed step retains
+            # its completed judgments and can resume using the same cache.
+            worker_failed = True
+            code = 1
     else:
         code = 0
         _write_json(task, manifest_path, {**initial_manifest, "status": "skipped_no_candidates",
@@ -1158,6 +1181,7 @@ def _run_reviews(task: ReviewTask, runtime: Path, workers: int, batch_size: int,
     reviews = normalized.reviews
     manifest = _read_json(task, manifest_path, {})
     manifest = manifest if isinstance(manifest, dict) else {}
+    worker_failed = worker_failed or bool(code) or manifest.get("status") in {"failed", "interrupted"}
     lost_hits = len(initial_hits - {key for key, row in reviews.items() if row.get("status") == "success"})
     counts["cache_hit_count"] -= lost_hits
     counts["cache_miss_count"] += lost_hits
@@ -1171,9 +1195,13 @@ def _run_reviews(task: ReviewTask, runtime: Path, workers: int, batch_size: int,
         stats["llm_pending_count"] = 0
     if code and not control.requested:
         issues.append(f"模型子进程退出码 {code}；未成功岗位不进入保留或剔除名单，可重试本步。")
+    if worker_failed and not control.requested:
+        issues.insert(0, "AI 处理器运行失败；已停止本次请求，保留已发布检查点，可重试本步。")
     if normalized.invalidated_count:
         issues.append("模型结果的输入或配置签名不匹配，已保留为历史记录；本次未完成AI判断，岗位不进入保留或剔除名单，可重试本步。")
-    status = control.requested or "completed"
+    status = control.requested or ("failed" if worker_failed else "completed")
+    if worker_failed and not control.requested:
+        manifest["status"] = "failed"
     _write_json(task, manifest_path, {**manifest, **counts, "candidate_count": len(eligible),
                                      "completed_count": stats["llm_success_count"],
                                      "failed_count": stats["llm_failed_count"],

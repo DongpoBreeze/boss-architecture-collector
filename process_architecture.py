@@ -16,14 +16,17 @@ import queue
 import re
 import subprocess
 import sys
+import tempfile
+import threading
 import time
 import urllib.error
 import urllib.request
 from collections import Counter, defaultdict
+from contextlib import contextmanager
 from datetime import datetime
 from functools import lru_cache
 from pathlib import Path
-from typing import Any, Callable, Iterable
+from typing import Any, Callable, Iterable, Iterator, TextIO
 
 import browser_setup
 from jd_parallel import detail_completeness, detail_quality as _detail_quality
@@ -121,6 +124,7 @@ ALGORITHM_TERMS = ("算法研发", "算法工程", "模型训练", "深度学习
 INFRA_TERMS = ("高并发", "高吞吐", "微服务", "分布式", "kubernetes", "k8s", "服务治理", "推理服务", "算力", "模型训练", "底层架构", "基础架构", "向量数据库", "性能优化")
 CLASSIFICATIONS = ("重点投递", "海投池", "暂不投")
 SCREENING_VERSION = "title-skills-three-queues-v5-20261023"
+LLM_FATAL_MARKER = "[AI_REVIEW_FATAL]"
 
 # These are context signals, not standalone positive/negative word lists.
 # In particular, AI may mean Illustrator, and sales/algorithm/infra titles
@@ -268,20 +272,47 @@ def read_json(path: Path) -> Any:
     return json.loads(path.read_text(encoding="utf-8-sig"))
 
 
-def write_json(path: Path, value: Any) -> None:
+@contextmanager
+def _atomic_text_writer(path: Path) -> Iterator[TextIO]:
+    """Publish one complete file, tolerating brief Windows reader locks."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(path.name + ".tmp")
-    temporary.write_text(json.dumps(value, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-    os.replace(temporary, path)
+    temporary: Path | None = None
+    try:
+        # Distinct writers must never truncate or publish each other's temp.
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", newline="\n",
+                                         prefix=f".{path.name}.", suffix=".tmp",
+                                         dir=path.parent, delete=False) as handle:
+            temporary = Path(handle.name)
+            yield handle
+        for attempt in range(5):
+            try:
+                os.replace(temporary, path)
+                break
+            except OSError as exc:
+                # Windows may report reader sharing violations as access
+                # denied (5), sharing violation (32), or lock violation (33).
+                # Retry only replacement, for at most 100 ms in total.
+                if (not isinstance(exc, PermissionError)
+                        and getattr(exc, "winerror", None) not in {5, 32, 33}) or attempt == 4:
+                    raise
+                time.sleep(.01 * (attempt + 1))
+    finally:
+        if temporary is not None:
+            try:
+                temporary.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+
+def write_json(path: Path, value: Any) -> None:
+    with _atomic_text_writer(path) as handle:
+        handle.write(json.dumps(value, ensure_ascii=False, indent=2) + "\n")
 
 
 def write_jsonl(path: Path, rows: Iterable[dict[str, Any]]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(path.name + ".tmp")
-    with temporary.open("w", encoding="utf-8", newline="\n") as handle:
+    with _atomic_text_writer(path) as handle:
         for row in rows:
             handle.write(json.dumps(row, ensure_ascii=False) + "\n")
-    os.replace(temporary, path)
 
 
 def load_config(path: Path) -> dict[str, Any]:
@@ -2199,26 +2230,34 @@ def run_llm(output_root: Path, workers: int = AI_DEFAULT_WORKERS, timeout: int =
         "response_storage_requested": bool(session_reuse and cfg.api_mode == "responses"),
     }
 
-    def save_checkpoint(status: str) -> dict[str, Any]:
-        save_reviews(selection)
+    def checkpoint_manifest(status: str) -> dict[str, Any]:
         successful = sum(row.get("status") == "success" for row in results.values())
         failures = sum(row.get("status") == "failed" for row in results.values())
-        manifest = {
+        return {
             "generated_at": now_iso(), "candidate_count": len(candidates), "completed_count": successful,
             "pending_count": len(candidates) - successful - failures, "failed_count": failures,
             "fallback_count": failures, "workers": workers, "model": cfg.model,
             "reasoning_effort": cfg.effective_reasoning_effort,
-            "api_mode": cfg.api_mode, "chat_stream": cfg.chat_stream if cfg.api_mode == "chat_completions" else False,
+            "api_mode": cfg.api_mode, "chat_stream": cfg.chat_stream,
             "status": status, **conversation_stats, **counts,
         }
-        write_json(manifest_path, manifest)
-        return manifest
+
+    def save_checkpoint(status: str) -> dict[str, Any]:
+        nonlocal last_checkpoint
+        write_json(reviews_path, selection.document(now_iso()))
+        # JSON is the authoritative resume checkpoint even if publishing a
+        # sidecar or manifest fails afterwards. Count only this committed data.
+        last_checkpoint = checkpoint_manifest(status)
+        write_jsonl(jsonl_path, selection.reviews.values())
+        write_json(manifest_path, last_checkpoint)
+        return last_checkpoint
 
     # Displaced successes are history, never current results while requests are
     # in flight.  Each per-job checkpoint is independently safe to resume even
     # if its sidecar or final manifest was not written before interruption.
-    save_checkpoint("running" if pending else "completed")
+    last_checkpoint = checkpoint_manifest("running" if pending else "completed")
     outcome_queue: queue.Queue = queue.Queue()
+    stop_requested = threading.Event()
 
     def review_lane(lane_jobs: list[dict[str, Any]]) -> None:
         conversation: dict[str, Any] = {}
@@ -2226,6 +2265,9 @@ def run_llm(output_root: Path, workers: int = AI_DEFAULT_WORKERS, timeout: int =
         conversation_enabled = session_reuse
         responses_history_only = False
         for job in lane_jobs:
+            if stop_requested.is_set():
+                return
+            checkpointed = threading.Event()
             started = False
             continued = False
             fallback = False
@@ -2253,6 +2295,8 @@ def run_llm(output_root: Path, workers: int = AI_DEFAULT_WORKERS, timeout: int =
                         and isinstance(first_exc, (InvalidJsonResponseError, JsonSchemaValidationError))
                     )
                     if conversation_enabled and (transport_rejected_history or invalid_server_continuation):
+                        if stop_requested.is_set():
+                            return
                         fallback = True
                         if cfg.api_mode == "responses" and not responses_history_only:
                             # Keep a real logical conversation when server-side
@@ -2285,7 +2329,7 @@ def run_llm(output_root: Path, workers: int = AI_DEFAULT_WORKERS, timeout: int =
                             conversation_enabled = False
                             fallback = True
                     turns += 1
-                outcome_queue.put((job, result, None, started, continued, fallback))
+                outcome_queue.put((job, result, None, started, continued, fallback, checkpointed))
             except Exception as exc:
                 # A failed turn may not have a usable response ID. Start a clean
                 # session on the next job rather than risking cross-job drift.
@@ -2293,19 +2337,48 @@ def run_llm(output_root: Path, workers: int = AI_DEFAULT_WORKERS, timeout: int =
                 turns = 0
                 if responses_history_only:
                     conversation["responses_history_only"] = True
-                outcome_queue.put((job, None, exc, started, continued, fallback))
+                outcome_queue.put((job, None, exc, started, continued, fallback, checkpointed))
             except BaseException as exc:
                 # A worker interruption must reach the main thread; otherwise
                 # it would wait indefinitely for an outcome that never arrives.
-                outcome_queue.put((job, None, exc, started, continued, fallback))
+                outcome_queue.put((job, None, exc, started, continued, fallback, checkpointed))
                 return
+            # Do not run ahead through an entire lane while the consumer is
+            # unable to persist outcomes. At most one outcome/request per lane
+            # may be in flight, and a failed consumer releases all waiters.
+            while not stop_requested.is_set():
+                if checkpointed.wait(.05):
+                    break
 
     lanes = [pending[index::max(1, workers)] for index in range(max(1, workers))]
     lanes = [lane for lane in lanes if lane]
-    with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, workers)) as pool:
+    pool = None
+    lane_futures = []
+    try:
+        save_checkpoint("running" if pending else "completed")
+        pool = concurrent.futures.ThreadPoolExecutor(max_workers=max(1, workers))
         lane_futures = [pool.submit(review_lane, lane) for lane in lanes]
         for _ in range(len(pending)):
-            job, value, error_exc, session_started, session_continued, session_fallback = outcome_queue.get()
+            while True:
+                try:
+                    outcome = outcome_queue.get(timeout=.1)
+                    break
+                except queue.Empty:
+                    # A lane can fail before publishing an outcome (including
+                    # BaseException). Never wait forever for a missing result.
+                    for future in lane_futures:
+                        if future.done():
+                            future.result()
+                    if all(future.done() for future in lane_futures):
+                        # A final outcome may have arrived between the timed
+                        # get and the done checks. Recheck after all producers
+                        # have stopped before declaring a missing result.
+                        try:
+                            outcome = outcome_queue.get_nowait()
+                            break
+                        except queue.Empty:
+                            raise RuntimeError("AI 审核线程已退出，但仍有结果未返回") from None
+            job, value, error_exc, session_started, session_continued, session_fallback, checkpointed = outcome
             key = text(job.get("job_id") or job.get("dedupe_key"))
             if session_started:
                 conversation_stats["conversation_sessions_started"] += 1
@@ -2348,7 +2421,7 @@ def run_llm(output_root: Path, workers: int = AI_DEFAULT_WORKERS, timeout: int =
                 result["review_model"] = cfg.model
                 result["review_reasoning_effort"] = cfg.effective_reasoning_effort
                 result["review_api_mode"] = cfg.api_mode
-                result["review_chat_stream"] = cfg.chat_stream if cfg.api_mode == "chat_completions" else False
+                result["review_chat_stream"] = cfg.chat_stream
                 result["format_repair_attempts"] = int(result.pop("_format_repair_attempts", 0))
                 result.pop("_response_id", None)
                 if session_fallback:
@@ -2381,16 +2454,42 @@ def run_llm(output_root: Path, workers: int = AI_DEFAULT_WORKERS, timeout: int =
                     "requested_model": cfg.model,
                     "requested_reasoning_effort": cfg.effective_reasoning_effort,
                     "requested_api_mode": cfg.api_mode,
-                    "requested_chat_stream": cfg.chat_stream if cfg.api_mode == "chat_completions" else False,
+                    "requested_chat_stream": cfg.chat_stream,
                     "needs_human_review": True,
                 }
             result[CACHE_SIGNATURE_FIELD] = signatures[key]
             result[CACHE_INPUT_SIGNATURE_FIELD] = input_signatures[key]
             results[key] = result
             save_checkpoint("running")
+            checkpointed.set()
         for future in lane_futures:
             future.result()
-    return save_checkpoint("completed")
+        return save_checkpoint("completed")
+    except BaseException as exc:
+        # Stop lanes before waiting for executor shutdown. Otherwise workers
+        # keep requesting jobs after the only checkpoint consumer has failed.
+        stop_requested.set()
+        for future in lane_futures:
+            future.cancel()
+        status = "interrupted" if isinstance(exc, (KeyboardInterrupt, SystemExit)) else "failed"
+        failure_manifest = {
+            **last_checkpoint, "generated_at": now_iso(), "status": status,
+            "error": "AI 审核已停止；已发布检查点可用于恢复",
+            "error_type": type(exc).__name__,
+        }
+        # Do not retry save_reviews here or count the unsaved in-memory result
+        # as committed. A manifest failure must not hide the original error.
+        print(f"{LLM_FATAL_MARKER} AI 审核已停止（{type(exc).__name__}）；已发布检查点可用于恢复。",
+              file=sys.stderr, flush=True)
+        try:
+            write_json(manifest_path, failure_manifest)
+        except BaseException as manifest_exc:
+            print(f"AI 失败状态未能写入（{type(manifest_exc).__name__}）。",
+                  file=sys.stderr, flush=True)
+        raise
+    finally:
+        if pool is not None:
+            pool.shutdown(wait=True, cancel_futures=True)
 
 
 def _grounded_quotes(evidence: Any, jd: str) -> list[str]:

@@ -784,6 +784,95 @@ class AiStageDecisionTests(unittest.TestCase):
 
 
 class ReviewTests(PipelineCase):
+    def test_fatal_ai_checkpoint_preserves_results_and_can_resume_without_reset(self):
+        self.seed_llm_input()
+        published = []
+        continued_after_failure = []
+
+        def failed_worker(task, stage, command, control, emit, monitor=None):
+            self.fake_reviews()(task, stage, command, control, emit, None)
+            runtime = task.run_directory(stage)
+            path = runtime / "prepared/llm_reviews.json"
+            payload = self.read(path)
+            payload["reviews"] = payload["reviews"][:1]
+            published.append(payload["reviews"][0]["job_id"])
+            self.write(path, payload)
+            self.write(runtime / "prepared/llm_manifest.json", {
+                "status": "failed", "error_type": "PermissionError",
+                "error": "private-provider-diagnostic-must-not-appear",
+            })
+            monitor()
+            continued_after_failure.append(True)
+            return 0
+
+        with patch.object(pipeline, "_provider_hash", return_value="fixture-provider"), \
+             patch.object(pipeline, "_run_child", side_effect=failed_worker):
+            info = self.run_step("llm")["stages"]["llm"]
+        self.assertEqual(continued_after_failure, [])
+        self.assertEqual(info["status"], "failed")
+        self.assertFalse(info["confirmed"])
+        self.assertEqual((info["stats"]["llm_success_count"], info["stats"]["llm_pending_count"]), (1, 2))
+        self.assertEqual(info["keep_ids"], published)
+        self.assertEqual(len(info["pending_ids"]), 2)
+        self.assertIn("已发布检查点", info["issues"][0])
+        with self.assertRaises(TaskStateError):
+            self.task.confirm("llm")
+        visible = json.dumps(info, ensure_ascii=False) + json.dumps(self.events, ensure_ascii=False)
+        self.assertNotIn("private-provider-diagnostic-must-not-appear", visible)
+        self.task.set_keep("llm", published, False)
+
+        def resumed_worker(task, stage, command, control, emit, monitor=None):
+            rows = self.read(task.run_directory(stage) / "prepared/llm_reviews.json")["reviews"]
+            self.assertEqual([row["job_id"] for row in rows], published)
+            return self.fake_reviews()(task, stage, command, control, emit, monitor)
+
+        with patch.object(pipeline, "_provider_hash", return_value="fixture-provider"), \
+             patch.object(pipeline, "_run_child", side_effect=resumed_worker) as child:
+            resumed = self.run_step("llm")["stages"]["llm"]
+        child.assert_called_once()
+        self.assertEqual(resumed["status"], "completed")
+        self.assertEqual((resumed["stats"]["llm_success_count"], resumed["stats"]["llm_cache_hit_count"],
+                          resumed["stats"]["llm_request_count"]), (3, 1, 2))
+        self.assertFalse(resumed["manual_choices"][published[0]])
+        self.assertNotIn(published[0], resumed["keep_ids"])
+
+    def test_terminal_ai_failure_without_monitor_is_not_marked_completed(self):
+        self.seed_llm_input()
+
+        def failed_worker(task, stage, command, control, emit, monitor=None):
+            self.fake_reviews()(task, stage, command, control, emit, None)
+            self.write(task.run_directory(stage) / "prepared/llm_manifest.json", {"status": "failed"})
+            return 0
+
+        with patch.object(pipeline, "_provider_hash", return_value="fixture-provider"), \
+             patch.object(pipeline, "_run_child", side_effect=failed_worker):
+            info = self.run_step("llm")["stages"]["llm"]
+        self.assertEqual(info["status"], "failed")
+        self.assertEqual(info["stats"]["llm_success_count"], 3)
+        self.assertFalse(info["confirmed"])
+
+    def test_nonzero_ai_exit_with_stale_running_manifest_retains_pending_results(self):
+        self.seed_llm_input()
+
+        def failed_worker(task, stage, command, control, emit, monitor=None):
+            self.fake_reviews()(task, stage, command, control, emit, None)
+            runtime = task.run_directory(stage)
+            path = runtime / "prepared/llm_reviews.json"
+            payload = self.read(path)
+            payload["reviews"] = payload["reviews"][:1]
+            self.write(path, payload)
+            self.write(runtime / "prepared/llm_manifest.json", {"status": "running"})
+            return 1
+
+        with patch.object(pipeline, "_provider_hash", return_value="fixture-provider"), \
+             patch.object(pipeline, "_run_child", side_effect=failed_worker):
+            info = self.run_step("llm")["stages"]["llm"]
+        self.assertEqual(info["status"], "failed")
+        self.assertEqual((info["stats"]["llm_success_count"], info["stats"]["llm_pending_count"]), (1, 2))
+        self.assertEqual(len(info["pending_ids"]), 2)
+        with self.assertRaises(TaskStateError):
+            self.task.confirm("llm")
+
     def test_both_protocols_reject_corrupt_child_input_signature_and_repair_on_normal_continuation(self):
         from llm_client import CodexConfig
         from review_cache import provider_signature, review_input_signature
@@ -1497,6 +1586,54 @@ class ReportTests(PipelineCase):
 
 
 class ChildAndSafetyTests(PipelineCase):
+    def test_fatal_log_stops_owned_child_without_a_failure_manifest(self):
+        control = pipeline.StageControl()
+        pids = []
+
+        def callback(kind, value):
+            if kind == "log" and value.startswith("worker:"):
+                pids.append(int(value.split(":", 1)[1]))
+
+        command = [sys.executable, "-u", "-c", (
+            "import os,time; print('worker:'+str(os.getpid()),flush=True); "
+            f"print({pipeline.processor.LLM_FATAL_MARKER!r},flush=True); time.sleep(15)"
+        )]
+        started = time.monotonic()
+        with self.assertRaises(pipeline._AIWorkerFailed):
+            pipeline._run_child(self.task, "llm", command, control,
+                                pipeline._Emitter(self.task, "llm", callback))
+        self.assertLess(time.monotonic() - started, 10)
+        self.assertEqual(len(pids), 1)
+        self.assertFalse(pipeline._pid_alive(pids[0]))
+        self.assertFalse(control._children)
+        self.assertFalse(self.read(self.task.run_directory("llm") / "child_lease.json")["active"])
+        self.assertIsNone(control.requested)
+
+    def test_fatal_monitor_stops_owned_child_and_releases_its_lease(self):
+        control = pipeline.StageControl()
+        pids = []
+
+        def callback(kind, value):
+            if kind == "log" and value.startswith("worker:"):
+                pids.append(int(value.split(":", 1)[1]))
+
+        def monitor():
+            if pids:
+                raise pipeline._AIWorkerFailed("AI 处理器运行失败")
+
+        command = [sys.executable, "-u", "-c",
+                   "import os,time; print('worker:'+str(os.getpid()),flush=True); time.sleep(15)"]
+        started = time.monotonic()
+        with self.assertRaises(pipeline._AIWorkerFailed):
+            pipeline._run_child(self.task, "llm", command, control,
+                                pipeline._Emitter(self.task, "llm", callback), monitor)
+        self.assertLess(time.monotonic() - started, 10)
+        self.assertEqual(len(pids), 1)
+        self.assertFalse(pipeline._pid_alive(pids[0]))
+        self.assertFalse(control._children)
+        self.assertFalse(self.read(self.task.run_directory("llm") / "child_lease.json")["active"])
+        self.assertIsNone(control.requested)
+
     def test_owned_subprocess_stdout_is_redacted_before_callback_or_log(self):
         emit = pipeline._Emitter(self.task, "llm", lambda k, v: self.events.append((k, v)))
         text = 'api_key="dummy-private-value"\nCookie: first=private-cookie; second=private-cookie-two\nAuthorization: Bearer private-auth\n'

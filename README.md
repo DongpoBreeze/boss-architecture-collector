@@ -72,7 +72,7 @@ AI 运行中会自动读取新落盘的判断，更新保留、剔除、待核�
 
 JD 每个浏览器页面并发默认 3、AI 请求并发默认 10，均可设为 1–32，彼此独立；GUI 每批默认 30，用于检查点分组，不是并发数。桌面 JD 页直接展示浏览器模式、登录准备按钮及两侧状态，新设置默认“Chrome + Edge 各半”；已有明确保存的单浏览器选择仍保留，可在本页切换并立即保存。CLI 继续默认单 Chrome，可用 `--browser-mode dual` 切换。双侧并发各为页面并发值，例如设为 2 时最多同时打开 4 个页面；本批只剩 1 个岗位时仅分给 Chrome。Chrome 和 Edge 分别默认使用 CDP 9222 / 9223 及独立 profile，岗位稳定均衡分成前后两个连续分片。两侧结果先分别写入检查点，再按输入顺序合并；一侧验证暂停时保留另一侧已完成结果，续跑仅重试未完成的岗位。两个实例不得共用端口或 profile。
 
-AI 语义复核初始默认使用 `gpt-5.6-luna`、思考强度 `max` 和 Responses API；旧配置未保存协议时仍使用 Responses。在“AI 语义复核”页点击“修改模型配置”，可修改服务地址、API 协议、模型、思考强度和 API Key。服务仅兼容 Chat 接口时选择“Chat Completions”，使用 `/chat/completions`；如服务要求流式请求，勾选“Chat 使用流式响应”。Chat 默认不发送强度，点击“验证思考强度”，模型完整返回后再保存，才会发送顶层 `reasoning_effort`。修改地址、模型、强度、流式或密钥后须重新验证。API Key 仅存于 Windows Credential Manager，不写入源码、日志、岗位结果或全局 Codex 配置。
+AI 语义复核初始默认使用 `gpt-5.6-luna`、思考强度 `max` 和 Responses API；旧配置未保存协议时仍使用 Responses。在“AI 语义复核”页点击“修改模型配置”，可修改服务地址、API 协议、模型、思考强度和 API Key。如服务要求流式请求，勾选“使用流式响应”，Responses 和 Chat 均支持，无需为流式切换协议。程序完整接收并校验后才更新岗位判断，断流不算成功。服务仅兼容 Chat 接口时选择“Chat Completions”，使用 `/chat/completions`。Chat 默认不发送强度，点击“验证思考强度”，模型完整返回后再保存，才会发送顶层 `reasoning_effort`。修改地址、模型、强度、流式或密钥后，Chat 须重新验证强度。API Key 仅存于 Windows Credential Manager，不写入源码、日志、岗位结果或全局 Codex 配置。
 
 可先“读取模型”或手动填写模型名，再点“测试连接”；读取列表和普通连接成功不代表强度已验证。“验证思考强度”单独发送一次短请求，不自动重试；HTTP 200、空文本或截断结果均不能作为验证成功。成功仅说明服务接受参数并完整返回，不能证明内部思考预算。点击“保存配置”后才用于后续 AI 复核，保存不运行 AI。CLI 使用同一项目配置，也可用 `--base-url`、`--api-key`、`--model`、`--reasoning-effort` 和 `--api-mode responses|chat_completions` 覆盖本次请求。更换有效请求配置后，需重跑 AI；Chat 只有已验证且实际发送的强度参与缓存签名。默认 Responses 保留原有签名，升级不会仅因新增协议选项使已有成功缓存失效；历史报告不会自动改写。
 

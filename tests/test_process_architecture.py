@@ -8,7 +8,7 @@ import tempfile
 import threading
 import time
 import unittest
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
@@ -43,6 +43,8 @@ from process_architecture import (  # noqa: E402
     score_job,
     shortlist_jobs,
     wait_for_detail_gate_retry,
+    write_json,
+    write_jsonl,
 )
 
 
@@ -74,6 +76,140 @@ def write_raw_file(root: Path, name: str, jobs: list[dict], track: str = "curren
         ),
         encoding="utf-8",
     )
+
+
+class AtomicCheckpointWriteTests(unittest.TestCase):
+    def test_transient_replace_permission_and_windows_sharing_errors_recover(self):
+        original_replace = os.replace
+        for writer in (write_json, write_jsonl):
+            for winerror in (None, 5, 32, 33):
+                with self.subTest(writer=writer.__name__, winerror=winerror), tempfile.TemporaryDirectory() as directory:
+                    target = Path(directory) / "checkpoint.json"
+                    error = PermissionError("temporary reader lock") if winerror is None else OSError("reader lock")
+                    if winerror is not None:
+                        error.winerror = winerror
+                    attempts = []
+
+                    def replace(source, destination):
+                        attempts.append(Path(source))
+                        if len(attempts) == 1:
+                            raise error
+                        original_replace(source, destination)
+
+                    with patch("process_architecture.os.replace", side_effect=replace), \
+                            patch("process_architecture.time.sleep") as sleep:
+                        writer(target, [{"job_id": "saved"}])
+                    self.assertEqual(len(attempts), 2)
+                    self.assertEqual(len(set(attempts)), 1)
+                    sleep.assert_called_once_with(.01)
+                    self.assertIn('"saved"', target.read_text(encoding="utf-8"))
+                    self.assertEqual(list(Path(directory).glob("*.tmp")), [])
+
+    def test_persistent_replace_failure_is_bounded_and_keeps_prior_file(self):
+        for writer in (write_json, write_jsonl):
+            with self.subTest(writer=writer.__name__), tempfile.TemporaryDirectory() as directory:
+                target = Path(directory) / "checkpoint.json"
+                target.write_bytes(b"previous complete checkpoint\n")
+                unrelated = Path(directory) / "checkpoint.json.tmp"
+                unrelated.write_bytes(b"another writer's temp")
+                error = PermissionError("persistent lock")
+                with patch("process_architecture.os.replace", side_effect=error) as replace, \
+                        patch("process_architecture.time.sleep") as sleep:
+                    with self.assertRaises(PermissionError) as raised:
+                        writer(target, [{"job_id": "new"}])
+                self.assertIs(raised.exception, error)
+                self.assertEqual(replace.call_count, 5)
+                self.assertEqual([call.args[0] for call in sleep.call_args_list], [.01, .02, .03, .04])
+                self.assertEqual(target.read_bytes(), b"previous complete checkpoint\n")
+                self.assertEqual(unrelated.read_bytes(), b"another writer's temp")
+                self.assertEqual(list(Path(directory).glob(".*.tmp")), [])
+
+    def test_other_replace_and_write_errors_are_not_retried(self):
+        for writer in (write_json, write_jsonl):
+            with self.subTest(writer=writer.__name__), tempfile.TemporaryDirectory() as directory:
+                target = Path(directory) / "checkpoint.json"
+                target.write_bytes(b"previous checkpoint")
+                with patch("process_architecture.os.replace", side_effect=OSError(28, "disk full")) as replace, \
+                        patch("process_architecture.time.sleep") as sleep:
+                    with self.assertRaises(OSError):
+                        writer(target, [{"job_id": "new"}])
+                replace.assert_called_once()
+                sleep.assert_not_called()
+                with patch("process_architecture.tempfile.NamedTemporaryFile", side_effect=PermissionError("create denied")) as create, \
+                        patch("process_architecture.os.replace") as replace, \
+                        patch("process_architecture.time.sleep") as sleep:
+                    with self.assertRaises(PermissionError):
+                        writer(target, [{"job_id": "new"}])
+                create.assert_called_once()
+                replace.assert_not_called()
+                sleep.assert_not_called()
+                self.assertEqual(target.read_bytes(), b"previous checkpoint")
+                self.assertEqual(list(Path(directory).glob("*.tmp")), [])
+
+    def test_failed_jsonl_iteration_never_publishes_partial_rows(self):
+        def rows():
+            yield {"job_id": "first"}
+            raise PermissionError("write input failed")
+
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / "checkpoint.jsonl"
+            target.write_bytes(b"previous complete rows\n")
+            with patch("process_architecture.os.replace") as replace, patch("process_architecture.time.sleep") as sleep:
+                with self.assertRaises(PermissionError):
+                    write_jsonl(target, rows())
+            replace.assert_not_called()
+            sleep.assert_not_called()
+            self.assertEqual(target.read_bytes(), b"previous complete rows\n")
+            self.assertEqual(list(Path(directory).glob("*.tmp")), [])
+
+    def test_concurrent_writers_use_distinct_temporaries(self):
+        original_replace = os.replace
+        for writer in (write_json, write_jsonl):
+            with self.subTest(writer=writer.__name__), tempfile.TemporaryDirectory() as directory:
+                target = Path(directory) / "checkpoint.json"
+                barrier = threading.Barrier(2)
+                sources, errors = [], []
+                lock = threading.Lock()
+
+                def replace(source, destination):
+                    with lock:
+                        first_attempt = Path(source) not in sources
+                        if first_attempt:
+                            sources.append(Path(source))
+                    if first_attempt:
+                        barrier.wait(timeout=3)
+                    original_replace(source, destination)
+
+                def save(key):
+                    try:
+                        writer(target, [{"job_id": key}])
+                    except BaseException as exc:
+                        errors.append(exc)
+
+                with patch("process_architecture.os.replace", side_effect=replace):
+                    threads = [threading.Thread(target=save, args=(key,)) for key in ("a", "b")]
+                    for thread in threads:
+                        thread.start()
+                    for thread in threads:
+                        thread.join(timeout=4)
+                self.assertFalse(any(thread.is_alive() for thread in threads))
+                self.assertEqual(errors, [])
+                self.assertEqual(len(set(sources)), 2)
+                self.assertIn(json.loads(target.read_text(encoding="utf-8")),
+                              ([{"job_id": "a"}], [{"job_id": "b"}]) if writer is write_json else
+                              ({"job_id": "a"}, {"job_id": "b"}))
+                self.assertEqual(list(Path(directory).glob("*.tmp")), [])
+
+    @unittest.skipUnless(os.name == "nt", "ordinary Windows readers deny replacement")
+    def test_real_windows_reader_lock_can_clear_during_backoff(self):
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / "checkpoint.json"
+            write_json(target, {"old": True})
+            with target.open("rb") as reader, \
+                    patch("process_architecture.time.sleep", side_effect=lambda _: reader.close()) as sleep:
+                write_json(target, {"new": True})
+            sleep.assert_called_once_with(.01)
+            self.assertEqual(json.loads(target.read_text(encoding="utf-8")), {"new": True})
 
 
 class ProcessArchitectureTests(unittest.TestCase):
@@ -1990,7 +2126,7 @@ class SimpleReviewReportTests(unittest.TestCase):
     def test_current_manifest_with_no_records_keeps_config_failure_partial_jd_and_interruption_pending(self):
         from llm_client import CodexConfig, ConfigurationError
         config = CodexConfig(model="fixture", base_url="https://fixture.test/v1", api_key="fixture-key")
-        for outcome in ("configuration_failed", "skipped_no_candidates", "running"):
+        for outcome in ("configuration_failed", "skipped_no_candidates", "interrupted"):
             with self.subTest(outcome=outcome), tempfile.TemporaryDirectory() as directory:
                 output = Path(directory)
                 folder = output / "prepared/jd_shortlists"
@@ -2008,7 +2144,7 @@ class SimpleReviewReportTests(unittest.TestCase):
                               if outcome == "configuration_failed" else None, return_value=config) as loader, \
                         patch("llm_client.CodexResponsesClient", return_value=client), \
                         patch("process_architecture.load_prompt", return_value="fixture rules"):
-                    if outcome == "running":
+                    if outcome == "interrupted":
                         with self.assertRaises(KeyboardInterrupt):
                             run_llm(output, workers=1)
                     else:
@@ -2339,7 +2475,8 @@ class ConversationPoolTests(unittest.TestCase):
         with self.assertRaises(KeyboardInterrupt):
             self.run_client(Client(), count=1)
         manifest = json.loads((self.prepared / "llm_manifest.json").read_text(encoding="utf-8"))
-        self.assertEqual(manifest["status"], "running")
+        self.assertEqual(manifest["status"], "interrupted")
+        self.assertEqual(manifest["error_type"], "KeyboardInterrupt")
         self.assertEqual(manifest["pending_count"], 1)
 
     def test_invalid_session_size_is_rejected_before_files_or_requests(self):
@@ -2709,6 +2846,32 @@ class LLMCacheTests(unittest.TestCase):
         self.assertIsNone(changed["reasoning_effort"], "an effort override requires its own successful probe")
         self.assertIsNone(self.factory.call_args.args[0].effective_reasoning_effort)
 
+    def test_responses_stream_metadata_matches_the_actual_saved_option(self):
+        project_llm_settings.save_settings(
+            "https://responses-provider.example/v1", "fixture-responses-model", "high",
+            path=self.project_settings_path, api_mode="responses", chat_stream=True,
+        )
+        manifest = run_llm(self.output, workers=1)
+        self.assertTrue(self.factory.call_args.args[0].chat_stream)
+        self.assertEqual(manifest["api_mode"], "responses")
+        self.assertTrue(manifest["chat_stream"])
+        self.assertEqual({row["review_chat_stream"] for row in self.document()["reviews"]}, {True})
+
+    def test_responses_stream_failure_records_the_actual_requested_option(self):
+        from llm_client import LLMRequestError
+
+        project_llm_settings.save_settings(
+            "https://responses-provider.example/v1", "fixture-responses-model", "high",
+            path=self.project_settings_path, api_mode="responses", chat_stream=True,
+        )
+        self.failures["a"] = LLMRequestError("fixture-stream-error")
+        manifest = run_llm(self.output, workers=1)
+        self.assertTrue(manifest["chat_stream"])
+        failed = next(row for row in self.document()["reviews"] if row["status"] == "failed")
+        self.assertEqual(failed["requested_api_mode"], "responses")
+        self.assertTrue(failed["requested_chat_stream"])
+        self.assertNotIn("fixture-stream-error", json.dumps(failed))
+
     def test_verified_chat_failure_records_the_effort_actually_requested(self):
         from llm_client import LLMHTTPError
 
@@ -2845,9 +3008,176 @@ class LLMCacheTests(unittest.TestCase):
         self.assertEqual(len(checkpoint["reviews"]), 1)
         self.assertTrue(checkpoint["reviews"][0]["cache_signature"].startswith("semantic-review-v1:"))
         manifest = json.loads((self.prepared / "llm_manifest.json").read_text(encoding="utf-8"))
-        self.assertEqual((manifest["status"], manifest["completed_count"], manifest["pending_count"]), ("running", 1, 1))
+        self.assertEqual((manifest["status"], manifest["completed_count"], manifest["pending_count"]), ("interrupted", 1, 1))
+        self.assertEqual(len(self.requests), 1)
         self.assert_counts(run_llm(self.output), hits=1, requests=1)
-        self.assertEqual(len(self.requests), 3)
+        self.assertEqual(len(self.requests), 2)
+
+    def test_checkpoint_replace_failure_stops_long_lanes_and_resumes_saved_success(self):
+        self.jobs = [{**self.jobs[0], "job_id": f"job-{index}"} for index in range(60)]
+        self.details = [{**self.details[0], "job_id": job["job_id"]} for job in self.jobs]
+        self.write_inputs()
+        first_requests = threading.Barrier(3)
+        failure_started = threading.Event()
+        request_lock = threading.Lock()
+        calls = []
+        original_replace = os.replace
+        error = PermissionError(f"private detail {self.config.api_key} {self.config.base_url}")
+        error.winerror = 5
+
+        def request(job, *, prompt):
+            with request_lock:
+                calls.append(job["job_id"])
+                number = len(calls)
+            if number <= 3:
+                first_requests.wait(timeout=3)
+            else:
+                self.assertTrue(failure_started.wait(timeout=3))
+            return {"判断": "符合", "理由": "负责企业应用方案与交付。"}
+
+        def replace(source, destination):
+            if (Path(destination).name == "llm_reviews.json"
+                    and len(json.loads(Path(source).read_text(encoding="utf-8"))["reviews"]) == 2):
+                failure_started.set()
+                raise error
+            original_replace(source, destination)
+
+        self.client.review_job.side_effect = request
+        diagnostics = io.StringIO()
+        with patch("process_architecture.os.replace", side_effect=replace), \
+                patch("process_architecture.time.sleep"), redirect_stderr(diagnostics):
+            with self.assertRaises(PermissionError) as raised:
+                run_llm(self.output, workers=3)
+        self.assertIs(raised.exception, error)
+        self.assertLessEqual(len(calls), 4, "each lane must await its checkpoint before another request")
+        saved = self.document()["reviews"]
+        self.assertEqual(len(saved), 1)
+        self.assertEqual(saved[0]["status"], "success")
+        manifest = json.loads((self.prepared / "llm_manifest.json").read_text(encoding="utf-8"))
+        self.assertEqual((manifest["status"], manifest["completed_count"], manifest["pending_count"]),
+                         ("failed", 1, 59))
+        self.assertEqual(manifest["error_type"], "PermissionError")
+        for private in (self.config.api_key, self.config.base_url):
+            self.assertNotIn(private, diagnostics.getvalue() + json.dumps(manifest))
+        failed_run_calls = len(calls)
+        resumed = run_llm(self.output, workers=3)
+        self.assertEqual((resumed["status"], resumed["cache_hit_count"], resumed["request_count"], resumed["completed_count"]),
+                         ("completed", 1, 59, 60))
+        self.assertEqual(len(calls), failed_run_calls + 59)
+        self.assertEqual(calls.count(saved[0]["job_id"]), 1)
+        self.assertEqual(len(self.document()["reviews"]), 60)
+
+    def test_sidecar_or_manifest_failure_preserves_authoritative_reviews_for_resume(self):
+        import process_architecture as processor
+        original_json, original_jsonl = processor.write_json, processor.write_jsonl
+        for boundary in ("llm_reviews.jsonl", "llm_manifest.json", "completed"):
+            with self.subTest(boundary=boundary):
+                for name in ("llm_reviews.json", "llm_reviews.jsonl", "llm_manifest.json"):
+                    (self.prepared / name).unlink(missing_ok=True)
+                self.requests.clear()
+                error = OSError("checkpoint boundary failed")
+
+                def write_json(path, payload):
+                    if path.name == "llm_manifest.json" and (
+                        (boundary == path.name and payload.get("status") == "running" and payload["completed_count"] == 2)
+                        or (boundary == "completed" and payload.get("status") == "completed")
+                    ):
+                        raise error
+                    original_json(path, payload)
+
+                def write_jsonl(path, rows):
+                    rows = list(rows)
+                    if boundary == path.name and len(rows) == 2:
+                        raise error
+                    original_jsonl(path, rows)
+
+                with patch.object(processor, "write_json", side_effect=write_json), \
+                        patch.object(processor, "write_jsonl", side_effect=write_jsonl), redirect_stderr(io.StringIO()):
+                    with self.assertRaises(OSError) as raised:
+                        run_llm(self.output, workers=1)
+                self.assertIs(raised.exception, error)
+                saved = json.loads((self.prepared / "llm_reviews.json").read_text(encoding="utf-8"))["reviews"]
+                self.assertEqual(len(saved), 2)
+                manifest = json.loads((self.prepared / "llm_manifest.json").read_text(encoding="utf-8"))
+                self.assertEqual(manifest["status"], "failed")
+                self.assertEqual(manifest["completed_count"], 2)
+                self.assert_counts(run_llm(self.output, workers=1), hits=2, requests=0)
+                self.assertEqual(len(self.requests), 2)
+                self.assertEqual(len(self.document()["reviews"]), 2)
+
+    def test_initial_checkpoint_and_failure_manifest_errors_keep_original_exception(self):
+        import process_architecture as processor
+        original_write = processor.write_json
+        error = OSError(f"original {self.config.api_key}")
+
+        def write(path, payload):
+            if path.name == "llm_reviews.json":
+                raise error
+            if path.name == "llm_manifest.json":
+                self.assertTrue(diagnostics.getvalue().startswith(processor.LLM_FATAL_MARKER + " "))
+                raise PermissionError(f"secondary {self.config.base_url}")
+            original_write(path, payload)
+
+        diagnostics = io.StringIO()
+        with patch.object(processor, "write_json", side_effect=write), redirect_stderr(diagnostics):
+            with self.assertRaises(OSError) as raised:
+                run_llm(self.output, workers=2)
+        self.assertIs(raised.exception, error)
+        self.assertEqual(self.requests, [])
+        self.assertEqual(processor.LLM_FATAL_MARKER, "[AI_REVIEW_FATAL]")
+        self.assertEqual(diagnostics.getvalue().count(processor.LLM_FATAL_MARKER), 1)
+        self.assertIn("OSError", diagnostics.getvalue())
+        self.assertIn("PermissionError", diagnostics.getvalue())
+        for private in (self.config.api_key, self.config.base_url, "original", "secondary"):
+            self.assertNotIn(private, diagnostics.getvalue())
+
+    def test_lane_exit_without_outcome_cannot_leave_consumer_waiting_forever(self):
+        import concurrent.futures
+        import process_architecture as processor
+        for interruption in (None, KeyboardInterrupt("worker exited before publishing")):
+            with self.subTest(interruption=interruption):
+                future = concurrent.futures.Future()
+                if interruption is None:
+                    future.set_result(None)
+                else:
+                    future.set_exception(interruption)
+                pool = Mock()
+                pool.submit.return_value = future
+                outcomes = Mock()
+                outcomes.get.side_effect = processor.queue.Empty
+                outcomes.get_nowait.side_effect = processor.queue.Empty
+                expected = RuntimeError if interruption is None else KeyboardInterrupt
+                with patch.object(processor.concurrent.futures, "ThreadPoolExecutor", return_value=pool), \
+                        patch.object(processor.queue, "Queue", return_value=outcomes), redirect_stderr(io.StringIO()):
+                    with self.assertRaises(expected):
+                        run_llm(self.output, workers=1)
+                outcomes.get.assert_called_once_with(timeout=.1)
+                pool.shutdown.assert_called_once_with(wait=True, cancel_futures=True)
+                manifest = json.loads((self.prepared / "llm_manifest.json").read_text(encoding="utf-8"))
+                self.assertEqual(manifest["status"], "failed" if interruption is None else "interrupted")
+                self.assertEqual(manifest["completed_count"], 0)
+
+    def test_final_worker_outcome_racing_with_queue_timeout_is_consumed(self):
+        import concurrent.futures
+        import process_architecture as processor
+        future = concurrent.futures.Future()
+        future.set_result(None)
+        pool = Mock()
+        pool.submit.return_value = future
+        outcomes = Mock()
+        outcomes.get.side_effect = processor.queue.Empty
+        acknowledgements = [threading.Event() for _ in self.jobs]
+        outcomes.get_nowait.side_effect = [
+            (job, {"判断": "符合", "理由": "负责企业应用方案与交付。"}, None, False, False, False, acknowledged)
+            for job, acknowledged in zip(self.jobs, acknowledgements)
+        ]
+        with patch.object(processor.concurrent.futures, "ThreadPoolExecutor", return_value=pool), \
+                patch.object(processor.queue, "Queue", return_value=outcomes):
+            manifest = run_llm(self.output, workers=1)
+        self.assertEqual((manifest["status"], manifest["completed_count"]), ("completed", 2))
+        self.assertTrue(all(event.is_set() for event in acknowledgements))
+        self.assertEqual(outcomes.get_nowait.call_count, 2)
+        self.assertEqual(len(self.document()["reviews"]), 2)
 
     def test_partial_or_removed_jobs_never_read_credentials_or_keep_current_results(self):
         run_llm(self.output)

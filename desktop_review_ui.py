@@ -1370,8 +1370,7 @@ class ReviewDesktopApp:
         effort_label = (f"思考强度 {effort}" if api_mode == project_llm_settings.API_MODE_RESPONSES
                         else f"思考强度 {effort}（已验证，将发送）" if verified
                         else f"思考强度 {effort}（未验证，不发送）")
-        if api_mode == project_llm_settings.API_MODE_CHAT_COMPLETIONS:
-            effort_label += " · 流式" if settings.get("chat_stream", False) else " · 非流式"
+        effort_label += " · 流式" if settings.get("chat_stream", False) else " · 非流式"
         self.model_config_label.configure(
             text=f"协议：{api_mode_label} · 模型：{model} · {effort_label}\nURL：{base_url} · API Key：Windows Credential Manager"
         )
@@ -1422,7 +1421,7 @@ class ReviewDesktopApp:
             state="readonly", width=24, style="Review.TCombobox",
         )
         api_mode_box.grid(row=2, column=1, sticky="w", pady=5)
-        stream_check = ttk.Checkbutton(body, text="Chat 使用流式响应", variable=chat_stream)
+        stream_check = ttk.Checkbutton(body, text="使用流式响应", variable=chat_stream)
         stream_check.grid(row=2, column=2, sticky="w", padx=(8, 0), pady=5)
         ttk.Label(
             body, textvariable=mode_hint,
@@ -1453,14 +1452,14 @@ class ReviewDesktopApp:
 
         def update_api_mode() -> None:
             is_chat = API_MODE_CHOICES.get(api_mode.get()) == "chat_completions"
-            stream_check.configure(state="normal" if is_chat else "disabled")
+            stream_check.configure(state="normal")
             reasoning_button.configure(state="normal" if is_chat and not self._model_config_request_busy else "disabled")
             verified = project_llm_settings.is_chat_reasoning_verified(
                 base_url.get().strip(), model.get().strip(), effort.get().strip(),
                 self._model_config_verified_for, chat_stream=chat_stream.get(),
             )
             if not is_chat:
-                mode_hint.set("Responses 使用 /responses，直接发送所选思考强度。")
+                mode_hint.set("Responses 使用 /responses，直接发送所选思考强度；支持流式响应，完整接收后校验结果。")
             elif verified:
                 mode_hint.set("思考强度已验证，保存后随 Chat 请求发送；修改地址、模型、强度、流式或密钥后需重新验证。")
             else:
@@ -1613,7 +1612,9 @@ class ReviewDesktopApp:
                     "api_key": api_key,
                     "requires_auth": True,
                     "disable_response_storage": True,
-                    "timeout": 60 if operation == "reasoning" else 25,
+                    # High reasoning effort can take longer than the former
+                    # 25-second connection limit even with streaming enabled.
+                    "timeout": 25 if operation == "models" else 120,
                     "max_retries": 0,
                 }
                 client = CodexResponsesClient(config, response_schema=None)

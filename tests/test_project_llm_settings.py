@@ -10,7 +10,7 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import project_llm_settings as settings
-from llm_client import ConfigurationError, load_codex_config
+from llm_client import CodexResponsesClient, ConfigurationError, load_codex_config
 
 
 class ProjectSettingsTests(unittest.TestCase):
@@ -152,6 +152,32 @@ class ProjectSettingsTests(unittest.TestCase):
             self.assertEqual(explicit.endpoint, "https://provider.test/v1/responses")
             self.assertEqual((project.read_bytes(), config_path.read_bytes()), before)
             self.assertNotIn("fixture-project-key", project.read_text(encoding="utf-8") + repr(inherited))
+
+    def test_responses_reuses_the_existing_stream_key_without_changing_the_project_protocol(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            project = settings.save_settings(
+                "https://provider.invalid/v1", "fixture-model", "high",
+                api_mode=settings.API_MODE_RESPONSES, chat_stream=True, path=root / "provider.json",
+            )
+            config_path = root / "config.toml"
+            config_path.write_text("", encoding="utf-8")
+            before = project.read_bytes(), config_path.read_bytes()
+            value = json.loads(project.read_text(encoding="utf-8"))
+            self.assertIs(value["chat_stream"], True)
+            self.assertEqual(value["api_mode"], settings.API_MODE_RESPONSES)
+            self.assertNotIn("responses_stream", value)
+            inherited = load_codex_config(
+                config_path, root / "auth.json", project_settings_path=project, api_key="fixture-only-key")
+            self.assertIs(inherited.chat_stream, True)
+            self.assertEqual(inherited.api_mode, settings.API_MODE_RESPONSES)
+            self.assertEqual(inherited.effective_reasoning_effort, "high")
+            for source in (inherited, dict(inherited)):
+                with self.subTest(source=type(source).__name__):
+                    self.assertTrue(CodexResponsesClient(source).config.chat_stream)
+                    self.assertFalse(CodexResponsesClient(source, chat_stream=False).config.chat_stream)
+            self.assertEqual((project.read_bytes(), config_path.read_bytes()), before)
+            self.assertNotIn("fixture-only-key", project.read_text(encoding="utf-8") + repr(inherited.redacted()))
 
     def test_settings_reject_http_urls_credentials_and_unknown_effort(self):
         for change in (

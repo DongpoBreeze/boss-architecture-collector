@@ -112,7 +112,7 @@ def _validated_settings(value: Any) -> dict[str, Any]:
     if not isinstance(verified_for, str) or (verified_for and not _VERIFIED_SIGNATURE_RE.fullmatch(verified_for)):
         raise ProjectProviderError("Chat 思考强度验证记录无效")
     if not isinstance(chat_stream, bool):
-        raise ProjectProviderError("Chat 流式响应设置无效")
+        raise ProjectProviderError("流式响应设置无效")
     return {
         "base_url": base_url.strip().rstrip("/"),
         "model": model.strip(),

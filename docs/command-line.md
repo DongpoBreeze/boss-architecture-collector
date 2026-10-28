@@ -170,7 +170,7 @@ python process_architecture.py --root "D:\岗位数据\采集源" --output-root 
 
 JD 补抓会检查专用 Chrome CDP / 登录，必要时尝试准备浏览器并等待，最长登录检查 300 秒；本机 CDP 地址加入子进程代理绕行列表。遇验证保存并等待，终端按 Enter 重试当前批次，输入 q 可退出后续跑。使用 `all` 遇验证不会继续 AI / 报告；子进程致命失败不会被当作完成。`--no-wait-on-gate` 不代表验证通过，不能只凭退出码判定采集完整。
 
-模型初始默认使用 `gpt-5.6-luna` / `max` 和 Responses API；AI 页面保存的项目配置也会由 CLI 默认读取。项目 URL 读取本机项目配置，API Key 读取 Windows Credential Manager；两者均不写入项目结果或全局 Codex 配置。CLI 显式 `--base-url`、`--api-key`、`--model`、`--reasoning-effort`、`--api-mode` 只覆盖本次请求，不保存配置。Chat 默认不发送强度；可在 GUI 选择流式选项、验证强度并保存，CLI 读取同一份验证记录。覆盖后的地址、模型、强度、流式选项必须匹配验证记录，否则不发送参数；`--reasoning-effort` 本身不能绕过验证。更换有效请求配置后显式重跑会使不匹配的缓存失效；Chat 仅实际发送的强度参与缓存签名。默认 Responses 沿用原签名，旧成功缓存仍可复用，历史报告不会自动改写。GUI 的协议选择、读取模型和极短连接测试见[工作流契约](desktop-review-workflow.md)。
+模型初始默认使用 `gpt-5.6-luna` / `max` 和 Responses API；AI 页面保存的项目配置也会由 CLI 默认读取。项目 URL 读取本机项目配置，API Key 读取 Windows Credential Manager；两者均不写入项目结果或全局 Codex 配置。CLI 显式 `--base-url`、`--api-key`、`--model`、`--reasoning-effort`、`--api-mode` 只覆盖本次请求，不保存配置。GUI 的“使用流式响应”对两种协议均有效；兼容沿用本机 `chat_stream` 配置键，CLI 同样读取，缺省为非流式。Chat 默认不发送强度；可在 GUI 选择流式选项、验证强度并保存，CLI 读取同一份验证记录。覆盖后的地址、模型、强度、流式选项必须匹配验证记录，否则不发送参数；`--reasoning-effort` 本身不能绕过验证。更换有效请求配置后显式重跑会使不匹配的缓存失效；Chat 仅实际发送的强度参与缓存签名。默认 Responses 沿用原签名，仅切换流式不使成功缓存失效，历史报告不会自动改写。GUI 的协议选择、读取模型和极短连接测试见[工作流契约](desktop-review-workflow.md)。
 
 ## 同样本离线重筛
 
