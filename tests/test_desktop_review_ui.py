@@ -86,6 +86,29 @@ class ReviewUIHelpersTests(unittest.TestCase):
         for phrase in ("六维", "旧维度", "能力差距", "confidence", "模型证据"):
             self.assertNotIn(phrase, detail)
 
+    def test_manual_ai_row_reason_preserves_original_judgment_and_technical_failure(self):
+        app = SimpleNamespace(stage=SimpleNamespace(get=lambda: "llm"), _previews=set(),
+                              _stage_info=lambda: {"manual_choices": {"pending": True}, "confirmed": False})
+        failed = review_pipeline._analyze_ai_stage({"job_id": "pending", "jd": "完整职责正文"},
+                 {"job_id": "pending", "review_format": "simple-v1", "status": "failed", "error": "fixture timeout"})
+        original = copy.deepcopy(failed)
+        reason = ui.ReviewDesktopApp._row_reason(app, failed)
+        for phrase in ("人工保留（待确认）", "未完成有效判断", "fixture timeout"):
+            self.assertIn(phrase, reason)
+        self.assertNotIn("不在保留或剔除名单", reason)
+        self.assertEqual(failed, original)
+
+    def test_report_row_reason_uses_confirmed_manual_decision_instead_of_raw_ai_pending(self):
+        app = SimpleNamespace(stage=SimpleNamespace(get=lambda: "report"), _previews=set())
+        job = {"job_id": "pending", "classification": "待核实", "analysis_pending": True,
+               "review_selection": {"llm": {"status": "completed", "in_input": True, "has_result": True,
+                   "confirmed": True, "pending": False, "manual_keep": True, "keep": True}}}
+        self.assertEqual(ui.ReviewDesktopApp._row_reason(app, job), "海投池 · AI复核已确认人工保留")
+        job["review_selection"]["llm"].update(manual_keep=False, keep=False)
+        self.assertEqual(ui.ReviewDesktopApp._row_reason(app, job), "暂不投 · AI复核已确认人工剔除")
+        job["review_selection"]["llm"]["confirmed"] = False
+        self.assertIn("待核实", ui.ReviewDesktopApp._row_reason(app, job))
+
     def test_saved_list_queues_are_mutually_exclusive_and_old_labels_are_never_rescored(self):
         examples = (
             ({"list_queue": "relevant", "list_pass": False}, ("relevant", False)),
@@ -387,6 +410,35 @@ class ReviewTkTests(unittest.TestCase):
 
     def queue_ids(self, queue):
         return [job_id(job) for job in self.app._rows["shortlist"] if job.get("list_queue") == queue]
+
+    def complete_ai_with_pending(self):
+        def pending_executor(task, stage, **options):
+            if stage != "llm":
+                return self.fake_executor(task, stage, **options)
+            task.begin(stage)
+            rows = []
+            for index, job in enumerate(task.input_jobs(stage)):
+                review = {"job_id": job_id(job), "status": "success", "review_format": ui.SIMPLE_REVIEW_FORMAT,
+                          "判断": "符合", "理由": "企业方案交付相关。"}
+                if index == 0:
+                    review.update(判断="信息不足", 理由="缺少本人交付职责说明。")
+                elif index == 1:
+                    review = {"job_id": job_id(job), "status": "failed", "review_format": ui.SIMPLE_REVIEW_FORMAT,
+                              "error": "fixture timeout"}
+                elif index == 2:
+                    job.update(jd="", jd_completeness="missing")
+                    review = None
+                elif index == 3:
+                    review.pop("理由")  # Invalid model result remains independently pending.
+                elif index == 4:
+                    review = None
+                rows.append(review_pipeline._analyze_ai_stage(job, review))
+            task.finish(stage, rows, stats={"review_format": ui.SIMPLE_REVIEW_FORMAT})
+            return task.snapshot()
+
+        self.app.executor = pending_executor
+        self.complete_through("llm")
+        return list(self.app._stage_info()["pending_ids"])
 
     def test_reset_button_is_visible_on_all_five_pages_and_disabled_until_a_first_run(self):
         self.assertTrue(self.app.reset_button.instate(["disabled"]))
@@ -2323,7 +2375,7 @@ class ReviewTkTests(unittest.TestCase):
         self.assertEqual(len(self.calls), calls)
         self.browser.assert_not_called()
 
-    def test_suggestion_colors_are_independent_of_manual_keep_choices(self):
+    def test_ai_manual_keep_choices_override_suggestion_colors_without_changing_ai_evidence(self):
         def suggestions(task, stage, **options):
             if stage != "llm":
                 return self.fake_executor(task, stage, **options)
@@ -2361,10 +2413,14 @@ class ReviewTkTests(unittest.TestCase):
             with self.subTest(theme=theme):
                 app._set_theme(theme, persist=False)
                 app._render_rows()
-                self.assertEqual(app.results_table.item(keep, "tags"), ("suggest_keep",))
-                self.assertEqual(app.results_table.item(exclude, "tags"), ("suggest_exclude",))
+                self.assertEqual(app.results_table.item(keep, "tags"), ("excluded",))
+                self.assertEqual(app.results_table.item(exclude, "tags"), ("kept",))
                 self.assertEqual(app.results_table.set(keep, "keep"), "☐")
                 self.assertEqual(app.results_table.set(exclude, "keep"), "☑")
+                self.assertIn("人工剔除", app.results_table.set(keep, "reason"))
+                self.assertIn("AI判断：符合", app.results_table.set(keep, "reason"))
+                self.assertIn("人工保留", app.results_table.set(exclude, "reason"))
+                self.assertIn("AI判断：不符合", app.results_table.set(exclude, "reason"))
                 self.assertEqual(self.task_json(), saved, "rendering must not modify task decisions")
         self.browser.assert_not_called()
 
@@ -2404,6 +2460,187 @@ class ReviewTkTests(unittest.TestCase):
         self.assertNotIn("旧代码证据不足", detail)
         self.browser.assert_not_called()
 
+    def test_ai_pending_single_detail_keyboard_and_exclude_controls_save_manual_choices(self):
+        pending = self.complete_ai_with_pending()
+        app, task = self.app, self.app.task
+        self.assertEqual(len(pending), 5)
+        original = copy.deepcopy(app._rows["llm"])
+        result_file = task.path / app._stage_info()["result_file"]
+        result_bytes, calls = result_file.read_bytes(), len(self.calls)
+        app._focus_id = pending[0]
+        app.results_table.focus(pending[0])
+        app.results_table.selection_set(pending[0])
+        app._show_selected_job()
+        self.assertNotIn("disabled", app.detail_toggle_button.state())
+        self.assertEqual(app.detail_toggle_button.cget("text"), "人工保留当前岗位")
+        self.assertIn("当前名单：待核实", app.detail_text.get("1.0", "end-1c"))
+        app.detail_toggle_button.invoke()
+        self.wait_idle()
+        self.assertTrue(app._stage_info()["manual_choices"][pending[0]])
+        self.assertEqual(app.results_table.set(pending[0], "keep"), "☑")
+        self.assertIn("人工保留（待确认）", app.results_table.set(pending[0], "reason"))
+        self.assertIn("当前名单：保留 · 人工决定 · 待确认", app.detail_text.get("1.0", "end-1c"))
+        self.assertIn("AI判断：信息不足", app.detail_text.get("1.0", "end-1c"))
+        self.assertNotIn("不进入保留或剔除名单", app.detail_text.get("1.0", "end-1c"))
+        app._focus_id = pending[1]
+        app.results_table.focus(pending[1])
+        app.results_table.selection_set(pending[1])
+        app._table_space()
+        self.wait_idle()
+        self.assertTrue(app._stage_info()["manual_choices"][pending[1]])
+        app._show_detail()
+        self.assertIn("fixture timeout", app.detail_text.get("1.0", "end-1c"))
+        self.assertIn("未产生模型理由", app.detail_text.get("1.0", "end-1c"))
+        self.root.geometry("1024x820")
+        self.root.deiconify()
+        app.search.set(pending[3])
+        self.pump()
+        self.root.update()
+        self.assertTrue(app.results_table.bind("<Double-1>"))
+        x, y, width, height = app.results_table.bbox(pending[3], "job")
+        event = SimpleNamespace(x=x + min(width // 2, 50), y=y + min(height // 2, 5))
+        self.assertEqual(app.results_table.identify_row(event.y), pending[3])
+        self.assertEqual(app.results_table.identify_region(event.x, event.y), "cell")
+        self.assertEqual(app._table_double_click(event), "break")
+        self.wait_idle()
+        self.assertTrue(app._stage_info()["manual_choices"][pending[3]])
+        app.search.set("")
+        self.pump()
+        app.results_table.selection_set(pending[2])
+        app.exclude_button.invoke()
+        self.wait_idle()
+        info = app._stage_info()
+        self.assertFalse(info["manual_choices"][pending[2]])
+        self.assertIn(pending[2], info["excluded_ids"])
+        self.assertEqual(app.results_table.set(pending[2], "keep"), "☐")
+        self.assertEqual(app.filter_buttons["待核实"].cget("text"), "待核实 1")
+        self.assertIn("待核实 1", app.count_text.get())
+        self.assertFalse(info["confirmed"])
+        self.assertEqual(app._rows["llm"], original, "manual controls must preserve immutable AI evidence")
+        self.assertEqual(result_file.read_bytes(), result_bytes)
+        self.assertEqual(len(self.calls), calls, "manual selection must not run an executor")
+        self.browser.assert_not_called()
+        self.assertEqual((self.source / "raw/current/shanghai/jobs.json").read_bytes(), self.raw_before)
+
+    def test_ai_pending_page_and_mixed_bulk_choices_reset_to_three_default_lists(self):
+        pending = self.complete_ai_with_pending()
+        app = self.app
+        related = app._stage_info()["keep_ids"][0]
+        app.results_table.selection_set([related, pending[0]])
+        app.exclude_button.invoke()
+        self.wait_idle()
+        self.assertTrue({related, pending[0]} <= set(app._stage_info()["excluded_ids"]))
+        app.results_table.selection_set([related, pending[0]])
+        self.assertEqual(app.restore_button.cget("text"), "保留所选")
+        app.restore_button.invoke()
+        self.wait_idle()
+        self.assertTrue({related, pending[0]} <= set(app._stage_info()["keep_ids"]))
+        app.filter.set("待核实")
+        self.pump()
+        visible = set(app._page_ids)
+        self.assertEqual(visible, set(pending[1:]))
+        app.select_page_button.invoke()
+        self.wait_idle()
+        self.assertTrue(visible <= set(app._stage_info()["keep_ids"]))
+        self.assertEqual(app._stage_info()["pending_ids"], [])
+        self.assertEqual(app.filter_buttons["待核实"].cget("text"), "待核实 0")
+        app.recommend_button.invoke()
+        self.wait_idle()
+        self.assertEqual(app._stage_info()["manual_choices"], {})
+        self.assertEqual(app._stage_info()["pending_ids"], pending)
+        self.assertEqual(app.filter_buttons["待核实"].cget("text"), "待核实 5")
+        self.assertEqual(set(app._page_ids), set(pending))
+        app._focus_id = pending[0]
+        app._show_detail()
+        self.assertIn("当前名单：待核实 · 尚未人工处理", app.detail_text.get("1.0", "end-1c"))
+        info = app._stage_info()
+        groups = [set(info[key]) for key in ("keep_ids", "excluded_ids", "pending_ids")]
+        self.assertEqual(set.union(*groups), set(info["result_ids"]))
+        self.assertTrue(all(not groups[left] & groups[right] for left in range(3) for right in range(left + 1, 3)))
+
+    def test_ai_pending_manual_choices_survive_reopen_and_stale_snapshot_cannot_edit(self):
+        pending = self.complete_ai_with_pending()
+        app, task = self.app, self.app.task
+        app._set_keep([pending[0]], True)
+        self.wait_idle()
+        root, reopened = self.make_window()
+        reopened._open_task(task.path)
+        self.wait_idle(reopened, root)
+        reopened._select_stage("llm")
+        self.wait_idle(reopened, root)
+        self.assertIn(pending[0], reopened._stage_info()["keep_ids"])
+        self.assertIn("人工保留（待确认）", reopened.results_table.set(pending[0], "reason"))
+        self.assertNotIn("disabled", reopened.detail_toggle_button.state())
+        task.set_keep("llm", [pending[1]], False)
+        app._set_keep([pending[2]], True)
+        self.wait_idle()
+        self.assertIn("其他窗口修改", self.errors.call_args.args[1])
+        info = app._stage_info()
+        self.assertFalse(info["manual_choices"][pending[1]])
+        self.assertNotIn(pending[2], info["manual_choices"])
+        self.assertIn(pending[2], info["pending_ids"])
+
+    def test_legacy_rich_ai_results_remain_read_only_in_the_tk_controls(self):
+        self.complete_through("fetch-jd", confirm_last=True)
+        app, task = self.app, self.app.task
+        task.begin("llm")
+        rows = task.input_jobs("llm")
+        for job in rows:
+            job["llm_review"] = {"job_id": job_id(job), "status": "success", "summary": "旧版只读判断",
+                                 "dimensions": {}, "target_relevance": {"assessment": "related"}}
+        task.finish("llm", rows)
+        app._apply_view(task, app._capture_view(task))
+        app._select_stage("llm")
+        before = task.snapshot()
+        self.assertFalse(app._can_edit())
+        for button in (app.detail_toggle_button, app.select_page_button, app.restore_button,
+                       app.exclude_button, app.recommend_button):
+            self.assertIn("disabled", button.state())
+        app._set_keep([job_id(rows[0])], True)
+        app._toggle_focused_keep()
+        self.assertEqual(task.snapshot(), before)
+        self.assertIn("只读历史", app.detail_text.get("1.0", "end-1c"))
+
+    def test_confirmed_ai_manual_keep_shows_report_pool_and_current_counts_with_raw_pending_evidence(self):
+        pending = self.complete_ai_with_pending()
+        app = self.app
+        app._set_keep([pending[0]], True)
+        self.wait_idle()
+        app._set_keep([pending[1]], False)
+        self.wait_idle()
+        app._confirm_stage()
+        self.wait_idle()
+        self.assertEqual(app.stage.get(), "report")
+        app.executor = ui.execute_stage
+        with patch.object(review_pipeline, "_run_child", side_effect=AssertionError("no external process is allowed")), \
+                patch("llm_client.load_codex_config", side_effect=AssertionError("no credentials are allowed")):
+            app._run_stage()
+            self.wait_idle()
+        self.assertEqual(app._stage_info()["status"], "completed", self.errors.call_args_list)
+        rows = {job_id(row): row for row in app._rows["report"]}
+        kept = rows[pending[0]]
+        self.assertTrue(kept["analysis_pending"], "the AI evidence remains pending after a human decision")
+        self.assertEqual(kept["classification"], "海投池")
+        self.assertTrue(app._kept(kept))
+        app.filter.set("保留")
+        self.pump()
+        self.assertIn(pending[0], app._page_ids)
+        self.assertEqual(app.results_table.set(pending[0], "keep"), "☑")
+        self.assertIn("已确认人工保留", app.results_table.set(pending[0], "reason"))
+        self.assertNotIn("不在保留或剔除名单", app.results_table.set(pending[0], "reason"))
+        app._focus_id = pending[0]
+        app._show_detail()
+        self.assertIn("已有分层：海投池", app.detail_text.get("1.0", "end-1c"))
+        self.assertIn("已确认人工保留", app.detail_text.get("1.0", "end-1c"))
+        app.filter.set("待核实")
+        self.pump()
+        self.assertNotIn(pending[0], app._page_ids)
+        self.assertNotIn(pending[1], app._page_ids)
+        current = app._stage_info()["stats"]["classification_counts"]["待核实"]
+        self.assertEqual(app.filter_buttons["待核实"].cget("text"), f"待核实 {current}")
+        self.assertIn(f"待核实 {current}", app.count_text.get())
+        self.assertIn("disabled", app.detail_toggle_button.state())
+
     def test_running_ai_checkpoint_updates_three_exclusive_lists_and_pending_filter(self):
         self.complete_through("fetch-jd", confirm_last=True)
         app, task = self.app, self.app.task
@@ -2436,6 +2673,14 @@ class ReviewTkTests(unittest.TestCase):
             app.stage.set("llm")
             app._apply_view(task, view)
             app._render()
+            before = copy.deepcopy(task.snapshot())
+            self.assertFalse(app._can_edit())
+            self.assertIn("disabled", app.detail_toggle_button.state())
+            app._set_keep([job_id(jobs[2])], True)
+            app._select_page()
+            app._focus_id = job_id(jobs[2])
+            app._toggle_focused_keep()
+            self.assertEqual(task.snapshot(), before, "running AI checkpoints remain read-only")
             self.assertEqual(app.filter_buttons["保留"].cget("text"), "保留 1")
             self.assertEqual(app.filter_buttons["剔除"].cget("text"), "剔除 1")
             self.assertEqual(app.filter_buttons["待核实"].cget("text"), f"待核实 {len(jobs) - 2}")

@@ -834,6 +834,80 @@ class AtomicSelectionTests(TaskTestCase):
         self.assertEqual(self.task.snapshot(), saved)
 
 
+class ManualAIChoicesTests(TaskTestCase):
+    def seed_pending_ai(self):
+        self.run_import()
+        self.run_stage("shortlist", {key: {"list_pass": True} for key in "abc"})
+        self.run_stage("fetch-jd", {key: {"jd": f"JD {key}", "recommended_keep": True} for key in "abc"})
+        rows = [
+            {"job_id": "a", "llm_review": {"job_id": "a", "status": "success", "review_format": "simple-v1",
+                                           "判断": "信息不足", "理由": "职责不足以判断。"}},
+            {"job_id": "b", "llm_review": {"job_id": "b", "status": "failed", "review_format": "simple-v1",
+                                           "error": "Offline fixture failure"}},
+            {"job_id": "c", "review_format": "simple-v1", "jd_completeness": "missing"},
+        ]
+        self.task.begin("llm")
+        self.task.finish("llm", rows)
+        return rows
+
+    def test_pending_choices_survive_rerun_and_open_without_changing_ai_evidence(self):
+        rows = self.seed_pending_ai()
+        before_rows = self.task.jobs("llm")
+        self.task.set_keep("llm", ["a"], True)
+        self.task.set_keep("llm", ["b"], False)
+        info = self.task.stage_info("llm")
+        self.assertEqual((info["keep_ids"], info["excluded_ids"], info["pending_ids"]), (["a"], ["b"], ["c"]))
+        self.assertEqual((info["recommended_keep_ids"], info["recommended_exclude_ids"]), ([], []))
+        self.assertEqual(self.task.jobs("llm"), before_rows)
+        self.task = tasks.ReviewTask.open(self.task.path)
+        self.addCleanup(self.task._release_run)
+        self.assertEqual(self.task.stage_info("llm")["manual_choices"], {"a": True, "b": False})
+        self.task.begin("llm")
+        self.task.finish("llm", rows)
+        self.assertEqual(self.task.stage_info("llm")["manual_choices"], {"a": True, "b": False})
+        self.assertEqual(self.task.confirm("llm"), ["a"])
+        self.assertEqual([tasks.job_id(row) for row in self.task.input_jobs("report")], ["a"])
+        audit = {row["job_id"]: row["review_selection"]["llm"] for row in self.task.all_jobs()}
+        self.assertTrue(audit["a"]["confirmed"])
+        self.assertTrue(audit["a"]["manual_keep"])
+        self.assertFalse(audit["b"]["manual_keep"])
+        self.assertIsNone(audit["c"]["keep"])
+        self.task.apply_recommendations("llm")
+        info = self.task.stage_info("llm")
+        self.assertEqual((info["keep_ids"], info["excluded_ids"], info["pending_ids"]), ([], [], list("abc")))
+        self.assertEqual(info["manual_choices"], {})
+        self.assertFalse(info["confirmed"])
+        self.assertEqual(self.task.jobs("llm"), before_rows)
+
+    def test_pending_bulk_replace_is_atomic_and_rejects_an_old_snapshot(self):
+        self.seed_pending_ai()
+        expected = self.task.stage_info("llm")
+        self.task.set_keep("llm", ["b"], True, replace_selection=True, expected_stage=expected)
+        info = self.task.stage_info("llm")
+        self.assertEqual((info["keep_ids"], info["excluded_ids"], info["pending_ids"]), (["b"], ["a", "c"], []))
+        self.assertEqual(info["manual_choices"], {"a": False, "b": True, "c": False})
+        saved = self.task.snapshot()
+        with self.assertRaisesRegex(tasks.TaskStateError, "其他窗口"):
+            self.task.set_keep("llm", ["a"], True, expected_stage=expected)
+        self.assertEqual(self.task.snapshot(), saved)
+        self.task.set_keep("llm", [], True, replace_selection=True, expected_stage=info)
+        self.assertEqual(self.task.stage_info("llm")["excluded_ids"], list("abc"))
+
+    def test_same_membership_manual_intent_requires_new_confirmation_and_report(self):
+        self.run_all()
+        old = self.task.stage_info("llm")
+        self.assertTrue(old["confirmed"])
+        self.task.set_keep("llm", ["a"], True, expected_stage=old)
+        info = self.task.stage_info("llm")
+        self.assertEqual(info["keep_ids"], old["keep_ids"])
+        self.assertFalse(info["confirmed"])
+        self.assertGreater(info["revision"], old["revision"])
+        self.assertEqual(self.task.stage_info("report")["status"], "stale")
+        self.task.confirm("llm")
+        self.task.apply_recommendations("llm")
+        self.assertFalse(self.task.stage_info("llm")["confirmed"])
+
+
 class PersistenceTests(TaskTestCase):
     def test_legacy_manifest_without_redo_count_opens_without_rewrite(self):
         self.run_import()
@@ -890,21 +964,23 @@ class PersistenceTests(TaskTestCase):
                       reopened._load()["stages"]["llm"]):
             self.assertEqual(state["recommended_keep_ids"], ["a"])
             self.assertEqual(state["recommended_exclude_ids"], ["b"])
-            self.assertEqual(state["pending_ids"], ["c"])
-            self.assertEqual(state["keep_ids"], [])
+            self.assertEqual(state["pending_ids"], [])
+            self.assertEqual(state["keep_ids"], ["c"])
             self.assertEqual(state["excluded_ids"], ["a", "b"])
-            self.assertEqual(state["manual_choices"], {"a": False, "outside-old-input": True})
+            self.assertEqual(state["manual_choices"], {"a": False, "c": True, "outside-old-input": True})
         self.assertIsNone(next(row for row in reopened.jobs("llm") if row["job_id"] == "c")["recommended_keep"])
         self.assertEqual(manifest_path.read_bytes(), legacy_bytes, "read-only migration must not rewrite an old manifest")
 
         reopened.set_keep("llm", ["b"], True)
         saved = reopened.stage_info("llm")
-        self.assertEqual(saved["keep_ids"], ["b"])
+        self.assertEqual(saved["keep_ids"], ["b", "c"])
         self.assertEqual(saved["excluded_ids"], ["a"])
-        self.assertEqual(saved["pending_ids"], ["c"])
-        self.assertEqual(saved["manual_choices"], {"a": False, "b": True, "outside-old-input": True})
-        with self.assertRaisesRegex(tasks.TaskStateError, "只能待核实"):
-            reopened.set_keep("llm", ["c"], False)
+        self.assertEqual(saved["pending_ids"], [])
+        self.assertEqual(saved["manual_choices"], {"a": False, "b": True, "c": True, "outside-old-input": True})
+        reopened.set_keep("llm", ["c"], False)
+        self.assertEqual(reopened.stage_info("llm")["excluded_ids"], ["a", "c"])
+        reopened.apply_recommendations("llm")
+        self.assertEqual(reopened.stage_info("llm")["pending_ids"], ["c"])
 
     def test_save_open_round_trip_keeps_scope_choices_progress_and_audit(self):
         self.run_import()

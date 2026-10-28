@@ -10,11 +10,102 @@ from unittest.mock import patch
 import llm_client
 import review_cache
 import review_pipeline as pipeline
-from desktop_tasks import ReviewTask, TaskStateError, job_id
+from desktop_tasks import ReviewTask, job_id
 from tests.test_review_pipeline import PipelineCase
 
 
 class SimpleReviewIntegrationTests(PipelineCase):
+    def test_confirmed_pending_manual_decisions_drive_report_without_changing_ai_results(self):
+        self.seed_llm_input(complete=("a", "b"))
+        prompt = pipeline._task_report_prompt(self.task)
+        rows = []
+        for job in self.task.input_jobs("llm"):
+            key = job_id(job)
+            review = None
+            if key == "a":
+                review = {"job_id": key, "status": "success", "review_format": "simple-v1",
+                          "判断": "信息不足", "理由": "保留原始信息不足理由。", "cache_signature": "offline-signature",
+                          "cache_input_signature": review_cache.review_input_signature(pipeline.processor.model_input(job), prompt)}
+            elif key == "b":
+                review = {"job_id": key, "status": "failed", "review_format": "simple-v1",
+                          "error": "Offline model request failed"}
+            rows.append(pipeline._analyze_ai_stage(job, review))
+        self.task.begin("llm")
+        self.task.finish("llm", rows, stats={"review_format": "simple-v1"})
+        original = {job_id(row): row for row in self.task.jobs("llm")}
+        self.task.set_keep("llm", ["a", "b"], True)
+        self.task.set_keep("llm", ["d"], False)
+        self.assertEqual(self.task.stage_info("llm")["pending_ids"], [])
+        self.task = ReviewTask.open(self.task.path)
+        self.addCleanup(self.task._release_run)
+        self.task.confirm("llm")
+        with patch.object(pipeline, "_run_child", side_effect=AssertionError("report started a subprocess")), \
+             patch("llm_client.load_codex_config", side_effect=AssertionError("report read credentials")):
+            snapshot = self.run_step("report")
+        self.assertEqual(snapshot["stages"]["report"]["status"], "completed")
+        stats = snapshot["stages"]["report"]["stats"]
+        report = {job_id(row): row for row in self.read(Path(stats["json_path"]))["jobs"]}
+        pool = self.read(Path(stats["pool_path"]))["jobs"]
+        markdown = Path(stats["markdown_path"]).read_text(encoding="utf-8")
+        self.assertEqual({key: row["classification"] for key, row in report.items()},
+                         {"a": "海投池", "b": "海投池", "c": "暂不投", "d": "暂不投"})
+        self.assertEqual({job_id(row) for row in pool}, {"a", "b"})
+        self.assertEqual(stats["pending_verification_count"], 0)
+        self.assertEqual(stats["pool_count"], 2)
+        for key in ("a", "b", "d"):
+            self.assertEqual(report[key]["report_decision_source"], "manual_llm_confirmed")
+            self.assertEqual(report[key]["report_manual_keep"], key != "d")
+            self.assertEqual(report[key]["model_status"], original[key]["model_status"])
+            self.assertEqual(report[key].get("ai_judgment"), original[key].get("ai_judgment"))
+            self.assertEqual(report[key].get("ai_reason"), original[key].get("ai_reason"))
+            self.assertTrue(report[key]["analysis_pending"])
+        self.assertEqual(report["a"]["ai_judgment"], "信息不足")
+        self.assertEqual(report["b"]["model_status"], "failed")
+        self.assertIsNone(report["d"].get("ai_judgment"))
+        self.assertIn("已确认人工保留", markdown)
+        self.assertIn("已确认人工剔除", markdown)
+        self.assertIn("已确认人工保留（AI复核阶段）", markdown.split("以下为全部岗位详细证据。", 1)[0])
+        self.assertIn("保留原始信息不足理由。", markdown)
+        self.assertIn("## 海投池（2）", markdown)
+        self.assertIn("## 暂不投（2）", markdown)
+        self.assertIn("## 待核实（0）", markdown)
+
+    def test_report_manual_authority_requires_a_current_confirmed_result(self):
+        processor = pipeline.processor
+        audit = {"status": "completed", "in_input": True, "has_result": True,
+                 "confirmed": True, "pending": False, "keep": True, "manual_keep": True}
+        item = {"job_id": "manual-pending", "review_format": "simple-v1", "classification": "海投池",
+                "analysis_pending": True, "ai_judgment": "信息不足", "model_status": "failed",
+                "review_selection": {"llm": audit}}
+        effective = processor.report_decision(item)
+        self.assertEqual(effective["classification"], "海投池")
+        self.assertTrue(processor.report_pool_eligible(effective))
+        self.assertEqual(processor.report_decision(effective), effective)
+        for override in ({"confirmed": False}, {"status": "stale"}, {"status": "running"},
+                         {"has_result": False}, {"in_input": False}, {"keep": False},
+                         {"manual_keep": None}, {"manual_keep": 1}, {"pending": True}):
+            with self.subTest(override=override):
+                invalid = {**effective, "review_selection": {"llm": {**audit, **override}}}
+                actual = processor.report_decision(invalid)
+                self.assertEqual(actual["classification"], "待核实")
+                self.assertNotIn("report_manual_keep", actual)
+                self.assertNotIn("report_decision_source", actual)
+                self.assertFalse(processor.report_pool_eligible(invalid))
+        prior_exclusion = processor.report_decision({**item, "excluded_at": "shortlist"})
+        self.assertEqual(prior_exclusion["classification"], "暂不投")
+        self.assertEqual(prior_exclusion["report_decision_source"], "confirmed_exclusion")
+        self.assertFalse(processor.report_pool_eligible(prior_exclusion))
+        rejected = processor.report_decision({**item, "review_selection": {"llm": {
+            **audit, "keep": False, "manual_keep": False}}})
+        self.assertEqual(rejected["classification"], "暂不投")
+        self.assertFalse(processor.report_pool_eligible(rejected))
+        for judgment, expected in (("符合", "海投池"), ("不符合", "暂不投"), (None, "待核实")):
+            with self.subTest(previous_manual_classification=judgment):
+                invalid = {**effective, "analysis_pending": False, "ai_judgment": judgment,
+                           "review_selection": {"llm": {**audit, "confirmed": False}}}
+                self.assertEqual(processor.report_decision(invalid)["classification"], expected)
+                self.assertEqual(processor.report_pool_eligible(invalid), judgment == "符合")
+
     def test_report_does_not_overrule_a_valid_simple_judgment_with_old_code_gates(self):
         job = {
             "job_id": "retained-after-manual-review",
@@ -137,8 +228,13 @@ class SimpleReviewIntegrationTests(PipelineCase):
             checkpoint = self.read(runtime / "prepared/llm_reviews.json")
             self.assertTrue(any(entry.get("review") == legacy for entry in checkpoint["previous_reviews"]))
             for keep in (True, False):
-                with self.subTest(pending_keep=keep), self.assertRaises(TaskStateError):
+                with self.subTest(pending_keep=keep):
                     self.task.set_keep("llm", ["d"], keep)
+                    selection = self.task.stage_info("llm")
+                    self.assertEqual(selection["pending_ids"], [])
+                    self.assertIn("d", selection["keep_ids"] if keep else selection["excluded_ids"])
+                    self.assertEqual(selection["manual_choices"]["d"], keep)
+            self.task.apply_recommendations("llm")
             self.task.set_keep("llm", ["a"], False)
             self.task = ReviewTask.open(self.task.path)
             self.addCleanup(self.task._release_run)

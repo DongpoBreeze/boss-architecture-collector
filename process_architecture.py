@@ -2765,6 +2765,8 @@ def _report_overview_lines(jobs: list[dict[str, Any]], pool: list[dict[str, Any]
                 "missing": "JD缺失（待核实）",
                 "unknown": "JD完整性待核实（旧数据未记录完整度）",
             }[_report_jd_completeness(job)]]
+            if report_manual_choice(job) is True:
+                flags.append("已确认人工保留（AI复核阶段）")
             salary_flags = job.get("salary_flags")
             if isinstance(salary_flags, list):
                 flags.extend(text(flag) for flag in salary_flags if text(flag))
@@ -2819,6 +2821,10 @@ def _report_job_lines(job: dict[str, Any]) -> list[str]:
             f"  - 模型：{display(review.get('review_model'))}；协议：{display(review.get('review_api_mode'))}；缓存：{display(job.get('model_cache_validation'))}",
             f"  - 待核实：{display(job.get('verification') or job.get('verify') or [])}",
         ]
+        manual = report_manual_choice(job)
+        if manual is not None:
+            lines.append("  - 报告决定来源：AI 语义复核已确认人工" + ("保留" if manual else "剔除")
+                         + "；原始 AI 判断与技术状态保留追溯。")
         for source in job.get("observed_in", []):
             if isinstance(source, dict):
                 lines.append("  - 检索来源：" + display(source))
@@ -2915,12 +2921,49 @@ def report_prompt(prompt_file: Path | None = None) -> str | None:
         return None
 
 
+def report_manual_choice(item: dict[str, Any]) -> bool | None:
+    """Return only a current, explicitly confirmed AI-stage manual decision.
+
+    ``ReviewTask.all_jobs`` supplies this per-job audit from the validated
+    manifest. A saved intent outside the current input/result, a stale result,
+    or an unconfirmed selection must never authorize the actionable pool.
+    """
+    audit = item.get("review_selection")
+    selection = audit.get("llm") if isinstance(audit, dict) else None
+    if (isinstance(selection, dict)
+            and selection.get("status") == "completed"
+            and selection.get("in_input") is True and selection.get("has_result") is True
+            and selection.get("confirmed") is True and selection.get("pending") is False
+            and type(selection.get("manual_keep")) is bool
+            and selection.get("keep") is selection["manual_keep"]):
+        return selection["manual_keep"]
+    return None
+
+
 def report_decision(item: dict[str, Any]) -> dict[str, Any]:
     """Project report eligibility while preserving the original audit fields."""
     result = dict(item)
-    classification = "暂不投" if result.get("excluded_at") else "待核实" if (
-        result.get("analysis_pending") or result.get("ai_judgment") == "信息不足"
-    ) else result.get("classification")
+    manual = report_manual_choice(result)
+    # Recompute derived provenance instead of trusting a previous report's label.
+    result.pop("report_manual_keep", None)
+    result.pop("report_decision_source", None)
+    if result.get("excluded_at"):
+        classification = "暂不投"
+        result["report_decision_source"] = "confirmed_exclusion"
+    elif manual is not None:
+        classification = "海投池" if manual else "暂不投"
+    elif result.get("analysis_pending") or result.get("ai_judgment") == "信息不足":
+        classification = "待核实"
+    elif result.get("review_format") == "simple-v1":
+        # A previous manual classification is derived output, not authority.
+        # Once its confirmation is gone, recover only the actual AI decision.
+        classification = {"符合": "海投池", "不符合": "暂不投"}.get(result.get("ai_judgment"), "待核实")
+    else:
+        classification = result.get("classification")
+    if manual is not None:
+        result["report_manual_keep"] = manual
+        if not result.get("excluded_at") or result.get("excluded_at") == "llm":
+            result["report_decision_source"] = "manual_llm_confirmed"
     if classification != result.get("classification"):
         result.setdefault("rule_classification", result.get("classification"))
         result["classification"] = classification
@@ -2929,9 +2972,11 @@ def report_decision(item: dict[str, Any]) -> dict[str, Any]:
 
 def report_pool_eligible(item: dict[str, Any]) -> bool:
     """Use the same actionable-pool boundary for CLI and desktop reports."""
-    return (item.get("classification") in ("重点投递", "海投池")
-            and not item.get("analysis_pending") and item.get("ai_judgment") != "信息不足"
-            and not item.get("excluded_at"))
+    decision = report_decision(item)
+    return (decision.get("classification") in ("重点投递", "海投池")
+            and (report_manual_choice(decision) is True or (
+                not decision.get("analysis_pending") and decision.get("ai_judgment") != "信息不足"))
+            and not decision.get("excluded_at"))
 
 
 def analyze_report_job(job: dict[str, Any], review: dict[str, Any] | None, *,

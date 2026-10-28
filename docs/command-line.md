@@ -152,7 +152,7 @@ CLI 默认输出规则：同时给城市和数量时是 `<源根>/test-runs/<城
 
 列表初筛为每岗保存互斥的 `list_queue`（`relevant` 明确相关、`verify` 待核实、`excluded` 剔除）及原因；`list_pass=true` 包含前两类，不设最低评分。`prepared/jd_shortlists/jd_input.json` 保留两类合并建议，同时输出 `jd_relevant.json`、`jd_verify.json`，并在元数据 / manifest 保存三类 `list_queue_counts`（含零值）。这些是方向队列，不是最终投递分层；CLI 默认沿用合并名单补 JD，需人工逐步选择和确认时使用桌面审核任务。
 
-报告与桌面共用 `report_decision / report_pool_eligible`：人工已确认剔除优先，AI 信息不足、失败和未运行项归待核实，不写入 `hai_tou_pool.json`。全量 JSON 和 Markdown 保留对应判断、来源及审计信息，数量按相同分类统计。
+报告与桌面共用 `report_decision / report_pool_eligible`：有效已确认的 AI 人工保留 / 剔除优先归入海投池 / 暂不投，前置已确认剔除仍优先。没有有效人工决定的 AI 信息不足、失败和未运行项归待核实，不写入 `hai_tou_pool.json`。全量 JSON 和 Markdown 保留原始判断、技术状态、来源及人工审计信息，数量按相同分类统计。普通 CLI 没有人工确认记录时仍按 AI 默认三类处理。
 
 自定义采集方案若含新增关键词，CLI `--config` 需包含其历史 catalog；GUI 新建任务会自动合并源内方案，CLI 不做该交接。未来检索选择不能用于删除既有 raw 来源。
 

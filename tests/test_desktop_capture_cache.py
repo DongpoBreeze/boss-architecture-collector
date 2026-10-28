@@ -69,17 +69,46 @@ class TaskViewCacheTests(unittest.TestCase):
         return ui._capture_task(self.task, cache=self.cache)
 
     def test_report_groups_prioritize_manual_exclusion_over_ai_pending(self):
+        manual_audit = {"status": "completed", "in_input": True, "has_result": True,
+                        "confirmed": True, "pending": False, "manual_keep": True, "keep": True}
         jobs = [
             {"job_id": "manual-excluded", "classification": "暂不投", "excluded_at": "import",
              "analysis_pending": True},
             {"job_id": "ai-pending", "classification": "待核实", "analysis_pending": True},
             {"job_id": "actionable", "classification": "海投池", "analysis_pending": False},
+            {"job_id": "manual-kept", "classification": "待核实", "analysis_pending": True,
+             "review_selection": {"llm": manual_audit}},
+            {"job_id": "manual-ai-excluded", "classification": "待核实", "analysis_pending": True,
+             "review_selection": {"llm": {**manual_audit, "manual_keep": False, "keep": False}}},
         ]
         info = {"keep_ids": [], "excluded_ids": [], "pending_ids": []}
         view = ui._row_view(jobs, info, "report", ui.TaskViewCache())
-        self.assertEqual([job_id(job) for job in view["groups"]["剔除"]], ["manual-excluded"])
+        self.assertEqual([job_id(job) for job in view["groups"]["剔除"]], ["manual-excluded", "manual-ai-excluded"])
         self.assertEqual([job_id(job) for job in view["groups"]["待核实"]], ["ai-pending"])
-        self.assertEqual([job_id(job) for job in view["groups"]["保留"]], ["actionable"])
+        self.assertEqual([job_id(job) for job in view["groups"]["保留"]], ["actionable", "manual-kept"])
+
+    def test_ai_pending_manual_edits_reuse_evidence_search_and_refresh_all_three_groups(self):
+        self.complete("fetch-jd")
+        self.task.confirm("fetch-jd")
+        self.task.begin("llm")
+        rows = [ui._analyze_ai_stage(job) for job in self.task.input_jobs("llm")]
+        self.task.finish("llm", rows, stats={"review_format": "simple-v1"})
+        before = self.capture()
+        snapshot = copy.deepcopy(before)
+        self.task.set_keep("llm", ["job-0"], True)
+        self.task.set_keep("llm", ["job-1"], False)
+        with patch.object(desktop_tasks, "_read_json", wraps=desktop_tasks._read_json) as reads, \
+                patch.object(ui, "_build_search", wraps=ui._build_search) as builds:
+            after = self.capture()
+        self.assertEqual(self.checkpoint_reads(reads), [])
+        self.assertEqual(builds.call_count, 1, "only the all-jobs selection audit needs new search text")
+        self.assertIs(after["rows"]["llm"], before["rows"]["llm"])
+        self.assertIs(after["search"]["llm"], before["search"]["llm"])
+        groups = after["row_views"]["llm"]["groups"]
+        self.assertEqual([job_id(job) for job in groups["保留"]], ["job-0"])
+        self.assertEqual([job_id(job) for job in groups["剔除"]], ["job-1"])
+        self.assertEqual([job_id(job) for job in groups["待核实"]], ["job-2"])
+        self.assertEqual(before, snapshot, "selection-only captures must not mutate published evidence")
 
     def checkpoint_reads(self, mock):
         return [call.args[0] for call in mock.call_args_list if call.args[0].name != "task_manifest.json"]

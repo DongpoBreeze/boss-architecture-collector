@@ -217,11 +217,12 @@ class StageRuleTextTests(unittest.TestCase):
         for phrase in ("完整JD", "企业AI解决方案架构师", "AI产品经理", "业务需求分析", "方案设计", "系统集成",
                        "不强求同名", "代码开发", "算法研究", "模型训练", "硬件", "渠道招商", "底层基础设施",
                        "不可误判", "判断", "理由", "一两句话", "符合→海投池", "不符合→暂不投", "独立待核实",
-                       "不进入保留或剔除名单", "不走代码语义兜底剔除", "缺失/部分JD", "gpt-5.6-luna", "思考强度max",
+                       "默认待人工核实", "可逐条或批量人工保留或剔除", "有效已确认人工保留或剔除优先",
+                       "原AI证据保留", "不走代码语义兜底剔除", "缺失/部分JD", "gpt-5.6-luna", "思考强度max",
                        "不接收职位名称", "通用关键词", "只读追溯", "恢复默认后仍须保存",
                        "信息不足", f"默认{AI_DEFAULT_WORKERS}", f"1–{MAX_WORKERS}", "独立于JD页面并发"):
             self.assertIn(phrase, rules)
-        for obsolete in ("规则回退", ">=4", ">=2", "0–1项", "最终报告仍按原代码规则"):
+        for obsolete in ("规则回退", ">=4", ">=2", "0–1项", "最终报告仍按原代码规则", "不进入保留或剔除名单"):
             self.assertNotIn(obsolete, rules)
 
     def test_manual_selection_precedence_does_not_promise_a_final_code_override(self):

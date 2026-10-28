@@ -508,8 +508,8 @@ class ReviewTask:
         """Project older AI selections in memory; never rewrite old artifacts.
 
         This runs on every load, so open, refresh and edits share one contract.
-        A stored manual choice remains auditable but only an actual AI decision
-        permits it to enter the keep/exclude sets.
+        Manual choices take precedence over AI suggestions, including rows with
+        no definite AI decision. Loading never rewrites their technical evidence.
         """
         stages = value.get("stages") if isinstance(value, dict) else None
         if not isinstance(stages, dict):
@@ -523,6 +523,10 @@ class ReviewTask:
         info = stages.get("llm")
         if not isinstance(info, dict) or not isinstance(info.get("result_ids"), list):
             return
+        manual = info.get("manual_choices")
+        if (not isinstance(manual, dict)
+                or any(not isinstance(key, str) or type(keep) is not bool for key, keep in manual.items())):
+            return  # Let validation reject malformed audit data without coercing it.
         # Reset creates a genuinely empty AI stage.  Do not synthesize
         # zero-valued triage counters while loading that fresh checkpoint;
         # the empty stats map is part of the reset contract.
@@ -562,13 +566,6 @@ class ReviewTask:
         recommended_keep, recommended_exclude = (list(projection[2]), list(projection[3])) if rows and projection else ([], [])
         info["recommended_keep_ids"] = recommended_keep
         info["recommended_exclude_ids"] = recommended_exclude
-        manual_choices = info.get("manual_choices") if isinstance(info.get("manual_choices"), dict) else {}
-        eligible = set(recommended_keep) | set(recommended_exclude)
-        result_ids = set(info["result_ids"])
-        info["manual_choices"] = {
-            key: keep for key, keep in manual_choices.items()
-            if key not in result_ids or key in eligible
-        }
         self._select(info, "llm")
         if isinstance(info.get("stats"), dict):
             info["stats"].update({
@@ -767,21 +764,22 @@ class ReviewTask:
                     or not set(info["recommended_exclude_ids"]) <= result_ids
                     or set(info["recommended_keep_ids"]) & set(info["recommended_exclude_ids"])):
                 raise TaskStateError("保留、剔除与待核实名单不构成完整互斥集合。")
-            if stage == "llm":
-                recommended_keep = set(info["recommended_keep_ids"])
-                recommended_exclude = set(info["recommended_exclude_ids"])
-                pending = set(info["pending_ids"])
-                if (recommended_keep & recommended_exclude
-                        or recommended_keep & pending
-                        or recommended_exclude & pending
-                        or recommended_keep | recommended_exclude | pending != result_ids
-                        or set(info["manual_choices"]) & pending):
-                    raise TaskStateError("AI 符合、AI 不符合与待核实名单必须完整互斥，待核实项不得人工归类。")
             if (not isinstance(info["manual_choices"], dict)
                     or any(not isinstance(key, str) or type(keep) is not bool for key, keep in info["manual_choices"].items())
                     or not isinstance(info["stats"], dict) or not isinstance(info["issues"], list)
                     or not isinstance(info["history"], list)):
                 raise TaskStateError("任务审核记录损坏。")
+            if stage == "llm":
+                recommended_keep = set(info["recommended_keep_ids"])
+                recommended_exclude = set(info["recommended_exclude_ids"])
+                manual = info["manual_choices"]
+                expected_keep = {key for key in result_ids if manual.get(key, key in recommended_keep)}
+                expected_exclude = {key for key in result_ids
+                                    if manual.get(key, key not in recommended_exclude) is False}
+                if (set(info["keep_ids"]) != expected_keep
+                        or set(info["excluded_ids"]) != expected_exclude
+                        or set(info["pending_ids"]) != result_ids - expected_keep - expected_exclude):
+                    raise TaskStateError("AI 人工选择、自动建议与待核实名单不一致。")
             progress = info["progress"]
             if (not isinstance(progress, dict) or any(type(progress.get(key)) is not int or progress[key] < 0 for key in ("done", "total"))
                     or progress["done"] > progress["total"]):
@@ -1046,7 +1044,11 @@ class ReviewTask:
                     info = value["stages"][stage]
                     ids = stage_ids[stage]
                     present = key in ids["result_ids"]
-                    confirmed = present and info["confirmed"] and info["status"] == "completed"
+                    current = present and (stage == "import" or (
+                        info["result_input_ids"] == info["input_ids"]
+                        and info["result_input_revision"] == info["input_revision"]))
+                    confirmed = (current and info["confirmed"] and info["status"] == "completed"
+                                 and info["confirmed_revision"] == info["revision"])
                     audit[stage] = {
                         "status": info["status"], "in_input": key in ids["input_ids"] or (stage == "import" and present),
                         "has_result": present,
@@ -1400,13 +1402,8 @@ class ReviewTask:
         manual = info["manual_choices"]
         if stage == "llm":
             keep, excluded, pending = [], [], []
-            unknown = set(info["result_ids"]) - recommended - recommended_exclude
-            for key in unknown:
-                manual.pop(key, None)
             for key in info["result_ids"]:
-                if key not in recommended and key not in recommended_exclude:
-                    pending.append(key)
-                elif key in manual:
+                if key in manual:
                     (keep if manual[key] else excluded).append(key)
                 elif key in recommended:
                     keep.append(key)
@@ -1434,11 +1431,13 @@ class ReviewTask:
         return info
 
     def _selection_changed(self, value: dict, stage: str,
-                           before: tuple[list[str], list[str], list[str]]) -> None:
+                           before: tuple[list[str], list[str], list[str]],
+                           manual_before: dict[str, bool] | None = None) -> None:
         info = value["stages"][stage]
         self._select(info, stage, self._result_jobs(value, stage))
         after = (info["keep_ids"], info["excluded_ids"], info["pending_ids"])
-        if after != before:
+        if after != before or (stage == "llm" and manual_before is not None
+                               and manual_before != info["manual_choices"]):
             info.update(confirmed=False, confirmed_revision=None, confirmed_at=None, revision=info["revision"] + 1)
             self._invalidate_downstream(value, stage)
 
@@ -1465,25 +1464,23 @@ class ReviewTask:
                 raise TaskStateError("审核名单或结果已被其他窗口修改，请刷新并重新审核后重试。")
             if not set(job_ids) <= set(info["result_ids"]):
                 raise TaskStateError("人工选择包含不属于本步结果的岗位。")
-            if stage == "llm" and set(job_ids) & set(info["pending_ids"]):
-                raise TaskStateError("未获得明确 AI 判断的岗位只能待核实，不能人工放入保留或剔除名单。")
             before = (list(info["keep_ids"]), list(info["excluded_ids"]), list(info["pending_ids"]))
+            manual_before = dict(info["manual_choices"])
             if replace_selection:
                 selected = set(job_ids)
-                eligible = set(info["recommended_keep_ids"]) | set(info["recommended_exclude_ids"])
-                info["manual_choices"].update({key: key in selected for key in info["result_ids"]
-                                               if stage != "llm" or key in eligible})
+                info["manual_choices"].update({key: key in selected for key in info["result_ids"]})
             else:
                 info["manual_choices"].update({key: keep for key in job_ids})
-            self._selection_changed(value, stage, before)
+            self._selection_changed(value, stage, before, manual_before)
 
     def apply_recommendations(self, stage: str) -> None:
         stage = self._stage(stage)
         with self._edit() as value:
             info = self._editable(value, stage)
             before = (list(info["keep_ids"]), list(info["excluded_ids"]), list(info["pending_ids"]))
+            manual_before = dict(info["manual_choices"])
             info["manual_choices"] = {}
-            self._selection_changed(value, stage, before)
+            self._selection_changed(value, stage, before, manual_before)
 
     def confirm(self, stage: str, *, expected_stage: dict | None = None) -> list[str]:
         stage = self._stage(stage)

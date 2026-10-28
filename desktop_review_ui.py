@@ -645,9 +645,11 @@ def _evidence_text(job: dict[str, Any], *, stage: str | None = None) -> str:
             f"正文完整度：{_jd_completeness_label(job)}",
         ]
         if current:
+            suggestion = ("待核实" if job.get("llm_stage_decision") == "pending_verification"
+                          else _display(job.get("reason")))
             lines.extend((f"AI判断：{_display(payload.get('判断')) if payload else '未完成有效判断（待人工核实）'}",
                           f"AI理由：{_display(payload.get('理由')) if payload else '未产生模型理由'}",
-                          f"本步建议：{_display(job.get('reason'))}",
+                          f"AI默认建议（不含人工决定）：{suggestion}",
                           f"模型状态：{_display(job.get('model_status'))}"))
             if job.get("model_error") or review.get("error"):
                 lines.append("技术问题（不是AI理由）：" + _display(job.get("model_error") or review.get("error")))
@@ -1166,6 +1168,7 @@ class ReviewDesktopApp:
         self.results_table.configure(yscrollcommand=scroll_y.set, xscrollcommand=scroll_x.set)
         self.results_table.bind("<<TreeviewSelect>>", self._show_selected_job)
         self.results_table.bind("<Button-1>", self._table_click, add="+")
+        self.results_table.bind("<Double-1>", self._table_double_click)
         self.results_table.bind("<space>", self._table_space)
         self.empty_label = ttk.Label(table_frame, textvariable=self.empty_text, style="Hint.TLabel", anchor="center", wraplength=430)
         self.empty_label.place(relx=.5, rely=.5, anchor="center")
@@ -2077,7 +2080,9 @@ class ReviewDesktopApp:
         return (self.task is not None and not self._execution_blocked and self.stage.get() != "report"
                 and not any(info.get("status") == "running" for info in self.manifest.get("stages", {}).values())
                 and self._stage_info().get("status") not in (None, "pending", "running", "stale")
-                and bool(self._rows.get(self.stage.get())))
+                and bool(self._rows.get(self.stage.get()))
+                and (self.stage.get() != "llm" or all(job.get("review_format") == SIMPLE_REVIEW_FORMAT
+                                                     for job in self._rows["llm"])))
 
     def _can_confirm(self) -> bool:
         return self._can_run() and self._stage_info().get("status") == "completed"
@@ -2212,7 +2217,7 @@ class ReviewDesktopApp:
         inputs = len(info.get("input_ids", []))
         if key == "report" and status == "completed" and stats.get("classification_counts"):
             counts = stats.get("actionable_classification_counts") or stats["classification_counts"]
-            pending = stats.get("llm_verification_count", stats.get("pending_verification_count", 0))
+            pending = counts.get("待核实", stats.get("pending_verification_count", stats.get("llm_verification_count", 0)))
             self.count_text.set(f"全量追踪 {stats.get('total_jobs', stats.get('unique_job_count', '—'))}  ·  重点 {counts.get('重点投递', '—')}  /  海投 {counts.get('海投池', '—')}  /  暂不投 {counts.get('暂不投', '—')}  /  待核实 {pending}")
         else:
             if key == "llm":
@@ -2224,8 +2229,8 @@ class ReviewDesktopApp:
         editable = self._can_edit()
         for widget in (self.select_page_button, self.exclude_button, self.restore_button, self.recommend_button):
             self._enabled(widget, editable)
-        self._enabled(self.detail_toggle_button, editable and self._focus_id is not None
-                      and self._focus_id not in info.get("pending_ids", []))
+        self.restore_button.configure(text="保留所选" if key == "llm" else "恢复所选")
+        self._enabled(self.detail_toggle_button, editable and self._focus_id is not None)
         self._render_list_queues()
         report_ready = _report_ready(self.manifest) and not self._busy and not self._closing
         if key == "report":
@@ -2246,12 +2251,16 @@ class ReviewDesktopApp:
         return job_id(job) in self._stage_info().get("keep_ids", [])
 
     def _row_reason(self, job: dict[str, Any]) -> str:
-        if self.stage.get() == "report" and job.get("excluded_at"):
-            return "暂不投 · 人工剔除于" + STAGE_LABELS.get(job["excluded_at"], job["excluded_at"])
         if self.stage.get() == "report":
-            if job.get("analysis_pending"):
-                return "待核实 · AI未完成有效判断 · 不在保留或剔除名单"
-            return str(job.get("classification") or "待生成报告")
+            decision = report_decision(job)
+            classification = decision.get("classification") or "待生成报告"
+            if decision.get("report_decision_source") == "manual_llm_confirmed":
+                return str(classification) + " · AI复核已确认人工" + ("保留" if decision["report_manual_keep"] else "剔除")
+            if decision.get("excluded_at"):
+                return "暂不投 · 人工剔除于" + STAGE_LABELS.get(decision["excluded_at"], decision["excluded_at"])
+            if classification == "待核实":
+                return "待核实 · 尚无有效AI判断或已确认人工决定"
+            return str(classification)
         if self.stage.get() in self._previews:
             return "输入预览 · 尚未运行"
         if self.stage.get() == "import":
@@ -2264,6 +2273,15 @@ class ReviewDesktopApp:
             return _list_queue_label(job) + " · " + _list_queue_reason(job).replace("\n", " ")
         if self.stage.get() == "llm" and job.get("review_format") != SIMPLE_REVIEW_FORMAT:
             return "旧版结果 · 只读历史 · 需重跑AI采用新版判断"
+        if self.stage.get() == "llm":
+            info = self._stage_info() if hasattr(self, "_stage_info") else {}
+            manual = info.get("manual_choices", {}).get(job_id(job))
+            if type(manual) is bool:
+                label = "人工保留" if manual else "人工剔除"
+                label += "（已确认）" if info.get("confirmed") else "（待确认）"
+                judgment = job.get("ai_judgment") or "未完成有效判断"
+                reason = job.get("ai_reason") or job.get("model_error")
+                return label + " · AI判断：" + str(judgment) + (" · " + _display(reason).replace("\n", " ") if reason else "")
         if self.stage.get() == "llm" and job.get("llm_stage_decision") == "pending_verification":
             message = _display(job.get("ai_reason") or job.get("reason")).replace("\n", " ")
             if job.get("model_status") == "failed" and job.get("model_error"):
@@ -2323,6 +2341,7 @@ class ReviewDesktopApp:
             current_focus = self.results_table.focus() or self._focus_id
             self._jobs_by_id = row_view["by_id"]
             kept_ids, pending_ids = row_view["kept_ids"], row_view["pending_ids"]
+            manual_choices = info.get("manual_choices", {})
             shown = filtered[self._page * PAGE_SIZE:(self._page + 1) * PAGE_SIZE]
             self._page_ids = [job_id(job) for job in shown]
             children = self.results_table.get_children()
@@ -2345,6 +2364,8 @@ class ReviewDesktopApp:
                     row_tag = "kept" if kept or preview else "excluded"
                 elif stage == "llm" and identity in pending_ids:
                     row_tag = "pending_review"
+                elif stage == "llm" and type(manual_choices.get(identity)) is bool:
+                    row_tag = "kept" if kept else "excluded"
                 else:
                     recommendation = job.get("recommended_keep")
                     if recommendation is None and stage == "shortlist":
@@ -2404,10 +2425,16 @@ class ReviewDesktopApp:
         detail_key = (self.stage.get(), id(job), self.stage.get() in self._previews,
                       bool(job and self._kept(job)), self._can_edit(),
                       bool(job and job_id(job) in self._stage_info().get("pending_ids", [])),
+                      self._stage_info().get("manual_choices", {}).get(job_id(job)) if job else None,
+                      self._stage_info().get("confirmed"),
                       self._row_reason(job) if job else None,
                       job.get("ai_judgment") if job else None,
                       job.get("ai_reason") if job else None,
                       job.get("classification") if job else None)
+        # Rendering the toolbar can temporarily disable this button before
+        # the table restores its focus. Restore its state even when the
+        # unchanged evidence text is already cached.
+        self._enabled(self.detail_toggle_button, self._can_edit() and job is not None)
         if detail_key == self._detail_key:
             return
         self._detail_key = detail_key
@@ -2415,20 +2442,29 @@ class ReviewDesktopApp:
         if job and self.stage.get() == "shortlist" and "shortlist" in self._previews:
             evidence = "输入预览：尚未运行列表初筛，没有本步方向队列。\n\n" + _evidence_text(job)
         else:
-            evidence = _evidence_text(job, stage=self.stage.get()) if job else "依据、风险与人工审计将在这里显示。"
+            detail_job = report_decision(job) if job and self.stage.get() == "report" else job
+            evidence = _evidence_text(detail_job, stage=self.stage.get()) if job else "依据、风险与人工审计将在这里显示。"
         if job and self.stage.get() == "shortlist" and "shortlist" not in self._previews:
             evidence = f"人工名单：{'保留' if self._kept(job) else '剔除'}（仅本任务后续输入）\n\n" + evidence
+        if job and self.stage.get() == "llm" and "llm" not in self._previews:
+            info = self._stage_info()
+            identity = job_id(job)
+            manual = info.get("manual_choices", {}).get(identity)
+            selection = ("待核实" if identity in info.get("pending_ids", []) else
+                         "保留" if self._kept(job) else "剔除")
+            origin = "人工决定" if type(manual) is bool else "默认建议" if selection != "待核实" else "尚未人工处理"
+            confirmation = "已确认" if info.get("confirmed") else "待确认"
+            evidence = f"当前名单：{selection} · {origin} · {confirmation}\n人工决定只改变本任务名单；原始 AI 判断、理由与技术状态保留。\n\n" + evidence
+        if job and self.stage.get() == "report":
+            evidence = self._row_reason(job) + "\n\n" + evidence
         self._replace_text(self.detail_text, evidence)
         self._replace_text(self.jd_text, _safe(desktop_data._jd_text(job)) or "暂无 JD 原文；请运行 JD 补抓或人工核实。" if job else "未选择岗位。")
         self._replace_text(self.sources_text, _sources_text(job) if job else "未选择岗位。")
         if job:
             pending_ai = (self.stage.get() == "llm"
                           and job_id(job) in self._stage_info().get("pending_ids", []))
-            self.detail_toggle_button.configure(text=("待核实 · 不可分类" if pending_ai else
+            self.detail_toggle_button.configure(text=("人工保留当前岗位" if pending_ai else
                                                        "剔除当前岗位" if self._kept(job) else "恢复当前岗位"))
-        else:
-            pending_ai = False
-        self._enabled(self.detail_toggle_button, self._can_edit() and job is not None and not pending_ai)
 
     def _show_selected_job(self, _event: tk.Event | None = None) -> None:
         if self._rendering:
@@ -2456,6 +2492,17 @@ class ReviewDesktopApp:
         self._focus_id = self.results_table.focus() or self._focus_id
         self._toggle_focused_keep()
         return "break"
+
+    def _table_double_click(self, event: tk.Event) -> str | None:
+        row = self.results_table.identify_row(event.y)
+        if (row and self.results_table.identify_column(event.x) != "#1"
+                and self.results_table.identify_region(event.x, event.y) == "cell"):
+            self._focus_id = row
+            self.results_table.focus(row)
+            self.results_table.selection_set(row)
+            self._toggle_focused_keep()
+            return "break"
+        return None
 
     def _debounce_filters(self, *_args: Any) -> None:
         self._cancel_after(self._filter_after_id)
@@ -2609,12 +2656,10 @@ class ReviewDesktopApp:
         task, stage = self.task, self.stage.get()
         assert task is not None
         identities = list(dict.fromkeys(identities))
-        if stage == "llm" and set(identities) & set(self._stage_info().get("pending_ids", [])):
-            self._notify("AI待核实岗位不能手动归入保留或剔除；请在复核结果有效后再处理。", warning=True)
-            return
+        expected_stage = copy.deepcopy(self._stage_info())
 
         def update() -> dict[str, Any]:
-            task.set_keep(stage, identities, keep)
+            task.set_keep(stage, identities, keep, expected_stage=expected_stage)
             self._write_log(task, f"人工{'恢复/保留' if keep else '剔除'}：{STAGE_LABELS[stage]}，{len(identities)} 个岗位；不修改原始数据。\n")
             view = self._capture_view(task)
             stale = [STAGE_LABELS[key] for key in STAGES if view["manifest"].get("stages", {}).get(key, {}).get("status") == "stale"]
@@ -2626,12 +2671,6 @@ class ReviewDesktopApp:
     def _select_page(self) -> None:
         if self._can_edit() and self._page_ids:
             identities = list(self._page_ids)
-            if self.stage.get() == "llm":
-                pending = set(self._stage_info().get("pending_ids", []))
-                identities = [identity for identity in identities if identity not in pending]
-                if not identities:
-                    self._notify("本页岗位都在待核实队列，不能批量归入保留。", warning=True)
-                    return
             self.results_table.selection_set(identities)
             self._selected_ids = tuple(identities)
             self._set_keep(identities, True)
@@ -2645,9 +2684,6 @@ class ReviewDesktopApp:
     def _toggle_focused_keep(self) -> None:
         job = self._jobs_by_id.get(self._focus_id or "")
         if job:
-            if self.stage.get() == "llm" and job_id(job) in self._stage_info().get("pending_ids", []):
-                self._notify("该岗位待核实，不能归入保留或剔除。", warning=True)
-                return
             self._set_keep([job_id(job)], not self._kept(job))
 
     def _apply_recommendations(self) -> None:
