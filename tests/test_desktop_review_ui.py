@@ -3385,7 +3385,10 @@ class ReviewTkTests(unittest.TestCase):
                 with self.subTest(theme=theme, stage=stage):
                     self.assertEqual(self.root.winfo_height(), 720)
                     self.assertGreaterEqual(self.app.results_table.winfo_height(), 60)
-                    self.assertGreaterEqual(self.app.log_view.winfo_height(), 40)
+                    self.assertGreaterEqual(self.app.log_view.winfo_height(), 40,
+                                            f"pane={self.app.main_pane.winfo_height()}, "
+                                            f"sash={self.app.main_pane.sashpos(0)}, "
+                                            f"toolbar={self.app.log_view.master.master.winfo_reqheight() - self.app.log_view.winfo_reqheight()}")
                     for widget in (self.app.confirm_button, self.app.detail_notebook,
                                    self.app.log_view):
                         self.assertTrue(widget.winfo_ismapped())

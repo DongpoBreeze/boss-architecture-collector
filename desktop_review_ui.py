@@ -785,6 +785,7 @@ class ReviewDesktopApp:
         self._review_rules_task: Path | None = None
         self._after_ids: set[str] = set()
         self._poll_after_id: str | None = None
+        self._log_layout_after_id: str | None = None
         # Progress callbacks normally publish a live AI view.  Keep a
         # separate, low-frequency checkpoint poll as a fallback: a child
         # process can update its JSON checkpoint without producing a callback
@@ -1228,6 +1229,7 @@ class ReviewDesktopApp:
 
         log_panel = ttk.Frame(self.main_pane, style="Card.TFrame", padding=(10, 5))
         self.main_pane.add(log_panel, weight=1)
+        log_panel.bind("<Configure>", self._keep_log_reachable, add="+")
         log_panel.columnconfigure(0, weight=1)
         log_panel.rowconfigure(1, weight=1)
         log_tools = ttk.Frame(log_panel, style="Card.TFrame")
@@ -1345,10 +1347,22 @@ class ReviewDesktopApp:
             self.binding_output_label.configure(wraplength=width)
 
     def _keep_log_reachable(self, event: tk.Event) -> None:
-        if len(self.main_pane.panes()) > 1 and event.height > 250:
-            # ttk panes have no minsize option.  Reserve a couple of real log
-            # lines at first layout / resize instead of shrinking them away.
-            maximum = event.height - 92
+        # Configure callbacks can run before ttk finishes arranging its panes.
+        # Coalesce them and adjust the sash only once that layout is settled.
+        if not self._closing and self._log_layout_after_id is None:
+            self._log_layout_after_id = self._after(None, self._fit_log_panel)
+
+    def _fit_log_panel(self) -> None:
+        self._log_layout_after_id = None
+        height = self.main_pane.winfo_height()
+        if len(self.main_pane.panes()) > 1 and height > 250 and hasattr(self, "log_view"):
+            # ttk panes have no minsize option. Measure the toolbar/font
+            # overhead: a fixed 92-pixel budget can leave only 15 pixels of
+            # log text on English Windows or a desktop with larger fonts.
+            panel = self.log_view.master.master
+            overhead = panel.winfo_reqheight() - self.log_view.winfo_reqheight()
+            sash = int(ttk.Style(self.root).lookup("TPanedwindow", "sashwidth") or 6)
+            maximum = max(0, height - max(0, overhead) - 40 - sash)
             if self.main_pane.sashpos(0) > maximum:
                 self.main_pane.sashpos(0, maximum)
 
@@ -3322,7 +3336,7 @@ class ReviewDesktopApp:
         except OSError as error:
             self._error("无法打开文件", error)
 
-    def _after(self, milliseconds: int, callback: Callable[[], None]) -> str | None:
+    def _after(self, milliseconds: int | None, callback: Callable[[], None]) -> str | None:
         if self._closed:
             return None
         identifier: str
@@ -3337,7 +3351,7 @@ class ReviewDesktopApp:
                 callback()
 
         command = self.root.register(invoke)
-        identifier = str(self.root.tk.call("after", milliseconds, command))
+        identifier = str(self.root.tk.call("after", "idle" if milliseconds is None else milliseconds, command))
         self._after_ids.add(identifier)
         return identifier
 
@@ -3366,6 +3380,7 @@ class ReviewDesktopApp:
         for identifier in tuple(self._after_ids):
             self._cancel_after(identifier)
         self._poll_after_id, self._live_refresh_after_id, self._filter_after_id = None, None, None
+        self._log_layout_after_id = None
         self.status_text.set("正在等待后台安全退出并关闭…")
         self._render(render_rows=False)
         self._finish_close()
