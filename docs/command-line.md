@@ -1,8 +1,15 @@
 # 命令行参考
 
-隔离安装后，可分别用 `boss-architecture-collect`、`boss-architecture-process`、`boss-architecture-desktop` 替代 `python collect_architecture.py`、`python process_architecture.py`、`python desktop_app.py`；参数保持一致。源码的 PowerShell / BAT 启动器继续可用，不包含在 wheel 中。源码默认输出根不变；安装态的默认可写目录见 [README](../README.md)。
+隔离安装后的入口与源码参数保持一致：
 
-日常使用推荐[双页面桌面程序](../README.md)。本文集中记录兼容 CLI：它们不建立 GUI 的 `task_manifest.json`，也没有“每步运行后人工确认”的任务状态机。不要将 CLI 运行目录、原始采集源和具名审核任务目录混用。所有示例均在项目目录执行，示例路径需替换。
+| 安装入口 | 源码入口 | 用途 |
+| --- | --- | --- |
+| `boss-architecture-desktop` | `python desktop_app.py` | 同窗采集、四步审核、投递导出 |
+| `boss-architecture-export` | `python delivery_export.py` | 读取已确认审核任务，导出 JSON |
+| `boss-architecture-collect` | `python collect_architecture.py` | 列表采集 |
+| `boss-architecture-process` | `python process_architecture.py` | 显式兼容后处理与报告 |
+
+日常使用推荐[三个模块的桌面程序](../README.md)。导出 CLI 直接读取已有 `task_manifest.json`；采集与兼容后处理 CLI 不建立人工确认任务，不能用它们的运行目录替代审核任务。所有示例的路径需按实际环境替换。源码的 PowerShell / BAT 启动器继续可用，不包含在 wheel 中；安装态默认可写目录见 [README](../README.md)。
 
 推荐 Python 3.11+；最低 3.10，读取 AI 的 TOML 配置需额外安装 `tomli`，3.11+ 使用标准库 `tomllib`。实际采集 / JD 需要安装 [boss-zhipin-scraper](https://github.com/eatmoreduck/boss-zhipin-scraper) 及其依赖，并使用独立浏览器 CDP profile；只读本地审核和 dry-run 不需要登录。模型凭据与服务授权约束见[工作流契约](desktop-review-workflow.md)。
 
@@ -31,6 +38,51 @@
 python desktop_app.py --legacy-workbench --root "D:\岗位数据\采集源"
 ```
 
+默认桌面的 01 页面直接管理 Chrome + Edge 的后台采集进程，分别连接 9222 / 9223。按勾选与数量上限确定本次组合后，再按浏览器和并发槽分为互不重叠的分片；共享输出根、方案快照和续采清单。页面提供两侧的状态、日志、登录准备及验证恢复，用户无需另开命令行双采集窗口。下文 `collect_architecture.py` 仍是单个浏览器 / 分片的入口，双终端启动器继续可用。
+
+01 的“每浏览器采集并发”默认 3，可设 1–8；每浏览器仅准备一次后，再为各槽启动独立页面和分片。翻页等待最短 / 最长秒数默认 12 / 22，可设有限小数范围 0–300，相同时使用固定间隔；所有设置对下次开始 / 续采生效。CLI 入口仍串行处理自己的分片，桌面并发由多个互不重叠的分片组成。
+
+## 投递 JSON 导出
+
+只读取已经完成并确认 `import / shortlist / fetch-jd / llm` 的具名任务。不会运行报告、补抓 JD、请求模型或执行投递。导出以 AI 阶段当前最终保留名单为准，人工决定优先；目标 ID / 链接缺失、无效或冲突，以及无效复核记录会列入 `blocked_jobs`。
+
+```powershell
+python delivery_export.py --task "D:\岗位数据\审核任务\task-…"
+
+# 安装态等效入口；--output-dir 指定保存父目录
+boss-architecture-export --task "D:\岗位数据\审核任务\task-…" --output-dir "D:\岗位数据\delivery-exports"
+```
+
+| 参数 | 行为 |
+| --- | --- |
+| `--task PATH` | 必填，具名审核任务目录；不能传原始源、CLI 运行或旧报告目录 |
+| `--output-dir PATH` | 可选，保存父目录；默认 `<任务>/delivery-exports`，每次在父目录下创建唯一子目录 |
+| `--help` | 显示帮助，不读取岗位或请求服务 |
+
+输出为 `<父目录>/<时间戳>-<uuid>/delivery_jobs.json`。文件采用白名单与标准库校验后原子发布，发布时必须仍为所捕获的确认名单；冲突时重新预览 / 重试。既有导出不覆盖，也不修改任务状态或人工决定。JSON 是审核快照，不能据此认定已经投递。
+
+根字段固定为 `schema_version`（字符串 `"1.0"`）、`export_id`、`generated_at`、`source_task`、`summary`、`jobs`、`blocked_jobs`。`summary.selected_count` 等于 `ready_count + blocked_count`，也分别对应两份数组长度。可选值为 `null`，未知字段不透传；不包含原始模型响应、凭据、Cookie、日志或本机路径。字段契约见 [JSON Schema](../schemas/delivery_jobs.v1.schema.json)。安装后可通过 `project_resources.resource_path("delivery_jobs.v1.schema.json")` 获取经过包清单和 SHA-256 校验的同一 Schema。
+
+每条记录的 `job_id` 是任务内身份，`boss_job_id` 是经真实岗位 ID / BOSS 详情链接核对的目标身份，二者不能互换。`job_key` 在同一任务的历次导出中稳定，可供外部脚本保存进度和去重；跨任务的同一目标可进一步按 `boss_job_id` 去重。地区缺失保留为 `null`，不会阻止有有效目标身份的岗位导出。
+
+`navigation` 保留已存在的 `lid`、`ka`、`from`、`security_id`、`encrypt_boss_id` 导航值和带允许查询参数的来源链接 `original_job_url`。BOSS 的 `securityId` 是详情页定位提示，`encrypt_boss_id` 是招聘者导航提示，均不充当岗位 ID；未知查询参数、登录凭据和 Cookie 不透传。机器可读阻止原因位于每个 `blocked_jobs` 记录的 `blocked_reasons`。
+
+下面的 Python 示例只读取可导出岗位，不发送任何内容：
+
+```python
+import json
+from pathlib import Path
+
+data = json.loads(Path("delivery_jobs.json").read_text(encoding="utf-8"))
+if data["schema_version"] != "1.0":
+    raise ValueError("不支持的导出版本")
+for job in data["jobs"]:
+    print(json.dumps(job, ensure_ascii=False))
+print("待修正：", len(data["blocked_jobs"]))
+```
+
+下游只消费 `jobs`，不得把 `blocked_jobs` 自动当可投岗位。修正任务取舍或证据后，应重新完成受影响审核并确认，生成新快照；历史文件保留原内容。
+
 ## 列表采集
 
 先检查计划，不连接浏览器或创建结果文件：
@@ -54,6 +106,7 @@ python collect_architecture.py --root "D:\岗位数据\采集源" --scraper-root
 | `--batch all\|current\|target` | `all` |
 | `--cities NAME_OR_ID ...` | 全部城市，可传“上海”或 `shanghai` 等 |
 | `--pages 1..10` | 每组合最多 10 页，默认 10 |
+| `--page-wait-min SECONDS`、`--page-wait-max SECONDS` | 列表翻页等待，默认 12 / 22 秒，有限小数，`0 ≤ min ≤ max ≤ 300`；相同值为固定等待 |
 | `--limit N` | 所选组合顺序前 N 组，应用于分片之前；不是岗位数或新增组数 |
 | `--total-shards N`、`--shard I` | 默认 1、0；全局序号轮流分配，I 从 0 开始 |
 | `--browser chrome\|edge` | `chrome` |
@@ -72,11 +125,11 @@ python collect_architecture.py --root "D:\岗位数据\采集源" --scraper-root
 python collect_architecture.py --setup-only --root "D:\岗位数据\浏览器准备" --scraper-root "..\boss-zhipin-scraper"
 ```
 
-CLI 的登录准备仍会初始化所指定根目录与清单；若不想触碰既有采集源，使用独立准备目录或 GUI“准备浏览器 / 登录”（使用临时根）。不要让并行实例共用 CDP 端口或 profile。
+CLI 的登录准备仍会初始化所指定根目录与清单；若不想触碰既有采集源，使用独立准备目录或 GUI“准备浏览器 / 登录”（使用临时根）。Chrome 与 Edge 使用各自端口和 profile；桌面同一浏览器的并发槽复用该侧端口，各自创建独立页面。翻页等待由项目内适配器应用到上游列表采集，兼容性检查失败会明确报错，不静默沿用旧等待值。
 
 ### PowerShell 包装与双账号
 
-`run_collect.ps1` / `run_collect.bat` 提供 `-Batch`、`-Pages`、`-Root`、`-ScraperRoot`、`-Browser`、`-CdpPort`、`-TotalShards`、`-Shard`、`-ProfileDir`、`-SetupBrowser`、`-SetupOnly`、`-DryRun`、`-ContinueOnError`、`-NoWaitOnGate` 和日志开关。`-SetupChrome` 是旧别名，`-SetupEdge` 选择 Edge 并准备登录。
+`run_collect.ps1` / `run_collect.bat` 提供 `-Batch`、`-Pages`、`-PageWaitMin`、`-PageWaitMax`、`-Root`、`-ScraperRoot`、`-Browser`、`-CdpPort`、`-TotalShards`、`-Shard`、`-ProfileDir`、`-SetupBrowser`、`-SetupOnly`、`-DryRun`、`-ContinueOnError`、`-NoWaitOnGate` 和日志开关。`-SetupChrome` 是旧别名，`-SetupEdge` 选择 Edge 并准备登录。双终端启动器也接受 `-PageWaitMin` / `-PageWaitMax`。
 
 与 Python 入口的差异：
 
@@ -95,7 +148,7 @@ CLI 的登录准备仍会初始化所指定根目录与清单；若不想触碰�
 .\run_collect_dual.ps1 -DryRun
 ```
 
-正常模式有意打开两个可见交互终端：Chrome 端口 9222 / 分片 0/2，Edge 端口 9223 / 分片 1/2。默认全量 560 组时各 280 组，使用同一固定结果根；不传根则创建当天默认根。`-SetupBrowsers` 在采集前准备两个浏览器，`-SetupOnly` 只准备；`-ChromeProfileDir`、`-EdgeProfileDir` 可分别覆盖 profile。中断后重复原命令续跑；只需人工处理受影响的分片。
+正常模式有意打开两个可见交互终端：Chrome 端口 9222 / 分片 0/2，Edge 端口 9223 / 分片 1/2。默认全量 672 组时各 336 组，使用同一固定结果根；不传根则创建当天默认根。`-SetupBrowsers` 在采集前准备两个浏览器，`-SetupOnly` 只准备；`-ChromeProfileDir`、`-EdgeProfileDir` 可分别覆盖 profile。中断后重复原命令续跑；只需人工处理受影响的分片。
 
 JD 补抓也支持在同一运行中使用两个浏览器：使用 Python 后处理 CLI 的 `--browser-mode dual` 并指定 `--chrome-port` / `--edge-port` 与 `--chrome-profile-dir` / `--edge-profile-dir`（默认 9222/9223）。JD 名单按输入稳定地连续切分，Chrome 获得前 `ceil(N/2)` 条，Edge 获得余下记录；两侧输出先写入 `details.chrome.json` / `details.edge.json`，再按原输入顺序合并到 `details.json`。合并输出保证 `job_id` 唯一；即使输入重复，也不输出重复行，但仍建议先修正上游输入。
 
@@ -190,6 +243,7 @@ python rescreen_saved_run.py --source-run "D:\岗位数据\采集源\test-runs\s
 python desktop_app.py --help
 python collect_architecture.py --help
 python process_architecture.py --help
+python delivery_export.py --help
 python rescreen_saved_run.py --help
 python collect_architecture.py --dry-run --cities 上海 --limit 2
 .\run_collect_dual.ps1 -DryRun

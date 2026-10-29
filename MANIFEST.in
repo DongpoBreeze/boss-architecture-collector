@@ -10,6 +10,8 @@ prune config
 include config/architecture_collection.json
 prune prompts
 include prompts/jd_semantic_review.md
+prune schemas
+include schemas/delivery_jobs.v1.schema.json
 prune job-result
 prune results
 prune chrome-profile

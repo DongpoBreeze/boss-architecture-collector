@@ -32,6 +32,7 @@ from llm_client import SIMPLE_REVIEW_FORMAT, JsonSchemaValidationError, simple_r
 
 
 STAGES = ("import", "shortlist", "fetch-jd", "llm", "report")
+REVIEW_STAGES = STAGES[:-1]
 STAGE_LABELS = {
     "import": "导入与去重",
     "shortlist": "列表初筛",
@@ -486,8 +487,11 @@ def stage_selection_version(info: dict) -> tuple:
 class ReviewTask:
     """A fixed source/range and independently run, manually confirmed stages."""
 
-    def __init__(self, path: Path, manifest: dict):
+    def __init__(self, path: Path, manifest: dict, *, read_only: bool = False,
+                 review_only: bool = False):
         self._path = path
+        self._read_only = read_only
+        self._review_only = review_only
         if isinstance(manifest, dict) and isinstance(manifest.get("stages"), dict):
             for info in manifest["stages"].values():
                 if isinstance(info, dict) and "redo_count" not in info:
@@ -502,7 +506,7 @@ class ReviewTask:
         self._run_release_deferred = False
         self._ai_projection_cache: tuple | None = None
         self._upgrade_pending_selection(manifest)
-        self._validate(manifest)
+        self._validate_review(manifest) if review_only else self._validate(manifest)
 
     def _upgrade_pending_selection(self, value: dict) -> None:
         """Project older AI selections in memory; never rewrite old artifacts.
@@ -661,6 +665,22 @@ class ReviewTask:
                     finally:
                         lease.close()
         return task
+
+    @classmethod
+    def open_readonly(cls, path: Path, *, review_only: bool = True) -> ReviewTask:
+        """Open for inspection without recovery writes or browsing raw data.
+
+        Delivery readers deliberately validate only the four review stages.
+        Historical report artifacts are outside that contract. The original
+        five-key manifest remains intact and this instance rejects all edits.
+        """
+        path = _absolute(path)
+        if path.name == _MANIFEST and not path.is_dir():
+            path = path.parent
+        _task_location(path)
+        if not path.is_dir():
+            raise TaskStateError("请选择已有任务目录或 task_manifest.json。")
+        return cls(path, _read_json(path / _MANIFEST), read_only=True, review_only=review_only)
 
     @property
     def path(self) -> Path:
@@ -836,7 +856,14 @@ class ReviewTask:
                     or len(set(baseline_ids)) != len(baseline_ids)):
                 raise TaskStateError("任务导入基线损坏。")
 
-    def _load(self) -> dict:
+    def _validate_review(self, value: dict) -> None:
+        if (not isinstance(value, dict) or not isinstance(value.get("stages"), dict)
+                or set(value["stages"]) != set(STAGES)):
+            raise TaskStateError("任务步骤清单损坏。")
+        checked = {**value, "stages": {**value["stages"], "report": _stage_template()}}
+        self._validate(checked)
+
+    def _load(self, *, review_only: bool = False) -> dict:
         value = _read_json(self.path / _MANIFEST)
         # Tasks created before the independent stage-redo feature predate the
         # per-stage counter.  Normalize that additive field in memory so old
@@ -848,12 +875,14 @@ class ReviewTask:
                 if isinstance(info, dict) and "reset_pending" not in info:
                     info["reset_pending"] = False
         self._upgrade_pending_selection(value)
-        self._validate(value)
+        self._validate_review(value) if review_only or self._review_only else self._validate(value)
         self._manifest = value
         return value
 
     @contextmanager
     def _edit(self, *, wait_seconds: float = 0) -> Iterator[dict]:
+        if self._read_only:
+            raise TaskStateError("此任务以只读方式打开，不能修改审核状态。")
         with self._thread_lock:
             _task_location(self.path)
             lease = _try_lease(self.path / ".task.lock")
@@ -882,6 +911,69 @@ class ReviewTask:
 
     def snapshot(self) -> dict:
         return self.refresh()
+
+    def review_snapshot(self) -> dict:
+        """Read a versioned first-four-stage snapshot, without writing files.
+
+        The token covers selection intent and current input/result identities
+        and file versions. It excludes report state, report artifacts and raw
+        source files. Callers reading checkpoint bodies must compare this
+        token again after those reads; publication can use review_read_lease.
+        """
+        with self._thread_lock:
+            before = _file_version(self.path / _MANIFEST)
+            value = self._load(review_only=True)
+            references = {(stage, value["stages"][stage][field])
+                          for stage in REVIEW_STAGES
+                          for field in ("input_file", "result_file", "result_input_file")
+                          if value["stages"][stage][field] is not None}
+            if value.get("import_baseline_file") is not None:
+                references.add(("import", value["import_baseline_file"]))
+            versions = {reference: _file_version(self._artifact_path(stage, reference))
+                        for stage, reference in sorted(references)}
+            llm = value["stages"]["llm"]
+            runtime = llm.get("runtime_directory", "runtime/llm")
+            prompt_reference = llm["stats"].get("review_prompt_file")
+            prompt_version = None
+            if (isinstance(prompt_reference, str)
+                    and re.fullmatch(re.escape(runtime) + r"/review_prompts/[a-f0-9]{64}\.md", prompt_reference)):
+                try:
+                    prompt_version = _file_version(self.path.joinpath(*PurePosixPath(prompt_reference).parts))
+                except TaskStateError:
+                    prompt_version = ("unavailable",)
+            descriptor = {
+                "task_id": value["task_id"], "scope": value["scope_signature"],
+                "name": value["name"], "created_at": value["created_at"],
+                "baseline_ids": value["baseline_ids"], "baseline_file": value["import_baseline_file"],
+                "review_rules": value.get("review_rules"),
+                "stages": {stage: stage_selection_version(value["stages"][stage]) for stage in REVIEW_STAGES},
+                "invalidations": {stage: value["stages"][stage].get("invalidated_by") for stage in REVIEW_STAGES},
+                "files": versions, "runtime": runtime, "prompt": prompt_reference,
+                "prompt_version": prompt_version,
+            }
+            if _file_version(self.path / _MANIFEST) != before:
+                raise TaskStateError("审核任务在读取时发生变化，请刷新后重试。")
+            return {"manifest": copy.deepcopy(value), "file_versions": versions,
+                    "snapshot_token": hashlib.sha256(_encoded(descriptor)).hexdigest()}
+
+    @contextmanager
+    def review_read_lease(self, *, expected_snapshot: str | None = None) -> Iterator[dict]:
+        """Guard a read/publication against concurrent task selection edits.
+
+        This shares the writer's OS lease but never commits a manifest. Only
+        an explicit publication needs the lease; preview is an optimistic read.
+        """
+        with self._thread_lock:
+            lease = _try_lease(self.path / ".task.lock")
+            if lease is None:
+                raise TaskStateError("任务正在更新，请刷新后重新导出。")
+            try:
+                snapshot = self.review_snapshot()
+                if expected_snapshot is not None and snapshot["snapshot_token"] != expected_snapshot:
+                    raise TaskStateError("审核名单或结果已变化，请刷新预览后重新导出。")
+                yield snapshot
+            finally:
+                lease.close()
 
     def stage_info(self, stage: str) -> dict:
         return self.refresh()["stages"][self._stage(stage)]
@@ -1008,12 +1100,13 @@ class ReviewTask:
                 jobs = [job for job in jobs if job_id(job) in keep]
             return copy.deepcopy(jobs)
 
-    def all_jobs(self) -> list[dict]:
+    def all_jobs(self, *, through_stage: str | None = None) -> list[dict]:
+        stages = STAGES if through_stage is None else STAGES[:STAGES.index(self._stage(through_stage)) + 1]
         with self._thread_lock:
-            value = self._load()
+            value = self._load() if through_stage is None else self._load(review_only=stages[-1] != "report")
             jobs = self._baseline_jobs(value)
             by_id = {job_id(job): _merge_job({}, job) for job in jobs}
-            for stage in STAGES:
+            for stage in stages:
                 info = value["stages"][stage]
                 if info["result_file"] is None:
                     continue
@@ -1035,12 +1128,12 @@ class ReviewTask:
                 stage: {field: set(info[field]) for field in (
                     "input_ids", "result_ids", "keep_ids", "recommended_keep_ids", "recommended_exclude_ids",
                     "excluded_ids", "pending_ids")}
-                for stage, info in value["stages"].items()
+                for stage, info in value["stages"].items() if stage in stages
             }
             for key, job in by_id.items():
                 job["excluded_at"] = None
                 audit = {}
-                for stage in STAGES:
+                for stage in stages:
                     info = value["stages"][stage]
                     ids = stage_ids[stage]
                     present = key in ids["result_ids"]

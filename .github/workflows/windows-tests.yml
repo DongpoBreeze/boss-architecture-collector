@@ -28,6 +28,11 @@ jobs:
         run: python -m pip install --upgrade "setuptools>=70.1" "tomli>=2; python_version < '3.11'"
       - name: Run offline regression and installation checks
         shell: pwsh
+        env:
+          # The runner context is available in step env, not job env.
+          # Avoid 8.3 aliases when exercising Windows path boundaries.
+          TEMP: ${{ runner.temp }}
+          TMP: ${{ runner.temp }}
         run: |
           New-Item -ItemType Directory -Force -Path ci-artifacts | Out-Null
           python -B -m unittest discover -s tests -v *> ci-artifacts/tests.log
@@ -40,6 +45,8 @@ jobs:
           python -B collect_architecture.py --dry-run --limit 1
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           python -B process_architecture.py --help
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python -B delivery_export.py --help
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           python -B desktop_app.py --help
           exit $LASTEXITCODE

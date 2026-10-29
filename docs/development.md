@@ -6,11 +6,13 @@
 
 | 职责 | 主要文件 | 边界 |
 | --- | --- | --- |
-| 桌面入口 | `desktop_app.py`、`run_desktop.*` | 默认打开新双页面；旧工作台仅通过 `--legacy-workbench` 启用 |
-| 独立采集页面 | `desktop_collection.py` | 编辑与预览方案、显式开始、人工验证与进度；不自动执行后处理 |
+| 桌面入口 | `desktop_app.py`、`run_desktop.*` | 默认同窗三个模块，后处理只展示四步；旧工作台通过 `--legacy-workbench` 启用 |
+| 独立采集页面 | `desktop_collection.py` | 编辑与预览方案、Chrome / Edge 并发分片、进程所有权、人工验证与汇总进度；不自动执行后处理 |
 | 采集与方案 | `collect_architecture.py`、`collection_plan.py`、`collection_sources.py` | 组合展开、原始采集续跑、不可变方案及历史来源映射 |
+| 列表等待适配 | `collection_runtime.py` | 在运行时为已识别的上游翻页等待应用本次范围，不修改上游源文件或其他等待 |
 | 手动审核界面 | `desktop_review_ui.py` | 运行与确认分开，后台执行，界面从持久化结果展示统计 |
-| 审核存储与执行 | `desktop_tasks.py`、`review_pipeline.py` | 固定源、五步状态机、版本化检查点、输入集合和进程所有权 |
+| 审核存储与执行 | `desktop_tasks.py`、`review_pipeline.py` | 固定源、四步审核、版本化检查点和进程所有权；清单保留旧五键兼容 |
+| 投递预览与导出 | `desktop_delivery.py`、`delivery_export.py`、`schemas/delivery_jobs.v1.schema.json` | 只读已确认最终名单，白名单快照、目标阻断、schema 校验与原子发布 |
 | 处理与规则 | `process_architecture.py`、`screening_policy.py` | 去重、初筛、证据、薪资和经验硬规则、最终分层与报告 |
 | 模型缓存 | `review_cache.py` | CLI / 桌面共用签名，区分当前有效记录与历史结果；报告只做离线输入校验 |
 | 任务复核规则 | `review_rules.py` | 分离可编辑语义规则与固定输出协议，为任务请求、缓存和报告提供一致提示词 |
@@ -30,19 +32,23 @@
 python -B -m unittest discover -s tests -v
 python -B collect_architecture.py --dry-run
 python -B process_architecture.py --help
+python -B delivery_export.py --help
 ```
 
 - `-B` 只避免当前 Python 进程生成字节码；验证子进程时可在当前终端设置 `$env:PYTHONDONTWRITEBYTECODE = '1'`，不修改全局环境。
 - 自动测试使用临时目录、模拟服务或无害本机子进程。不要用真实采集、登录或模型请求替代单元测试。
 - Windows 文件锁、Job Object、路径联接、暂停/停止及 Tk 后台线程属于回归重点；缺少符号链接权限的测试可能跳过，应报告原因。
 - 修改规则时验证人工确认、旧缓存失效、全部来源、薪资边界与 JSON/Markdown 数量一致；列表队列需验证三类互斥、合并与分列文件一致、缺字段的历史结果兼容，以及人工选队列后实际确认输入。修改并发或进程代码时验证取消和所有权。
+- 01 双浏览器回归需用可阻塞的假子进程验证两侧同时运行、分片不重叠且覆盖所选前 N 组、验证恢复只写等待侧、单侧失败不取消另一侧、双侧暂停与关闭。共享采集清单需验证并发写入不丢记录或缩减预计组合；安装态使用同一 Python 采集入口，不依赖源码 PowerShell 启动器。
+- 多槽采集还需验证同浏览器真实并发上限、每侧只准备一次、分片前的数量限制、所有活跃组合中断保存，以及安全验证后同侧不再调度新组合。等待时间用合成上游和假 sleep 验证最小 / 最大 / 固定值实际生效、其他等待不变、未知上游形态报错；不以命令包含参数代替生效验证。
+- 每侧结束立即检查其遗留清单锁，避免阻塞仍在运行的同伴。Windows 虚拟环境启动器的根 PID 可能不同于实际采集解释器；GUI 通过本次启动的随机 token 核对解释器身份，只有已知自有进程均退出才清理其锁。先完成侧的浏览器进程树归属保留到双侧会话收尾，使中途暂停 / 关闭仍能终止本次拥有的两侧；正常结束后保留可复用的专用浏览器。
 - 离线测试通过不代表真实 BOSS 登录、网站并发稳定性、模型授权或桌面截图视觉效果已经验收。
 - JD 自动准备与审核界面“准备浏览器”共用 `browser_setup.py`，直接启动本机 Chrome / Edge 并打开 BOSS 窗口，不将本项目的 `--profile-dir` / `--setup-browser` 参数传给上游。准备按钮只确认窗口启动命令与 CDP 连接，不表示 BOSS 已登录；自动补抓仅用上游支持的 `--check --cdp-port` 检查登录，失败后显示窗口并暂停，保留 JD 检查点，不循环探测验证页。
 
 ## 可以清理与必须保留的内容
 
 - 可重新生成：`__pycache__/`、`.pytest_cache/`、构建目录和覆盖率输出。这些由 `.gitignore` 排除。
-- 必须保留：采集根的 `raw/`、manifest、续跑检查点、原始日志、具名审核任务、版本化阶段文件、已保存 JD/模型记录和报告。
+- 必须保留：采集根的 `raw/`、manifest、续跑检查点、原始日志、具名审核任务、版本化阶段文件、已保存 JD/模型记录、导出快照和历史报告。
 - `config/collection-plans/`、`config/review-source-catalogs/` 虽然不提交 Git，但可能被任务按路径及摘要固定引用，不是普通缓存。
 - 浏览器 profile、环境文件及本机 Codex 配置/凭据不属于源码清理对象。不要把它们放入开源包或诊断日志。
 - 删除或移动前先确认真实引用与路径边界；历史版本管理尚未实现自动回收，不手工按“看起来旧”删除检查点。
@@ -50,12 +56,24 @@ python -B process_architecture.py --help
 ## 当前优化契约
 
 - 模型缓存：CLI 与桌面使用同一签名规则，覆盖完整模型输入、提示词、模型、服务地址、API 协议与实际生效的思考强度；缺少签名或签名不匹配的成功记录不得作为本次成功复用，失败记录仍可重试。签名及诊断不保存密钥或原始服务地址，不修改历史报告。
-- 发布：保留源码启动及现有平铺导入兼容，显式声明可安装模块和只读配置/提示词资源；在项目外的临时目录验证 wheel/sdist 及已安装入口，不将岗位数据、本机配置和凭据打包。
+- 发布：保留源码启动及现有平铺导入兼容，显式声明可安装模块和只读配置 / 提示词 / 导出 Schema；在项目外的临时目录验证 wheel/sdist 及已安装入口，不将岗位、导出快照、本机配置和凭据打包。
 - 桌面公共层：小范围提取仍被新旧界面共同依赖的偏好保存等基础逻辑，使用唯一临时文件避免竞争；不搬迁整个项目或删除仍有引用的兼容代码。
 - 刷新性能：未变化的任务阶段复用已读取岗位与搜索索引，变更时可靠失效；日志持久化不阻塞 Tk 主线程，并在关闭时处理尚未写完的记录。性能测试使用确定性读次数/索引构建次数，不依赖机器时间阈值。
 - 验收边界：保留人工确认、阶段 stale、只读数据源和列表初筛独立规则；新版 AI / 报告不得再被代码关键词、职责证据或六维改判。全部验证使用临时数据与模拟服务，不运行真实采集、模型或读取个人凭据。
 
-### 模型缓存与离线报告
+### 投递 JSON 快照
+
+默认流程为同窗 `01 岗位采集 → 02 后处理审核（四步） → 03 投递数据导出`。审核以 `llm` 确认收束，默认桌面不调用 `report`。`desktop_tasks.STAGES` 和旧五键 manifest 保持兼容；显式 `process_architecture --stage report`、旧工作台及历史文件不迁移、不删除。
+
+`delivery_export.preview_task(task, cache=ExportCache())` 只捕获当前前四步全部完成且确认的任务，返回 `snapshot_token`、`source_task`、`summary`、`jobs` 与 `blocked_jobs`；summary 的键为 `selected_count / ready_count / blocked_count`。只导出 AI 阶段最终 `keep_ids`，有效人工选择优先；无效目标身份、链接冲突或无效复核记录放入阻断数组。缓存复用未变化的阶段数据，但仍核对当前 manifest、阶段身份和确认快照，不复活兼容 report 的旧增强字段。
+
+`job_id` 是任务内身份；只有 `boss_job_id / encrypt_job_id / encryptJobId` 或有效 BOSS 详情 URL 可证明目标岗位，`encrypt_boss_id / encryptBossId` 仅为招聘者导航值。`job_key` 对同一任务记录的重复导出稳定；可选地区字段缺失不阻断导出。导航字段按显式白名单保留原值，来源链接保留允许的 `lid / ka / from / securityId` 参数，不带未知查询和登录凭据。阻断记录使用 `blocked_reasons: list[str]`。UI 在后台构建搜索索引，分页、筛选和主题切换复用解析结果。
+
+`schemas/delivery_jobs.v1.schema.json` 是稳定 `schema_version="1.0"` 的唯一静态格式源，运行时通过 `resource_path` 读取，使用标准库校验，不新增 JSON Schema 运行依赖。字段白名单明确拒绝本机路径、原始响应和凭据，可选值为 null。唯一目录写入、校验和选择快照复核全部成功后才原子发布 `delivery_jobs.json`，既有导出不可覆盖。默认父目录 `<任务>/delivery-exports`；该目录名在任意深度都被 Git 忽略，发行包继续使用精确白名单排除生成数据。
+
+导出验收使用临时具名任务及合成岗位，覆盖有效保留 / 人工覆盖 / 阻断、未确认与 stale、来源冲突、内容改写后的缓存失效、发布前并发变化、无敏感字段、schema 与安装态入口。GUI 预览和写盘在后台，Tk 更新在主线程；宿主互斥、关闭清理、当前页 F5 和跨任务刷新沿用原约束。导出不读取模型配置、不重新报告分类、不请求网站或模型；输出只表示审核快照。
+
+### 模型缓存与兼容报告
 
 AI 默认逐岗独立请求：`run_llm`、CLI 与 PowerShell 的 `conversation_size` 均为 1，桌面显式传入 1。worker 不向客户端传递跨岗位会话状态，Responses 默认 `store=false`，Chat 仅提交当前岗位消息；主线程逐岗写检查点。显式多岗参数仍保留兼容实现与测试，但不作为默认工作流。相关测试核对两个协议的实际请求体、默认参数、桌面子命令、成功缓存续跑和并发控制；不改变模型、强度、服务商或列表初筛的独立规则。
 
@@ -65,7 +83,7 @@ AI 默认逐岗独立请求：`run_llm`、CLI 与 PowerShell 的 `conversation_s
 
 当前模型协议为 `simple-v1`：模型只返回 `判断`（符合 / 不符合 / 信息不足）、`理由`（一两句话）；本地追加岗位 ID、状态、模型、签名与格式标记。桌面 `review_pipeline._analyze_ai_stage` 仅接受格式标记、两字段结构、当前岗位身份和成功状态一致的记录。符合建议保留、不符合建议剔除，其余默认进入独立待核实集合；有效结果中的全部岗位均可逐条或批量人工保留 / 剔除，人工决定优先，加载、刷新与续跑保留 `manual_choices`，“采用建议”清除人工决定并恢复默认三类。本地 `ai_judgment / ai_reason / analysis_pending` 是 UI 派生字段，不属于模型输出，人工选择不改写原始 AI 证据。AI 与新版报告不调用关键词 / 引用 / 六维分类来推翻结论；报告优先采用当前有效且已确认的人工决定，分别映射海投池 / 暂不投，没有人工决定时按 AI 默认三类映射海投池 / 暂不投 / 待核实。前置阶段已确认剔除仍优先；未确认、失效或不在当前输入和结果中的人工选择不能授权入池。
 
-沿用 `AI_STAGE_PROJECTION="model_relevance_v1"` 的显式执行投影，`AI_STAGE_RESULT_FIELDS` 同时清理新旧派生字段，合并时不能复活旧分层、证据、置信度或能力差距。打开旧任务不迁移结果、不覆写自定义规则；旧 rich 显示只读历史，不能冒充新版成功。规则编辑器“恢复默认”仅改草稿，“保存本任务规则”才应用；“重置本阶段”只清除该阶段数据并待用户另行运行。只有重置后的 AI 阶段真正开始时才识别并迁移旧复杂规则到简化默认。随后用户手动运行 AI、确认名单、生成报告；已抓 JD、来源、上游结果和隔离目录边界不变。`llm_success_count` 只统计两字段有效的 `simple-v1` 成功；兼容字段 `llm_fallback_count` 在 UI / 日志显示“未完成AI判断”；人工选择不改变这些技术计数，`llm_verification_count` 则随尚未人工处理的待核实名单更新。
+沿用 `AI_STAGE_PROJECTION="model_relevance_v1"` 的显式执行投影，`AI_STAGE_RESULT_FIELDS` 同时清理新旧派生字段，合并时不能复活旧分层、证据、置信度或能力差距。打开旧任务不迁移结果、不覆写自定义规则；旧 rich 显示只读历史，不能冒充新版成功。规则编辑器“恢复默认”仅改草稿，“保存本任务规则”才应用；“重置本阶段”只清除该阶段数据并待用户另行运行。只有重置后的 AI 阶段真正开始时才识别并迁移旧复杂规则到简化默认。随后用户手动运行 AI、审核并确认名单，再进入投递预览；已抓 JD、来源、上游结果和隔离目录边界不变。`llm_success_count` 只统计两字段有效的 `simple-v1` 成功；兼容字段 `llm_fallback_count` 在 UI / 日志显示“未完成AI判断”；人工选择不改变这些技术计数，`llm_verification_count` 则随尚未人工处理的待核实名单更新。
 
 语义工作负载的初始默认模型与强度统一定义在 `screening_policy.py`：`gpt-5.6-luna` / `max`。项目 AI 使用 `project_llm_settings.py` 的本机项目配置，默认 URL 为 `https://nikoapi.xyz/v1`；AI 页面允许编辑服务地址、API 协议、模型、强度和 API Key，Windows API Key 仅存 Credential Manager。`api_mode` 使用稳定值 `responses` / `chat_completions`，缺省为 `responses`，旧配置无需迁移。`CodexConfig`、客户端 Mapping、项目设置和显式 CLI 覆盖传递同一模式；`load_codex_config(api_mode=...)` 及客户端显式参数优先于保存值。`llm_client.load_codex_config()` 只有显式传入 `project_settings_path` 时才读取该项目配置，避免改变通用 Codex 客户端语义。项目配置和密钥不写入岗位结果、日志或发行包。
 
@@ -81,11 +99,13 @@ Responses SSE 以 `response.completed` 内的 `status=completed` 对象为完成
 
 ### 安装产物
 
-`pyproject.toml` 显式列出平铺模块，`BuildPy` 从 `config/architecture_collection.json` 与 `prompts/jd_semantic_review.md` 精确生成包资源和 SHA-256 清单；不存在两份手工维护的默认配置。wheel 不带构建钩子、源码启动器、岗位数据、个人方案或凭据；sdist 以白名单纳入源码、测试、四份文档和两处资源源文件，可离线再构建 wheel。安装态发现资源缺失、篡改或版本错配时明确失败，不从工作目录猜测回退。
+`pyproject.toml` 显式列出平铺模块，包括 `delivery_export` 和 `desktop_delivery`，并保留原三个 console script，新增 `boss-architecture-export=delivery_export:main`。`BuildPy` 从 `config/architecture_collection.json`、`prompts/jd_semantic_review.md`、`schemas/delivery_jobs.v1.schema.json` 精确生成包资源和 SHA-256 清单；默认配置按集合配置校验，导出 Schema 按 JSON Schema 的固定导出根契约单独校验，不把所有 JSON 当作采集配置。不存在第二份手工维护的资源副本。
+
+wheel 不带构建钩子、源码启动器、岗位数据、导出快照、个人方案或凭据；sdist 以白名单纳入源码、测试、四份文档和三个资源源文件，可离线再构建 wheel。安装态 `resource_path("delivery_jobs.v1.schema.json")` 只从只读资源包定位 Schema；资源缺失、篡改或版本错配时明确失败，不从工作目录猜测回退。
 
 源码态 `default_state_root()` 返回项目目录。安装态 Windows 使用 `%LOCALAPPDATA%/boss-architecture-collector`，缺失时回退 `~/.boss-architecture-collector`；其他平台使用 `$XDG_STATE_HOME/boss-architecture-collector` 或 `~/.local/state/boss-architecture-collector`。该函数只计算路径，不创建目录。原有桌面偏好位置保持兼容，不迁移用户数据。
 
-`tests/test_packaging.py` 在临时源码副本中实际构建 wheel / sdist、从 sdist 再构建、在独立 venv 安装，并从源码目录外检查三个入口、模块和资源。离线测试需要已安装的 `setuptools>=70.1`、pip 与 ensurepip，不会联网安装构建工具。当前实际验证环境为 Windows Python 3.11；Python 3.10 条件依赖有元数据测试，尚未以该解释器实测。
+`tests/test_packaging.py` 在临时源码副本中实际构建 wheel / sdist、从 sdist 再构建、在独立 venv 安装，并从源码目录外检查四个入口、模块、资源和合成审核任务导出。测试注入伪私有文件验证排除边界，禁止网络连接，核对 Schema 的安装读取、缺失和篡改、源码无效时构建失败，以及新导出的不可覆盖和默认路径。离线测试需要已安装的 `setuptools>=70.1`、pip 与 ensurepip，不会联网安装构建工具。本机验证使用 Windows Python 3.11；Python 3.10 条件依赖有元数据测试，未因此声明其他解释器已实测。
 
 ### 刷新、日志与偏好
 

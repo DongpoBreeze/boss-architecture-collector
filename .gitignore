@@ -39,6 +39,7 @@ results/
 /logs/
 /collection-plans/
 /review-source-catalogs/
+delivery-exports/
 *.log
 *.sqlite
 *.sqlite3

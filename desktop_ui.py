@@ -157,7 +157,10 @@ class WorkspaceMixin:
             variable.trace_add("write", lambda *_: self._apply_result_filters())
         self.root.bind("<Control-f>", self._focus_result_search)
         self.root.bind("<F5>", lambda _: self._refresh_current_view())
-        self.root.bind_all("<MouseWheel>", self._scroll_settings, add="+")
+        # Child widgets include their toplevel in their bindtags. Keeping
+        # this callback on our window also lets Python 3.10 destroy it;
+        # that version's bind_all leaves the Tcl command unowned.
+        self.root.bind("<MouseWheel>", self._scroll_settings, add="+")
         self._update_stage_hint()
         self._set_theme(self.theme.get(), persist=False)
         self._workspace_ready = True
@@ -752,7 +755,7 @@ class WorkspaceMixin:
             return
         if not isinstance(manifest, dict):
             return
-        if manifest.get("city") in ("全部城市", "上海", "深圳", "杭州", "广州", "成都"):
+        if manifest.get("city") in ("全部城市", "上海", "深圳", "杭州", "广州", "成都", "北京"):
             self.city.set(manifest["city"])
         if manifest.get("track") in ("当前+成长", "当前岗位", "成长目标"):
             self.track.set(manifest["track"])

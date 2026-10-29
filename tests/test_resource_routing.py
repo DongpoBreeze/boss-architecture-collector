@@ -71,8 +71,14 @@ class ResourceRoutingTests(unittest.TestCase):
 
     def test_read_only_defaults_still_expand_expected_search_ranges(self):
         config = collector.load_config(resources.DEFAULT_CONFIG)
-        self.assertEqual(len(collector.build_specs(config)), 560)
+        self.assertEqual(len(collector.build_specs(config)), 672)
         self.assertEqual(len(collector.build_specs(config, cities=["上海"])), 112)
+        for city in ("北京", "beijing", "BEIJING"):
+            self.assertEqual(len(collector.build_specs(config, cities=[city])), 112)
+            self.assertEqual(desktop_app.canonical_city(city), "beijing")
+        expected_choices = ("全部城市", *(city["name"] for city in config["cities"]))
+        for module in (desktop_app, desktop_collection, desktop_review_ui):
+            self.assertEqual(module.CITY_CHOICES, expected_choices)
         prompt = processor.load_prompt()
         self.assertTrue(prompt.strip())
         self.assertEqual(prompt, llm_client.load_review_prompt())

@@ -40,11 +40,36 @@ def _resource_payloads() -> dict[str, bytes]:
             text = payload.decode("utf-8")
             if not text.strip():
                 raise ValueError("empty resource")
-            if name.endswith(".json"):
+            if name == "architecture_collection.json":
                 config = json.loads(text)
                 required = {"schema_version", "degree", "cities", "salaries", "current", "target"}
                 if not isinstance(config, dict) or not required.issubset(config):
                     raise ValueError("default collection configuration has an invalid schema")
+            elif name == "delivery_jobs.v1.schema.json":
+                schema = json.loads(text)
+                required = {
+                    "schema_version", "export_id", "generated_at", "source_task",
+                    "summary", "jobs", "blocked_jobs",
+                }
+                if (
+                    not isinstance(schema, dict)
+                    or schema.get("$schema") != "https://json-schema.org/draft/2020-12/schema"
+                    or schema.get("type") != "object"
+                    or schema.get("additionalProperties") is not False
+                    or not isinstance(schema.get("required"), list)
+                    or not all(isinstance(key, str) for key in schema["required"])
+                    or set(schema["required"]) != required
+                    or not isinstance(schema.get("properties"), dict)
+                    or set(schema["properties"]) != required
+                    or not isinstance(schema["properties"].get("schema_version"), dict)
+                    or schema["properties"]["schema_version"].get("const") != "1.0"
+                    or any(
+                        not isinstance(schema["properties"].get(key), dict)
+                        or schema["properties"][key].get("type") != "array"
+                        for key in ("jobs", "blocked_jobs")
+                    )
+                ):
+                    raise ValueError("delivery export JSON Schema has an invalid release contract")
         except (UnicodeError, ValueError) as exc:
             raise RuntimeError(f"Release resource is invalid: {relative}: {exc}") from exc
         payloads[name] = payload
@@ -52,7 +77,7 @@ def _resource_payloads() -> dict[str, bytes]:
 
 
 class BuildPy(build_py):
-    """Keep flat modules and generate only the two release assets plus hashes."""
+    """Keep flat modules and generate only allowlisted release assets plus hashes."""
 
     def find_package_modules(self, package, package_dir):
         modules = super().find_package_modules(package, package_dir)

@@ -40,7 +40,7 @@ from project_resources import DEFAULT_CONFIG, PROJECT_ROOT, default_state_root
 from screening_policy import AI_DEFAULT_MODEL, AI_DEFAULT_REASONING_EFFORT
 
 
-CITY_CHOICES = ("全部城市", "上海", "深圳", "杭州", "广州", "成都")
+CITY_CHOICES = ("全部城市", "上海", "深圳", "杭州", "广州", "成都", "北京")
 TRACK_CHOICES = ("当前+成长", "当前岗位", "成长目标")
 STAGE_CHOICES = (
     "完整流程（采集+后处理）",
@@ -1708,7 +1708,7 @@ class CollectorDesktopApp(WorkspaceMixin):
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="BOSS 岗位采集与处理桌面程序")
+    parser = argparse.ArgumentParser(description="BOSS 岗位采集、后处理审核与投递数据导出")
     parser.add_argument("--root", type=Path, default=None, help="采集结果根目录")
     parser.add_argument("--scraper-root", default=None, help="上游 boss-zhipin-scraper 目录")
     parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG, help="岗位检索配置")

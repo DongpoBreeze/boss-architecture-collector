@@ -19,6 +19,7 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import textwrap
 import unittest
 from unittest import mock
 import zipfile
@@ -76,6 +77,7 @@ class SourceResourceTests(unittest.TestCase):
         self.assertEqual(settings["packages"], ["boss_architecture_resources"])
         self.assertFalse(settings["include-package-data"])
         self.assertIn("desktop_tk_lifecycle", settings["py-modules"])
+        self.assertTrue({"delivery_export", "desktop_delivery"}.issubset(settings["py-modules"]))
         self.assertEqual(
             set(settings["py-modules"]),
             {path.stem for path in PROJECT.glob("*.py") if not path.stem.startswith("test_")},
@@ -89,6 +91,7 @@ class SourceResourceTests(unittest.TestCase):
             "boss-architecture-collect": "collect_architecture:main",
             "boss-architecture-process": "process_architecture:main",
             "boss-architecture-desktop": "desktop_app:main",
+            "boss-architecture-export": "delivery_export:main",
         })
 
     def test_source_resources_use_the_single_authoritative_files(self):
@@ -96,6 +99,10 @@ class SourceResourceTests(unittest.TestCase):
         self.assertEqual(project_resources.PROJECT_ROOT, PROJECT)
         self.assertEqual(project_resources.DEFAULT_CONFIG, PROJECT / resources.RESOURCE_SOURCES["architecture_collection.json"])
         self.assertEqual(project_resources.DEFAULT_PROMPT, PROJECT / resources.RESOURCE_SOURCES["jd_semantic_review.md"])
+        self.assertEqual(
+            project_resources.resource_path("delivery_jobs.v1.schema.json"),
+            PROJECT / "schemas" / "delivery_jobs.v1.schema.json",
+        )
         self.assertEqual(project_resources.default_state_root(), PROJECT)
         self.assertFalse((PROJECT / "boss_architecture_resources" / resources.DATA_DIRECTORY).exists())
 
@@ -161,6 +168,9 @@ class PackagingArtifactTests(unittest.TestCase):
             "private-provider.log",
             ".env",
             "boss_architecture_resources/unpublished.json",
+            "schemas/private-schema.json",
+            "delivery-exports/private-export/delivery_jobs.json",
+            "nested/delivery-exports/private-export/delivery_jobs.json",
         )
         for relative in cls.private_files:
             path = cls.stage / relative
@@ -243,11 +253,11 @@ class PackagingArtifactTests(unittest.TestCase):
             shutil.copy2(PROJECT / relative, target)
 
     @classmethod
-    def _run(cls, command, cwd, *, success=True):
+    def _run(cls, command, cwd, *, success=True, errors="replace"):
         result = subprocess.run(
             command, cwd=cwd, env=cls.environment, stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding="utf-8",
-            errors="replace", timeout=120,
+            errors=errors, timeout=120,
         )
         if success and result.returncode:
             raise AssertionError(f"Command failed ({result.returncode}): {command!r}\n{result.stdout[-16000:]}")
@@ -305,8 +315,13 @@ class PackagingArtifactTests(unittest.TestCase):
                              {"config/architecture_collection.json"})
             self.assertEqual({name for name in paths if name.startswith("prompts/")},
                              {"prompts/jd_semantic_review.md"})
+            self.assertEqual({name for name in paths if name.startswith("schemas/")},
+                             {"schemas/delivery_jobs.v1.schema.json"})
             self.assertTrue(set(self.private_files).isdisjoint(paths))
-            self.assertFalse(any(name.startswith(("job-result/", "chrome-profile/", "edge-profile/")) for name in paths))
+            self.assertFalse(any(
+                name.startswith(("job-result/", "chrome-profile/", "edge-profile/"))
+                or "delivery-exports" in PurePosixPath(name).parts for name in paths
+            ))
             self.assertNotIn("boss_architecture_resources/data/manifest.json", paths)
             self.assertEqual({name for name in paths if name.startswith("docs/")}, {
                 "docs/development.md", "docs/desktop-review-workflow.md", "docs/command-line.md",
@@ -323,21 +338,226 @@ class PackagingArtifactTests(unittest.TestCase):
                 )))
                 self.assertEqual(info["Version"], self.config["project"]["version"])
 
-    def test_installed_collect_dry_run_has_560_and_shanghai_112_combinations(self):
+    def test_installed_collect_dry_run_has_672_and_beijing_112_combinations(self):
         full = self._console("boss-architecture-collect", "--dry-run")
-        self.assertIn("组合数: 560", full.stdout)
-        self.assertEqual(len(re.findall(r"^\d{3}/560 ", full.stdout, re.M)), 560)
-        shanghai = self._console("boss-architecture-collect", "--dry-run", "--cities", "上海")
-        self.assertIn("组合数: 112", shanghai.stdout)
-        self.assertEqual(len(re.findall(r"^\d{3}/112 ", shanghai.stdout, re.M)), 112)
+        self.assertIn("组合数: 672", full.stdout)
+        self.assertEqual(len(re.findall(r"^\d{3}/672 ", full.stdout, re.M)), 672)
+        beijing = self._console("boss-architecture-collect", "--dry-run", "--cities", "北京")
+        self.assertIn("组合数: 112", beijing.stdout)
+        self.assertEqual(len(re.findall(r"^\d{3}/112 ", beijing.stdout, re.M)), 112)
         self.assertEqual(list(self.outside.iterdir()), [])
 
-    def test_installed_process_and_desktop_help_do_not_open_gui_or_network(self):
-        for entry in ("boss-architecture-process", "boss-architecture-desktop"):
+    def test_installed_process_desktop_and_export_help_do_not_open_gui_or_network(self):
+        for entry in ("boss-architecture-process", "boss-architecture-desktop", "boss-architecture-export"):
             with self.subTest(entry=entry):
                 result = self._console(entry, "--help")
                 self.assertIn("usage:", result.stdout)
         self.assertEqual(list(self.outside.iterdir()), [])
+
+    def test_installed_collection_page_commands_expand_disjoint_bounded_shards(self):
+        code = textwrap.dedent("""\
+            import json
+            from pathlib import Path
+            import collect_architecture as collector
+            from desktop_collection import CollectionRequest, CollectionSelection, make_collect_command
+            from project_resources import DEFAULT_CONFIG
+            request = CollectionRequest("unused", "", DEFAULT_CONFIG, CollectionSelection(city="北京", limit=5),
+                                        page_wait_min=1.25, page_wait_max=2.75, browser_workers=3)
+            commands = [make_collect_command(request, Path("not-created"), Path("missing-scraper"),
+                                            browser=browser, shard=browser_index + 2 * worker, total_shards=6)
+                        for worker in range(3) for browser_index, browser in enumerate(("chrome", "edge"))]
+            expected = [spec["combination"] for spec in collector.build_specs(
+                collector.load_config(DEFAULT_CONFIG), cities=["北京"], limit=5)]
+            print(json.dumps({"commands": commands, "expected": expected}))
+        """)
+        data = json.loads(self._run([str(self.python), "-I", "-c", code], self.outside).stdout)
+        targets = []
+        profiles = []
+        for index, command in enumerate(data["commands"]):
+            with self.subTest(browser=("chrome", "edge")[index % 2], worker=index // 2):
+                self.assertEqual(command[command.index("--cdp-port") + 1], str(9222 + index % 2))
+                self.assertEqual(command[command.index("--page-wait-min") + 1], "1.25")
+                self.assertEqual(command[command.index("--page-wait-max") + 1], "2.75")
+                profiles.append(command[command.index("--profile-dir") + 1])
+                result = self._run([*command, "--dry-run"], self.outside)
+                targets.append(re.findall(r"^\d{3}/\d+ (\S+) \|", result.stdout, re.M))
+                self.assertEqual(targets[index], data["expected"][index::6])
+        self.assertEqual([len(items) for items in targets], [1, 1, 1, 1, 1, 0])
+        flattened = [target for group in targets for target in group]
+        self.assertEqual(len(flattened), len(set(flattened)))
+        self.assertEqual(set(flattened), set(data["expected"]))
+        self.assertEqual(len(set(profiles[0::2])), 1)
+        self.assertEqual(len(set(profiles[1::2])), 1)
+        self.assertNotEqual(profiles[0], profiles[1])
+        self.assertEqual(list(self.outside.iterdir()), [])
+
+    def test_installed_runtime_changes_only_pagination_waits_in_synthetic_upstream(self):
+        with tempfile.TemporaryDirectory(dir=self.root, prefix="installed-list-runtime-") as temporary:
+            base = Path(temporary)
+            scraper = base / "中文 upstream"
+            script = scraper / "scripts" / "boss_cdp_raw.py"
+            script.parent.mkdir(parents=True)
+            source = textwrap.dedent('''\
+                import argparse
+                import json
+                import sys
+                from pathlib import Path
+                from types import SimpleNamespace
+
+                print("上游初始化：中文 ✓")
+                print("上游诊断：中文 ✓", file=sys.stderr)
+                waits = []
+                time = SimpleNamespace(sleep=waits.append)
+                random = SimpleNamespace(uniform=lambda lower, upper: (lower + upper) / 2)
+
+                def scrape_list(max_pages):
+                    for pg in range(1, max_pages + 1):
+                        time.sleep(3)
+                        if pg < max_pages:
+                            d = random.uniform(12, 22)
+                            print(f"  翻页等待 {d:.0f}s...\\n")
+                            time.sleep(d)
+
+                def main():
+                    parser = argparse.ArgumentParser()
+                    parser.add_argument("--output", required=True)
+                    parser.add_argument("--merge", required=True)
+                    arguments = parser.parse_args()
+                    scrape_list(3)
+                    Path(arguments.output).write_text(json.dumps({"waits": waits, "merge": arguments.merge}), encoding="utf-8")
+            ''')
+            script.write_text(source, encoding="utf-8")
+            output = base / "result.json"
+            prior = str(base / "历史 检查点.json")
+            runtime = self._run([str(self.python), "-I", "-c", "import collection_runtime; print(collection_runtime.__file__)"], self.outside)
+            bootstrap = (
+                "import runpy, sys; "
+                "sys.stdout.reconfigure(encoding=sys.argv.pop(1), errors='strict'); "
+                "sys.stderr.reconfigure(encoding=sys.stdout.encoding, errors='strict'); "
+                "print('INITIAL=' + sys.stdout.encoding + ';UTF8_MODE=' + str(sys.flags.utf8_mode), flush=True); "
+                "runpy.run_path(sys.argv.pop(1), run_name='__main__')"
+            )
+            # Keep the real -I script entrypoint.  The extra runs deliberately
+            # recreate English Windows/ASCII streams even on a Chinese host;
+            # no -X utf8 or ignored environment setting hides that contract.
+            for encoding in (None, "cp1252", "ascii"):
+                with self.subTest(initial_encoding=encoding):
+                    entrypoint = ([str(self.python), "-I", runtime.stdout.strip()] if encoding is None else
+                                  [str(self.python), "-I", "-X", "utf8=0", "-c", bootstrap, encoding, runtime.stdout.strip()])
+                    result = self._run([
+                        *entrypoint,
+                        "--scraper-root", str(scraper), "--page-wait-min", "1.25", "--page-wait-max", "2.75",
+                        "--", "--output", str(output), "--merge", prior,
+                    ], self.outside, errors="strict")
+                    if encoding is not None:
+                        self.assertIn(f"INITIAL={encoding};UTF8_MODE=0", result.stdout)
+                    self.assertIn("上游初始化：中文 ✓", result.stdout)
+                    self.assertIn("上游诊断：中文 ✓", result.stdout)
+                    self.assertEqual(result.stdout.count("翻页等待"), 2)
+                    self.assertEqual(json.loads(output.read_text(encoding="utf-8")), {
+                        "waits": [3, 2.0, 3, 2.0, 3], "merge": prior,
+                    })
+            self.assertEqual(script.read_text(encoding="utf-8"), source)
+            self.assertEqual(list(script.parent.iterdir()), [script])
+            self.assertEqual(list(self.outside.iterdir()), [])
+
+    def test_installed_export_reads_schema_and_publishes_unique_confirmed_snapshots(self):
+        with tempfile.TemporaryDirectory(dir=self.root, prefix="installed-export-") as temporary:
+            fixture = Path(temporary)
+            # Build the synthetic task through installed public storage APIs;
+            # no processor, provider, browser or existing job data is involved.
+            code = textwrap.dedent("""\
+                import hashlib, json, sys
+                from pathlib import Path
+                from desktop_tasks import ReviewTask
+                from process_architecture import model_input
+                from project_resources import resource_path
+                from review_cache import review_input_signature, review_signature
+                from review_rules import compose_review_prompt
+
+                root = Path(sys.argv[1])
+                source = root / 'synthetic-source'
+                (source / 'raw/current').mkdir(parents=True)
+                (source / 'raw/target').mkdir(parents=True)
+                key = 'c2f4a6b8d0e1133557799aabbccddeeff'
+                job = {
+                    'job_id': key, 'encrypt_job_id': key,
+                    'job_link': f'https://www.zhipin.com/job_detail/{key}.html',
+                    'title': 'Offline packaging fixture', 'company': 'Synthetic company',
+                    'location': 'Shanghai', 'salary': '20-30K',
+                    'api_key': 'temporary-fixture-private-data',
+                    'raw_model_response': 'temporary-fixture-private-data',
+                    'source_file': str(root / 'private-source.json'),
+                }
+                (source / 'raw/current/jobs.json').write_text(
+                    json.dumps({'jobs': [job]}), encoding='utf-8')
+                task = ReviewTask.create(source, root / 'tasks', 'Offline packaging fixture')
+                task.begin('import')
+                task.finish('import', [job])
+                task.confirm('import')
+                for stage in ('shortlist', 'fetch-jd', 'llm'):
+                    jobs = task.input_jobs(stage)
+                    task.begin(stage)
+                    stats = {}
+                    for item in jobs:
+                        if stage == 'shortlist':
+                            item['list_pass'] = True
+                        elif stage == 'fetch-jd':
+                            item.update(jd='岗位职责：分析业务需求，设计方案并实施交付。任职要求：具备系统集成经验。',
+                                        jd_completeness='complete', recommended_keep=True)
+                        else:
+                            prompt = compose_review_prompt(task.get_review_rules())
+                            digest = hashlib.sha256(prompt.encode('utf-8')).hexdigest()
+                            prompt_path = task.run_directory('llm') / 'review_prompts' / (digest + '.md')
+                            prompt_path.parent.mkdir(parents=True, exist_ok=True)
+                            prompt_path.write_text(prompt, encoding='utf-8')
+                            stats['review_prompt_file'] = prompt_path.relative_to(task.path).as_posix()
+                            payload = model_input(item)
+                            item['llm_review'] = {
+                                'job_id': key, 'status': 'success', 'review_format': 'simple-v1',
+                                '判断': '符合', '理由': 'Synthetic offline review.',
+                                'model': 'offline-fixture',
+                                'cache_input_signature': review_input_signature(payload, prompt),
+                                'cache_signature': review_signature(payload, prompt, 'offline-fixture-provider'),
+                                'raw_response': 'temporary-fixture-private-data',
+                            }
+                    task.finish(stage, jobs, stats=stats)
+                    task.confirm(stage)
+                schema = resource_path('delivery_jobs.v1.schema.json')
+                print(json.dumps({'task': str(task.path), 'schema': str(schema)}, ensure_ascii=False))
+                """)
+            result = self._run([str(self.python), "-I", "-c", code, str(fixture)], self.outside)
+            paths = json.loads(result.stdout)
+            task = Path(paths["task"])
+            schema = Path(paths["schema"])
+            self.assertTrue(schema.is_relative_to(Path(self.installed["root"]) / "boss_architecture_resources"))
+            self.assertEqual(json.loads(schema.read_text(encoding="utf-8"))["properties"]["schema_version"]["const"], "1.0")
+            manifest_before = (task / "task_manifest.json").read_bytes()
+            self._console("boss-architecture-export", "--task", str(task))
+            default_exports = list((task / "delivery-exports").glob("*/delivery_jobs.json"))
+            self.assertEqual(len(default_exports), 1)
+            original = default_exports[0].read_bytes()
+            output_parent = fixture / "custom-exports"
+            for _ in range(2):
+                self._console("boss-architecture-export", "--task", str(task), "--output-dir", str(output_parent))
+            custom_exports = list(output_parent.glob("*/delivery_jobs.json"))
+            self.assertEqual(len(custom_exports), 2)
+            export_ids = set()
+            for path in (*default_exports, *custom_exports):
+                payload = path.read_text(encoding="utf-8")
+                data = json.loads(payload)
+                self.assertEqual(data["schema_version"], "1.0")
+                self.assertEqual(data["summary"], {"selected_count": 1, "ready_count": 1, "blocked_count": 0})
+                self.assertEqual(len(data["jobs"]), 1)
+                self.assertEqual(data["blocked_jobs"], [])
+                self.assertNotIn("temporary-fixture-private-data", payload)
+                self.assertNotIn(str(fixture), payload)
+                export_ids.add(data["export_id"])
+            self.assertEqual(len(export_ids), 3)
+            self.assertEqual(default_exports[0].read_bytes(), original)
+            self.assertEqual((task / "task_manifest.json").read_bytes(), manifest_before)
+            self.assertFalse((task / "runtime/report").exists())
+            self.assertEqual(list(self.outside.iterdir()), [])
 
     def test_fixture_blocks_network_before_any_connection(self):
         result = self._run([
@@ -368,7 +588,8 @@ class PackagingArtifactTests(unittest.TestCase):
         self.assertFalse((site_packages / "config").exists())
 
     def test_missing_tampered_or_mismatched_installed_resources_fail_without_fallback(self):
-        for failure in ("missing-config", "tampered-prompt", "missing-manifest", "invalid-manifest", "wrong-version"):
+        for failure in ("missing-config", "tampered-prompt", "missing-schema", "tampered-schema",
+                        "missing-manifest", "invalid-manifest", "wrong-version"):
             with self.subTest(failure=failure), tempfile.TemporaryDirectory(dir=self.root, prefix="resource-probe-") as temporary:
                 probe = Path(temporary)
                 with zipfile.ZipFile(self.wheel) as archive:
@@ -384,6 +605,12 @@ class PackagingArtifactTests(unittest.TestCase):
                     expected = "Packaged resource is missing"
                 elif failure == "tampered-prompt":
                     (data / "jd_semantic_review.md").write_text("tampered", encoding="utf-8")
+                    expected = "checksum mismatch"
+                elif failure == "missing-schema":
+                    (data / "delivery_jobs.v1.schema.json").unlink()
+                    expected = "Packaged resource is missing"
+                elif failure == "tampered-schema":
+                    (data / "delivery_jobs.v1.schema.json").write_text("{}", encoding="utf-8")
                     expected = "checksum mismatch"
                 elif failure == "missing-manifest":
                     manifest_path.unlink()
@@ -402,7 +629,8 @@ class PackagingArtifactTests(unittest.TestCase):
                 shutil.copy2(PROJECT / "config" / "architecture_collection.json", cwd / "config" / "architecture_collection.json")
                 result = self._run([
                     str(self.python), "-I", "-c",
-                    "import sys; sys.path.insert(0, sys.argv[1]); import project_resources",
+                    "import sys; sys.path.insert(0, sys.argv[1]); import project_resources as r; "
+                    "r.resource_path('delivery_jobs.v1.schema.json')",
                     str(probe),
                 ], cwd, success=False)
                 self.assertNotEqual(result.returncode, 0)
@@ -410,24 +638,27 @@ class PackagingArtifactTests(unittest.TestCase):
                 self.assertIn(expected, result.stdout)
 
     def test_missing_or_invalid_authoritative_source_fails_the_build(self):
-        for failure in ("missing", "invalid"):
-            with self.subTest(failure=failure), tempfile.TemporaryDirectory(dir=self.root, prefix="bad-source-") as temporary:
-                root = Path(temporary)
-                source = root / "source"
-                self._copy_source(source)
-                config = source / "config" / "architecture_collection.json"
-                if failure == "missing":
-                    config.unlink()
-                    expected = "Release resource is missing"
-                else:
-                    config.write_text("{}", encoding="utf-8")
-                    expected = "Release resource is invalid"
-                artifacts = root / "artifacts"
-                artifacts.mkdir()
-                result = self._build("build_wheel", source, artifacts, success=False)
-                self.assertNotEqual(result.returncode, 0)
-                self.assertIn(expected, result.stdout)
-                self.assertEqual(list(artifacts.iterdir()), [])
+        for relative in ("config/architecture_collection.json", "schemas/delivery_jobs.v1.schema.json"):
+            for failure in ("missing", "invalid"):
+                with self.subTest(resource=relative, failure=failure), tempfile.TemporaryDirectory(
+                    dir=self.root, prefix="bad-source-"
+                ) as temporary:
+                    root = Path(temporary)
+                    source = root / "source"
+                    self._copy_source(source)
+                    resource = source / relative
+                    if failure == "missing":
+                        resource.unlink()
+                        expected = "Release resource is missing"
+                    else:
+                        resource.write_text("{}", encoding="utf-8")
+                        expected = "Release resource is invalid"
+                    artifacts = root / "artifacts"
+                    artifacts.mkdir()
+                    result = self._build("build_wheel", source, artifacts, success=False)
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertIn(expected, result.stdout)
+                    self.assertEqual(list(artifacts.iterdir()), [])
 
     def test_stale_private_build_files_fail_closed_instead_of_entering_the_wheel(self):
         with tempfile.TemporaryDirectory(dir=self.root, prefix="stale-build-") as temporary:

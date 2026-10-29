@@ -1,12 +1,13 @@
-"""Read-only release assets; their authoritative sources remain in config/prompts.
+"""Read-only release assets, sourced from config, prompts, and schemas.
 
-Only the build command copies these two files into the wheel.  No user plans,
+Only the build command copies these allowlisted files into the wheel.  No user plans,
 provider settings, browser profiles, logs, or collection results belong here.
 """
 
 RESOURCE_SOURCES = {
     "architecture_collection.json": "config/architecture_collection.json",
     "jd_semantic_review.md": "prompts/jd_semantic_review.md",
+    "delivery_jobs.v1.schema.json": "schemas/delivery_jobs.v1.schema.json",
 }
 DATA_DIRECTORY = "data"
 MANIFEST_FILENAME = "manifest.json"

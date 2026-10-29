@@ -50,14 +50,14 @@ class CollectionPlanTests(unittest.TestCase):
         arguments.update(overrides)
         return update_plan_config(base, **arguments)
 
-    def test_default_matrix_and_city_counts_are_unchanged(self):
+    def test_default_matrix_and_city_counts(self):
         normalized = validate_plan_config(self.config)
         self.assertEqual(normalized, self.config)
         self.assertNotIn("collection_selection", normalized)
         specs = build_specs(normalized)
-        self.assertEqual(len(specs), 560)
-        self.assertEqual(sum(spec["track"] == "current" for spec in specs), 440)
-        self.assertEqual(sum(spec["track"] == "target" for spec in specs), 120)
+        self.assertEqual(len(specs), 672)
+        self.assertEqual(sum(spec["track"] == "current" for spec in specs), 528)
+        self.assertEqual(sum(spec["track"] == "target" for spec in specs), 144)
         self.assertEqual(len(build_specs(normalized, cities=["上海"])), 112)
         self.assertEqual(len(build_specs(normalized, cities=["SHANGHAI"])), 112)
 
@@ -151,7 +151,7 @@ class CollectionPlanTests(unittest.TestCase):
         result = build_specs(plan)
         self.assertEqual(result, [specs[73], specs[-1]])
         self.assertEqual(build_specs(plan, limit=1), [specs[73]])
-        self.assertEqual(build_specs(plan, "target", limit=1, cities=["成都"]), [specs[-1]])
+        self.assertEqual(build_specs(plan, "target", limit=1, cities=["北京"]), [specs[-1]])
         self.assertEqual(build_specs(plan, cities=["深圳"]), [])
         self.assertNotIn("collection_selection", self.config)
 
@@ -161,7 +161,7 @@ class CollectionPlanTests(unittest.TestCase):
         self.assertIsNone(updated["collection_selection"]["combinations"])
         self.assertEqual(len(build_specs(updated)), 112)
         reset = select_plan_combinations(first, None)
-        self.assertEqual(len(build_specs(reset)), 560)
+        self.assertEqual(len(build_specs(reset)), 672)
         self.assertEqual(len(build_specs(first)), 1)
 
     def test_filter_uses_same_dimensions_without_mutating_supplied_specs(self):
@@ -175,10 +175,10 @@ class CollectionPlanTests(unittest.TestCase):
 
     def test_missing_selection_fields_default_to_all_but_empty_track_is_none(self):
         self.config["collection_selection"] = {"current": {"keywords": []}}
-        self.assertEqual(len(build_specs(self.config)), 120)
+        self.assertEqual(len(build_specs(self.config)), 144)
         plan = self.update(current_experience_ids=[])
         self.assertEqual(len(build_specs(plan, "current")), 0)
-        self.assertEqual(len(build_specs(plan, "target")), 120)
+        self.assertEqual(len(build_specs(plan, "target")), 144)
         specs = build_specs(self.default_config)
         partial = copy.deepcopy(self.default_config)
         partial["collection_selection"] = {"combinations": [specs[10]["combination"]]}
@@ -238,7 +238,7 @@ class CollectionPlanTests(unittest.TestCase):
         plan = self.update(current_keywords=["", "  ", "\n"], target_keywords=[" AI架构师 ", ""])
         self.assertEqual(plan["collection_selection"]["current"]["keywords"], [])
         self.assertEqual(plan["collection_selection"]["target"]["keywords"], ["aiarch"])
-        self.assertEqual(len(build_specs(plan)), 20)
+        self.assertEqual(len(build_specs(plan)), 24)
         with self.assertRaisesRegex(ValueError, "控制字符"):
             self.update(current_keywords=["FDE\n架构师"])
 

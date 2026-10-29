@@ -2,6 +2,8 @@ param(
     [ValidateSet("all", "current", "target")]
     [string]$Batch = "all",
     [int]$Pages = 10,
+    [double]$PageWaitMin = 12,
+    [double]$PageWaitMax = 22,
     [string]$Root = "",
     [string]$ScraperRoot = "",
     [string]$ChromeProfileDir = "",
@@ -57,6 +59,11 @@ if (-not (Test-Path -LiteralPath $runCollect -PathType Leaf)) {
 if ($Pages -lt 1 -or $Pages -gt 10) {
     throw "-Pages must be between 1 and 10"
 }
+if ([double]::IsNaN($PageWaitMin) -or [double]::IsInfinity($PageWaitMin) -or
+    [double]::IsNaN($PageWaitMax) -or [double]::IsInfinity($PageWaitMax) -or
+    $PageWaitMin -lt 0 -or $PageWaitMax -gt 300 -or $PageWaitMin -gt $PageWaitMax) {
+    throw "Page waits must be finite seconds with 0 <= PageWaitMin <= PageWaitMax <= 300"
+}
 if ($DryRun -and $SetupOnly) {
     throw "-DryRun and -SetupOnly cannot be used together"
 }
@@ -88,6 +95,8 @@ function New-CollectParameters {
     $parameters = @{
         Batch = $Batch
         Pages = $Pages
+        PageWaitMin = $PageWaitMin.ToString([Globalization.CultureInfo]::InvariantCulture)
+        PageWaitMax = $PageWaitMax.ToString([Globalization.CultureInfo]::InvariantCulture)
         Browser = $BrowserName
         CdpPort = $Port
         TotalShards = 2

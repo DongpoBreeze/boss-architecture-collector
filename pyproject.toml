@@ -10,6 +10,7 @@ dependencies = ["tomli>=2; python_version < '3.11'"]
 boss-architecture-collect = "collect_architecture:main"
 boss-architecture-process = "process_architecture:main"
 boss-architecture-desktop = "desktop_app:main"
+boss-architecture-export = "delivery_export:main"
 
 [tool.setuptools]
 packages = ["boss_architecture_resources"]
@@ -17,10 +18,13 @@ py-modules = [
     "browser_setup",
     "collect_architecture",
     "collection_plan",
+    "collection_runtime",
     "collection_sources",
+    "delivery_export",
     "desktop_app",
     "desktop_collection",
     "desktop_data",
+    "desktop_delivery",
     "desktop_preferences",
     "desktop_review_ui",
     "desktop_routing",

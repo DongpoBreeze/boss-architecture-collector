@@ -13,6 +13,7 @@ import os
 from pathlib import Path
 import queue
 import re
+import secrets
 import shutil
 import stat
 import subprocess
@@ -34,13 +35,18 @@ from project_resources import PROJECT_ROOT, default_state_root
 # These helpers start an OS-suspended Windows child, bind its descendants to
 # an anonymous kill-on-close job, and never target an existing browser / port.
 # Keep ownership and the final cancellation/normal-detach decision together.
-from review_pipeline import StageControl, _child_options, _stop_owned_child, _WindowsProcessTree
+from review_pipeline import StageControl, _child_options, _pid_alive, _stop_owned_child, _WindowsProcessTree
 
 
-CITY_CHOICES = ("全部城市", "上海", "深圳", "杭州", "广州", "成都")
+CITY_CHOICES = ("全部城市", "上海", "深圳", "杭州", "广州", "成都", "北京")
 TRACK_CHOICES = ("all", "current", "target")
 TRACK_LABELS = {"all": "全部分组", "current": "当前求职", "target": "成长参考"}
 TRACK_KEYS = {value: key for key, value in TRACK_LABELS.items()}
+BROWSER_MODES = {"dual": "Chrome + Edge", "chrome": "仅 Chrome"}
+BROWSER_NAMES = {"chrome": "Chrome", "edge": "Edge"}
+DEFAULT_BROWSER_WORKERS = 3
+MAX_BROWSER_WORKERS = 8
+GATE_STOP_FILE_ENV = "BOSS_COLLECTION_GATE_STOP_FILE"
 PLAN_DIRECTORY = default_state_root() / "config" / "collection-plans"
 STATUS_LABELS = {
     "success": "成功", "no_data": "确认无数据", "failed": "失败 / 可重试",
@@ -89,7 +95,7 @@ class CollectionSelection:
         city = "全部城市" if city.strip() == "全部" else city.strip()
         track = TRACK_KEYS.get(track.strip(), track.strip())
         if city not in CITY_CHOICES:
-            raise ValueError("城市请选择全部、上海、深圳、杭州、广州或成都。")
+            raise ValueError("城市请选择全部、上海、深圳、杭州、广州、成都或北京。")
         if track not in TRACK_CHOICES:
             raise ValueError("检索分组请选择全部分组、当前求职或成长参考。")
         return cls(city, track, _positive(limit, "本次最多检索组数", optional=True), int(_positive(pages, "每组页数", maximum=10)))
@@ -107,6 +113,10 @@ class CollectionRequest:
     selection: CollectionSelection
     config_snapshot: dict[str, Any] | None = field(default=None, repr=False)
     combination_ids: tuple[str, ...] | None = None
+    browser_mode: str = "dual"
+    page_wait_min: float = collector.DEFAULT_PAGE_WAIT_MIN
+    page_wait_max: float = collector.DEFAULT_PAGE_WAIT_MAX
+    browser_workers: int = DEFAULT_BROWSER_WORKERS
 
 
 def _validated_page_config(config: dict[str, Any]) -> dict[str, Any]:
@@ -272,14 +282,22 @@ def read_collection_progress(root: Path) -> dict[str, Any]:
             "rows": rows, "message": message}
 
 
-def make_collect_command(request: CollectionRequest, root: Path, scraper_root: Path, *, setup_only: bool = False) -> list[str]:
+def make_collect_command(request: CollectionRequest, root: Path, scraper_root: Path, *, setup_only: bool = False,
+                         browser: str = "chrome", shard: int = 0, total_shards: int = 1,
+                         setup_browser: bool = True) -> list[str]:
     """The sole launched entry point is the resumable raw-list CLI."""
     selection = request.selection
     command = [sys.executable, "-u", str(PROJECT_ROOT / "collect_architecture.py"),
                "--config", str(request.config_path), "--root", str(root),
                "--scraper-root", str(scraper_root), "--batch", selection.track,
                "--pages", str(selection.pages), "--gui-interactive", "--quiet-upstream",
-               "--wait-on-gate", "--setup-browser"]
+               "--wait-on-gate", "--browser", browser,
+               "--cdp-port", str(9223 if browser == "edge" else 9222),
+               "--profile-dir", str(collector.default_profile_dir(browser)),
+               "--shard", str(shard), "--total-shards", str(total_shards),
+               "--page-wait-min", str(request.page_wait_min), "--page-wait-max", str(request.page_wait_max)]
+    if setup_browser or setup_only:
+        command.append("--setup-browser")
     if selection.cities:
         command.extend(("--cities", *selection.cities))
     if selection.limit is not None:
@@ -290,9 +308,7 @@ def make_collect_command(request: CollectionRequest, root: Path, scraper_root: P
 
 
 class CollectionControl(StageControl):
-    def __init__(self) -> None:
-        super().__init__()
-        self.continue_requested = threading.Event()
+    """One cancellation decision shared by both owned browser lanes."""
 
 
 @dataclass
@@ -303,6 +319,7 @@ class CommandResult:
     pages_completed: int = 0
     page_markers: int = 0
     completed: set[str] = field(default_factory=set)
+    collector_pid: int | None = None
 
 
 class _OwnedCommand:
@@ -311,18 +328,48 @@ class _OwnedCommand:
         self.child: subprocess.Popen[str] | None = None
         self.reader: threading.Thread | None = None
         self.tree: _WindowsProcessTree | None = None
+        self.result: CommandResult | None = None
+        self.continue_requested = threading.Event()
+        self._gate_lock = threading.Lock()
+        self._waiting = False
+        self._can_preserve_tree = False
+
+    def request_continue(self) -> bool:
+        """Accept confirmation only for this currently waiting process."""
+        with self._gate_lock:
+            if (not self._waiting or self.continue_requested.is_set()
+                    or self.child is None or self.child.poll() is not None):
+                return False
+            self.continue_requested.set()
+            return True
+
+    @property
+    def command_complete(self) -> bool:
+        return ((self.child is None or self.child.poll() is not None)
+                and (self.reader is None or not self.reader.is_alive()))
 
     @property
     def shutdown_complete(self) -> bool:
-        return (self.tree is None and (self.child is None or self.child.poll() is not None)
-                and (self.reader is None or not self.reader.is_alive()))
+        return self.tree is None and self.command_complete
+
+    def release_tree(self, *, preserve_detached: bool) -> None:
+        """Caller serializes the group's final detach with cancellation."""
+        if self.tree:
+            self.tree.close(preserve_detached=preserve_detached and self._can_preserve_tree)
+            self.tree = None
 
     def run(self, command: list[str], control: CollectionControl,
-            emit: Callable[[str, Any], None], monitor: Callable[[], None] | None = None) -> CommandResult:
+            emit: Callable[[str, Any], None], monitor: Callable[[], None] | None = None, *,
+            hold_tree: bool = False, extra_env: Mapping[str, str] | None = None) -> CommandResult:
         if control.requested:
             return CommandResult(130)
         environment = os.environ.copy()
         environment.update(PYTHONIOENCODING="utf-8", PYTHONUTF8="1")
+        environment.pop(GATE_STOP_FILE_ENV, None)
+        if extra_env:
+            environment.update(extra_env)
+        owner_token = secrets.token_hex(16)
+        environment[collector.DESKTOP_OWNER_TOKEN_ENV] = owner_token
         for key in ("NO_PROXY", "no_proxy"):
             values = [value for value in environment.get(key, "").split(",") if value]
             environment[key] = ",".join(dict.fromkeys((*values, "localhost", "127.0.0.1", "::1")))
@@ -332,7 +379,7 @@ class _OwnedCommand:
             encoding="utf-8", errors="replace", bufsize=1, **_child_options())
         output: queue.Queue[tuple[str, Any] | None] = queue.Queue(maxsize=512)
         reader_stop = threading.Event()
-        result = CommandResult(1, child.pid)
+        result = self.result = CommandResult(1, child.pid)
         eof = False
         waiting = False
         stopping = False
@@ -354,6 +401,20 @@ class _OwnedCommand:
             assert child.stdout is not None
             parts: list[str] = []
             overflow = prompted = False
+
+            def publish_line() -> None:
+                if overflow:
+                    deliver(("line", "[日志行过长，已隐藏整行以保护敏感信息]"))
+                    return
+                line = "".join(parts)
+                if line.startswith(collector.DESKTOP_OWNER_PREFIX):
+                    owner = re.fullmatch(rf"{collector.DESKTOP_OWNER_PREFIX} token={owner_token} pid=([1-9][0-9]*)", line)
+                    if owner:
+                        deliver(("owner", int(owner[1])))
+                    else:
+                        deliver(("line", "[忽略不匹配的采集器进程身份消息]"))
+                else:
+                    deliver(("line", redact_log(line)))
             try:
                 while not reader_stop.is_set():
                     char = child.stdout.read(1)
@@ -361,7 +422,7 @@ class _OwnedCommand:
                         break
                     if char in "\r\n":
                         if parts or overflow:
-                            deliver(("line", "[日志行过长，已隐藏整行以保护敏感信息]" if overflow else redact_log("".join(parts))))
+                            publish_line()
                         parts, overflow, prompted = [], False, False
                     elif not overflow:
                         parts.append(char)
@@ -373,7 +434,7 @@ class _OwnedCommand:
                             deliver(("waiting", True))
                             prompted = True
                 if parts or overflow:
-                    deliver(("line", "[日志行过长，已隐藏整行以保护敏感信息]" if overflow else redact_log("".join(parts))))
+                    publish_line()
             except (OSError, ValueError):
                 if not reader_stop.is_set():
                     deliver(("line", "[本次采集输出已关闭；状态以落盘清单为准]"))
@@ -399,14 +460,17 @@ class _OwnedCommand:
                 if control.requested and not stopping:
                     _stop_owned_child(child, self.tree)
                     stopping = True
-                if control.continue_requested.is_set():
-                    control.continue_requested.clear()
+                if self.continue_requested.is_set():
+                    self.continue_requested.clear()
                     if waiting and not control.requested and child.poll() is None:
                         try:
                             assert child.stdin is not None
                             child.stdin.write("\n")
                             child.stdin.flush()
                             waiting = False
+                            with self._gate_lock:
+                                self._waiting = False
+                            emit("waiting", False)
                             emit("log", "已由用户确认人工处理完成，向本次采集器发送 Enter。")
                         except (OSError, ValueError):
                             emit("log", "采集器已结束或关闭输入；请按落盘清单使用开始 / 续采。")
@@ -417,8 +481,14 @@ class _OwnedCommand:
                     else:
                         kind, value = item
                         last_output = time.monotonic()
-                        if kind == "waiting":
+                        if kind == "owner":
+                            if result.collector_pid is None:
+                                result.collector_pid = int(value)
+                                emit("log", f"已确认本次采集器 PID {value}（启动根 {result.pid}）。")
+                        elif kind == "waiting":
                             waiting = True
+                            with self._gate_lock:
+                                self._waiting = True
                             emit("waiting", True)
                         else:
                             line = str(value)
@@ -434,7 +504,7 @@ class _OwnedCommand:
                             if pages:
                                 result.pages_completed = max(result.pages_completed, *(int(page) for page, _ in pages))
                                 result.page_markers += len(pages)
-                                emit("position", line)
+                                emit("position", f"{result.combination} · {line}" if result.combination else line)
                             emit("log", line)
                 except queue.Empty:
                     pass
@@ -461,12 +531,16 @@ class _OwnedCommand:
             _stop_owned_child(child, self.tree)
             raise
         finally:
+            with self._gate_lock:
+                self._waiting = False
+            self.continue_requested.clear()
+            self._can_preserve_tree = preserve_detached
             if self.tree:
                 # Same lock as Stop/Pause: a late cancellation cannot detach a
                 # newly launched browser after the user has requested Close.
-                with control._lock:
-                    self.tree.close(preserve_detached=preserve_detached and control._requested is None)
-                self.tree = None
+                if not hold_tree:
+                    with control._lock:
+                        self.release_tree(preserve_detached=control._requested is None)
             elif control.requested or not preserve_detached:
                 _stop_owned_child(child)
             if child.stdin:
@@ -481,17 +555,50 @@ class _OwnedCommand:
                 child.stdout.close()
 
 
+@dataclass
+class _CollectionSlot:
+    number: int
+    shard: int
+    total_shards: int
+    runner: _OwnedCommand = field(default_factory=_OwnedCommand)
+
+
+@dataclass
+class _CollectionLane:
+    browser: str
+    shard: int
+    total_shards: int
+    runner: _OwnedCommand = field(default_factory=_OwnedCommand)
+    slots: tuple[_CollectionSlot, ...] = ()
+    gate_file: Path | None = None
+
+    @property
+    def all_runners(self) -> tuple[_OwnedCommand, ...]:
+        return tuple(dict.fromkeys((self.runner, *(slot.runner for slot in self.slots))))
+
+    @property
+    def label(self) -> str:
+        return BROWSER_NAMES[self.browser]
+
+    @property
+    def port(self) -> int:
+        return 9223 if self.browser == "edge" else 9222
+
+
 def _clear_owned_lock(root: Path, result: CommandResult, log: Callable[[str], None]) -> None:
     """A forced exit may leave the CLI's short manifest lock behind.
 
-    Remove it only when its stored owner is this already-exited Popen root.
+    Accept the Popen root or its token-confirmed interpreter (venv launcher).
+    Both known processes must have exited before their lock can be removed.
     A lock owned by another collector is never touched or waited on.
     """
     path = root / "collection_manifest.json.lock"
     if result.pid is None or not path.is_file() or _reparse(path):
         return
     try:
-        if re.search(rf"(?m)^pid={result.pid}\s*$", path.read_text(encoding="utf-8")):
+        owners = re.findall(r"(?m)^pid=([1-9][0-9]*)\s*$", path.read_text(encoding="utf-8"))
+        owned_pids = {pid for pid in (result.pid, result.collector_pid) if pid is not None}
+        if len(owners) == 1 and int(owners[0]) in owned_pids and not any(_pid_alive(pid) for pid in owned_pids):
             path.unlink()
             log("已清理本次退出的采集器留下的清单锁；其他进程的锁不会改动。")
     except (OSError, UnicodeError):
@@ -595,9 +702,11 @@ class CollectionPage(ttk.Frame):
         self._operation_thread: threading.Thread | None = None
         self._operation_result: dict[str, Any] | None = None
         self._runner: _OwnedCommand | None = None
+        self._lanes: dict[str, _CollectionLane] = {}
+        self._lane_states: dict[str, dict[str, Any]] = {}
         self._control: CollectionControl | None = None
         self._traces: list[tuple[tk.Variable, str]] = []
-        self._layout_signature: tuple[int, int, int, int] | None = None
+        self._layout_signature: tuple[int, ...] | None = None
         self._track_syncing = False
         self._plan_config: dict[str, Any] | None = None
         self._cached_config_path: Path | None = None
@@ -614,6 +723,10 @@ class CollectionPage(ttk.Frame):
         self.track_label = _PageStringVar(self, TRACK_LABELS["all"])
         self.limit = _PageStringVar(self, "")
         self.pages = _PageStringVar(self, "10")
+        self.browser_mode = _PageStringVar(self, BROWSER_MODES["dual"])
+        self.page_wait_min = _PageStringVar(self, f"{collector.DEFAULT_PAGE_WAIT_MIN:g}")
+        self.page_wait_max = _PageStringVar(self, f"{collector.DEFAULT_PAGE_WAIT_MAX:g}")
+        self.browser_workers = _PageStringVar(self, str(DEFAULT_BROWSER_WORKERS))
         self.config_text = _PageStringVar(self, f"方案：{self.config_path}")
         self.scope_help = _PageStringVar(self, "检索分组是两套关键词与经验配置，不是岗位最终分层；正在读取当前方案的实际范围。")
         self.plan_search = _PageStringVar(self, "")
@@ -623,7 +736,8 @@ class CollectionPage(ttk.Frame):
         self.progress_text = _PageStringVar(self, "落盘进度：未知；尚未读取采集清单。")
         self.stats_text = _PageStringVar(self, "成功 —　无数据 —　失败 —　暂停 —　原始条目（可重复）—")
         self.position_text = _PageStringVar(self, "当前组合 / 页：未运行")
-        self._variables = (self.collection_root, self.scraper_root, self.city, self.track, self.track_label, self.limit, self.pages,
+        self._variables = (self.collection_root, self.scraper_root, self.city, self.track, self.track_label, self.limit, self.pages, self.browser_mode,
+                           self.page_wait_min, self.page_wait_max, self.browser_workers,
                            self.config_text, self.estimate_text, self.status_text, self.progress_text,
                            self.stats_text, self.position_text, self.scope_help, self.plan_search, self.plan_detail)
         self._snapshot: dict[str, Any] | None = None
@@ -647,7 +761,7 @@ class CollectionPage(ttk.Frame):
     def shutdown_complete(self) -> bool:
         with self._worker_lock:
             active = any(worker.is_alive() for worker in self._workers)
-        complete = not active and (self._runner is None or self._runner.shutdown_complete)
+        complete = not active and all(runner.shutdown_complete for lane in self._lanes.values() for runner in lane.all_runners)
         if complete and self._closing and threading.get_ident() == self._tk_thread and self._busy:
             self._set_busy(False)
         return complete
@@ -663,75 +777,100 @@ class CollectionPage(ttk.Frame):
         self.content = ttk.Frame(self.canvas, padding=(0, 0, 6, 0))
         self._canvas_window = self.canvas.create_window(0, 0, anchor="nw", window=self.content)
         self.content.columnconfigure(0, weight=1)
-        self.content.rowconfigure(4, weight=1, minsize=155)
+        self.content.rowconfigure(4, weight=1, minsize=165)
         self.canvas.bind("<Configure>", self._resize_content, add="+")
         self.content.bind("<Configure>", self._resize_content, add="+")
         ttk.Label(self.content,
-                  text="独立采集原始岗位列表；不会自动筛选、补 JD、调用模型或生成报告。登录 / 安全验证须在专用 Chrome 中人工完成。",
-                  style="Muted.TLabel", wraplength=940).grid(row=0, column=0, sticky="ew", pady=(0, 6))
-        settings = ttk.Frame(self.content, style="Card.TFrame", padding=(10, 7))
+                  text="独立采集原始岗位列表；不会自动筛选、补 JD、调用模型或生成报告。登录 / 安全验证须在各侧专用浏览器中人工完成。",
+                  style="Muted.TLabel", wraplength=940).grid(row=0, column=0, sticky="ew", pady=(0, 4))
+        settings = ttk.Frame(self.content, style="Card.TFrame", padding=(10, 3))
         settings.grid(row=1, column=0, sticky="ew")
         settings.columnconfigure(1, weight=1)
-        ttk.Label(settings, text="采集输出根", style="Card.TLabel").grid(row=0, column=0, sticky="w", padx=(0, 10))
-        self.root_entry = ttk.Entry(settings, textvariable=self.collection_root)
+        paths = ttk.Frame(settings, style="Card.TFrame")
+        paths.grid(row=0, column=0, columnspan=3, sticky="ew")
+        paths.columnconfigure(1, weight=1, uniform="collection_paths")
+        paths.columnconfigure(4, weight=1, uniform="collection_paths")
+        ttk.Label(paths, text="采集输出根", style="Card.TLabel").grid(row=0, column=0, sticky="w", padx=(0, 8))
+        self.root_entry = ttk.Entry(paths, textvariable=self.collection_root, style="Collection.TEntry")
         self.root_entry.grid(row=0, column=1, sticky="ew", padx=(0, 6), pady=2)
-        self.choose_root_button = ttk.Button(settings, text="选择 / 新建目录", style="Small.TButton", command=self._choose_root)
-        self.choose_root_button.grid(row=0, column=2)
-        ttk.Label(settings, text="上游 scraper", style="Card.TLabel").grid(row=1, column=0, sticky="w", padx=(0, 10))
-        self.scraper_entry = ttk.Entry(settings, textvariable=self.scraper_root)
-        self.scraper_entry.grid(row=1, column=1, sticky="ew", padx=(0, 6), pady=2)
-        self.choose_scraper_button = ttk.Button(settings, text="选择（留空自动找）", style="Small.TButton", command=self._choose_scraper)
-        self.choose_scraper_button.grid(row=1, column=2)
+        self.choose_root_button = ttk.Button(paths, text="选择 / 新建目录", style="Collection.Small.TButton", command=self._choose_root)
+        self.choose_root_button.grid(row=0, column=2, padx=(0, 12))
+        ttk.Label(paths, text="上游 scraper", style="Card.TLabel").grid(row=0, column=3, sticky="w", padx=(0, 8))
+        self.scraper_entry = ttk.Entry(paths, textvariable=self.scraper_root, style="Collection.TEntry")
+        self.scraper_entry.grid(row=0, column=4, sticky="ew", padx=(0, 6), pady=2)
+        self.choose_scraper_button = ttk.Button(paths, text="选择（留空自动找）", style="Collection.Small.TButton", command=self._choose_scraper)
+        self.choose_scraper_button.grid(row=0, column=5)
         filters = ttk.Frame(settings, style="Card.TFrame")
-        filters.grid(row=2, column=0, columnspan=3, sticky="ew", pady=(4, 3))
+        filters.grid(row=1, column=0, columnspan=3, sticky="ew", pady=(4, 3))
         ttk.Label(filters, text="城市", style="Card.TLabel").pack(side="left")
-        self.city_box = ttk.Combobox(filters, textvariable=self.city, values=CITY_CHOICES, state="readonly", width=8)
+        self.city_box = ttk.Combobox(filters, textvariable=self.city, values=CITY_CHOICES, state="readonly", width=8,
+                                   style="Collection.TCombobox")
         self.city_box.pack(side="left", padx=(6, 14))
         ttk.Label(filters, text="检索分组", style="Card.TLabel").pack(side="left")
-        self.track_box = ttk.Combobox(filters, textvariable=self.track_label, values=tuple(TRACK_LABELS.values()), state="readonly", width=9)
+        self.track_box = ttk.Combobox(filters, textvariable=self.track_label, values=tuple(TRACK_LABELS.values()), state="readonly", width=9,
+                                    style="Collection.TCombobox")
         self.track_box.pack(side="left", padx=(6, 14))
         ttk.Label(filters, text="本次最多检索", style="Card.TLabel").pack(side="left")
-        self.limit_entry = ttk.Entry(filters, textvariable=self.limit, width=7)
+        self.limit_entry = ttk.Entry(filters, textvariable=self.limit, width=7, style="Collection.TEntry")
         self.limit_entry.pack(side="left", padx=(6, 4))
         ttk.Label(filters, text="组，空 = 全部", style="Hint.TLabel").pack(side="left", padx=(0, 14))
         ttk.Label(filters, text="每组页数", style="Card.TLabel").pack(side="left")
-        self.pages_spin = ttk.Spinbox(filters, textvariable=self.pages, from_=1, to=10, width=5)
+        self.pages_spin = ttk.Spinbox(filters, textvariable=self.pages, from_=1, to=10, width=5, style="Collection.TSpinbox")
         self.pages_spin.pack(side="left", padx=(6, 5))
         ttk.Label(filters, text="1–10 页，仅列表", style="Hint.TLabel").pack(side="left")
         self.scope_help_label = ttk.Label(settings, textvariable=self.scope_help, style="Hint.TLabel", wraplength=900)
-        self.scope_help_label.grid(row=3, column=0, columnspan=3, sticky="ew", pady=(2, 0))
-        self.limit_help_label = ttk.Label(settings,
-            text="按配置顺序取勾选后的前 N 组；已完成组仍会跳过。N 不是岗位数，也不是新增 N 组。每组 = 城市 × 关键词 × 薪资 × 经验 × 本科。",
-            style="Hint.TLabel", wraplength=900)
-        self.limit_help_label.grid(row=4, column=0, columnspan=3, sticky="ew")
+        self.scope_help_label.grid(row=2, column=0, columnspan=3, sticky="ew", pady=(2, 0))
+        runtime = ttk.Frame(settings, style="Card.TFrame")
+        runtime.grid(row=3, column=0, columnspan=3, sticky="ew", pady=(2, 0))
+        ttk.Label(runtime, text="翻页等待（秒）最短", style="Card.TLabel").pack(side="left")
+        self.page_wait_min_entry = ttk.Entry(runtime, textvariable=self.page_wait_min, width=6, style="Collection.TEntry")
+        self.page_wait_min_entry.pack(side="left", padx=(5, 8))
+        ttk.Label(runtime, text="最长", style="Card.TLabel").pack(side="left")
+        self.page_wait_max_entry = ttk.Entry(runtime, textvariable=self.page_wait_max, width=6, style="Collection.TEntry")
+        self.page_wait_max_entry.pack(side="left", padx=(5, 15))
+        ttk.Label(runtime, text="每浏览器采集并发数", style="Card.TLabel").pack(side="left")
+        self.browser_workers_spin = ttk.Spinbox(runtime, textvariable=self.browser_workers, from_=1, to=MAX_BROWSER_WORKERS, width=4,
+                                              style="Collection.TSpinbox")
+        self.browser_workers_spin.pack(side="left", padx=(5, 8))
+        self.limit_help_label = ttk.Label(runtime, text="1–8 槽；上限先于分片，完成组跳过", style="Hint.TLabel")
+        self.limit_help_label.pack(side="left")
         plan_actions = ttk.Frame(settings, style="Card.TFrame")
-        plan_actions.grid(row=5, column=0, columnspan=3, sticky="ew", pady=(4, 2))
-        self.edit_plan_button = ttk.Button(plan_actions, text="编辑检索条件…", style="Small.TButton", command=self.open_plan_editor)
+        plan_actions.grid(row=4, column=0, columnspan=3, sticky="ew", pady=(4, 2))
+        self.edit_plan_button = ttk.Button(plan_actions, text="编辑检索条件…", style="Collection.Small.TButton", command=self.open_plan_editor)
         self.edit_plan_button.pack(side="left", padx=(0, 6))
-        self.load_plan_button = ttk.Button(plan_actions, text="加载方案…", style="Small.TButton", command=self.load_plan)
+        self.load_plan_button = ttk.Button(plan_actions, text="加载方案…", style="Collection.Small.TButton", command=self.load_plan)
         self.load_plan_button.pack(side="left", padx=(0, 8))
-        self.config_label = ttk.Label(plan_actions, textvariable=self.config_text, style="Hint.TLabel", wraplength=630)
+        # Long snapshot paths remain available in the operation log; this
+        # single-line label must not consume space needed by runtime controls.
+        self.config_label = ttk.Label(plan_actions, textvariable=self.config_text, style="Hint.TLabel", width=1)
         self.config_label.pack(side="left", fill="x", expand=True)
         self.estimate_label = ttk.Label(settings, textvariable=self.estimate_text, style="Hint.TLabel", wraplength=900)
-        self.estimate_label.grid(row=6, column=0, columnspan=3, sticky="ew")
+        self.estimate_label.grid(row=5, column=0, columnspan=3, sticky="ew")
         actions = ttk.Frame(self.content)
-        actions.grid(row=2, column=0, sticky="ew", pady=6)
+        actions.grid(row=2, column=0, sticky="ew", pady=2)
         first = ttk.Frame(actions)
         first.pack(fill="x")
-        self.start_button = ttk.Button(first, text="开始 / 续采", style="Primary.TButton", command=self.start)
-        self.prepare_browser_button = ttk.Button(first, text="准备浏览器 / 登录", style="Small.TButton", command=self.prepare_browser)
-        self.pause_button = ttk.Button(first, text="暂停", style="Small.TButton", command=self.pause)
-        self.stop_button = ttk.Button(first, text="停止", style="Small.TButton", command=self.stop)
-        self.continue_button = ttk.Button(first, text="人工处理完成，继续", style="Small.TButton", command=self.continue_after_gate)
-        for widget in (self.start_button, self.prepare_browser_button, self.pause_button, self.stop_button, self.continue_button):
+        self.start_button = ttk.Button(first, text="开始 / 续采", style="Collection.Primary.TButton", command=self.start)
+        self.prepare_browser_button = ttk.Button(first, text="准备浏览器 / 登录", style="Collection.Small.TButton", command=self.prepare_browser)
+        self.pause_button = ttk.Button(first, text="暂停", style="Collection.Small.TButton", command=self.pause)
+        self.stop_button = ttk.Button(first, text="停止", style="Collection.Small.TButton", command=self.stop)
+        self.continue_button = ttk.Button(first, text="Chrome 人工完成，继续", style="Collection.Small.TButton", command=self.continue_after_gate)
+        self.edge_continue_button = ttk.Button(first, text="Edge 人工完成，继续", style="Collection.Small.TButton",
+                                              command=lambda: self.continue_after_gate("edge"))
+        for widget in (self.start_button, self.prepare_browser_button, self.pause_button, self.stop_button,
+                       self.continue_button, self.edge_continue_button):
             widget.pack(side="left", padx=(0, 6))
         second = ttk.Frame(actions)
         second.pack(fill="x", pady=(4, 0))
-        self.refresh_button = ttk.Button(second, text="刷新进度", style="Small.TButton", command=self.refresh_progress)
-        self.open_root_button = ttk.Button(second, text="打开采集目录", style="Small.TButton", command=self.open_collection_directory)
-        self.use_source_button = ttk.Button(second, text="用此数据新建后处理任务", style="Small.TButton", command=self.use_source)
+        self.refresh_button = ttk.Button(second, text="刷新进度", style="Collection.Small.TButton", command=self.refresh_progress)
+        self.open_root_button = ttk.Button(second, text="打开采集目录", style="Collection.Small.TButton", command=self.open_collection_directory)
+        self.use_source_button = ttk.Button(second, text="用此数据新建后处理任务", style="Collection.Small.TButton", command=self.use_source)
         for widget in (self.refresh_button, self.open_root_button, self.use_source_button):
             widget.pack(side="left", padx=(0, 6))
+        self.browser_mode_box = ttk.Combobox(second, textvariable=self.browser_mode, values=tuple(BROWSER_MODES.values()),
+                                            state="readonly", width=16, style="Collection.TCombobox")
+        self.browser_mode_box.pack(side="right")
+        ttk.Label(second, text="采集浏览器").pack(side="right", padx=(8, 6))
         progress = ttk.Frame(self.content)
         progress.grid(row=3, column=0, sticky="ew", pady=(0, 6))
         progress.columnconfigure(0, weight=1)
@@ -745,23 +884,24 @@ class CollectionPage(ttk.Frame):
         self.stats_label.grid(row=3, column=0, sticky="ew")
         self.position_label = ttk.Label(progress, textvariable=self.position_text, style="Muted.TLabel", wraplength=940)
         self.position_label.grid(row=4, column=0, sticky="ew")
-        self.notebook = ttk.Notebook(self.content)
+        self.notebook = ttk.Notebook(self.content, style="Collection.TNotebook")
         self.notebook.grid(row=4, column=0, sticky="nsew")
         self.plan_frame = ttk.Frame(self.notebook)
         self.plan_frame.columnconfigure(0, weight=1)
         self.plan_frame.rowconfigure(1, weight=1)
         plan_toolbar = ttk.Frame(self.plan_frame)
         plan_toolbar.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(3, 3))
-        self.select_all_button = ttk.Button(plan_toolbar, text="全选可见范围", style="Small.TButton", command=lambda: self.select_visible_combinations(True))
+        self.select_all_button = ttk.Button(plan_toolbar, text="全选可见范围", style="Collection.Small.TButton", command=lambda: self.select_visible_combinations(True))
         self.select_all_button.pack(side="left", padx=(0, 5))
-        self.clear_selection_button = ttk.Button(plan_toolbar, text="清空可见范围", style="Small.TButton", command=lambda: self.select_visible_combinations(False))
+        self.clear_selection_button = ttk.Button(plan_toolbar, text="清空可见范围", style="Collection.Small.TButton", command=lambda: self.select_visible_combinations(False))
         self.clear_selection_button.pack(side="left", padx=(0, 12))
         ttk.Label(plan_toolbar, text="查找关键词 / 城市").pack(side="left")
-        self.plan_search_entry = ttk.Entry(plan_toolbar, textvariable=self.plan_search, width=22)
+        self.plan_search_entry = ttk.Entry(plan_toolbar, textvariable=self.plan_search, width=22, style="Collection.TEntry")
         self.plan_search_entry.pack(side="left", padx=6)
         ttk.Label(plan_toolbar, text="勾选后再应用本次上限", style="Muted.TLabel").pack(side="left")
         plan_columns = ("checked", "index", "group", "city", "keyword", "salary", "experience", "degree", "pages", "execution")
-        self.plan_table = ttk.Treeview(self.plan_frame, columns=plan_columns, show="headings", height=3, selectmode="extended")
+        self.plan_table = ttk.Treeview(self.plan_frame, columns=plan_columns, show="headings", height=3, selectmode="extended",
+                                     style="Collection.Treeview")
         for key, title, width in zip(plan_columns,
                 ("勾选", "序号", "检索分组", "城市", "关键词", "薪资", "经验", "学历", "页数", "本次计划"),
                 (48, 48, 85, 65, 225, 78, 85, 62, 48, 110)):
@@ -794,7 +934,7 @@ class CollectionPage(ttk.Frame):
         table_frame.columnconfigure(0, weight=1)
         table_frame.rowconfigure(0, weight=1)
         columns = ("combination", "scope", "status", "pages", "jobs")
-        self.progress_table = ttk.Treeview(table_frame, columns=columns, show="headings", height=4)
+        self.progress_table = ttk.Treeview(table_frame, columns=columns, show="headings", height=4, style="Collection.Treeview")
         for key, title, width in zip(columns, ("组合", "城市 / 分组", "落盘状态", "已落盘页", "条目"), (380, 145, 130, 95, 65)):
             self.progress_table.heading(key, text=title)
             self.progress_table.column(key, width=width, minwidth=55, stretch=key == "combination")
@@ -805,9 +945,27 @@ class CollectionPage(ttk.Frame):
         table_xscroll.grid(row=1, column=0, sticky="ew")
         self.progress_table.configure(yscrollcommand=table_scroll.set, xscrollcommand=table_xscroll.set)
         self.notebook.add(table_frame, text="组合进度（落盘清单）")
+        slot_frame = ttk.Frame(self.notebook)
+        slot_frame.columnconfigure(0, weight=1)
+        slot_frame.rowconfigure(0, weight=1)
+        self.slot_table = ttk.Treeview(slot_frame, columns=("browser", "slot", "state", "position"), show="headings", height=4,
+                                     style="Collection.Treeview")
+        for key, title, width in (("browser", "浏览器 / 端口", 130), ("slot", "并发槽", 65),
+                                  ("state", "状态", 175), ("position", "当前组合 / 页", 540)):
+            self.slot_table.heading(key, text=title)
+            self.slot_table.column(key, width=width, minwidth=50, stretch=key == "position")
+        self.slot_table.grid(row=0, column=0, sticky="nsew")
+        slot_scroll = ttk.Scrollbar(slot_frame, orient="vertical", command=self.slot_table.yview)
+        slot_scroll.grid(row=0, column=1, sticky="ns")
+        slot_xscroll = ttk.Scrollbar(slot_frame, orient="horizontal", command=self.slot_table.xview)
+        slot_xscroll.grid(row=1, column=0, sticky="ew")
+        self.slot_table.configure(yscrollcommand=slot_scroll.set, xscrollcommand=slot_xscroll.set)
+        self.slot_frame = slot_frame
+        self.notebook.add(slot_frame, text="浏览器槽位")
         self.notebook.select(self.plan_frame)
         self._edit_controls = (self.root_entry, self.scraper_entry, self.choose_root_button,
                                self.choose_scraper_button, self.limit_entry, self.pages_spin, self.edit_plan_button,
+                               self.page_wait_min_entry, self.page_wait_max_entry, self.browser_workers_spin,
                                self.load_plan_button, self.select_all_button, self.clear_selection_button, self.plan_search_entry)
         for section in (settings, actions, progress, self.notebook):
             # Their requested heights can shrink without resizing the canvas
@@ -819,12 +977,21 @@ class CollectionPage(ttk.Frame):
             return
         try:
             width = max(1, self.canvas.winfo_width())
-            # The notebook requests the height of its larger, hidden tree tab.
-            # It can safely shrink to the explicit row minimum while the log
-            # stays usable; do not force that hidden tab's full request on a
-            # 1024x760 host window (or retain an old, narrow-wrap request).
-            signature = (width, self.content.winfo_reqheight(), self.notebook.winfo_reqheight(), self.canvas.winfo_height())
-            minimum = max(1, signature[1] - signature[2] + 155)
+            # Tab chrome, toolbar and heading heights depend on the installed
+            # fonts and Tk scaling. Reserve a complete plan row using their
+            # measured requests, rather than squeezing everything into a fixed
+            # 165 px notebook that can leave only a heading on Windows CI.
+            row_height = int(ttk.Style(self).lookup("Collection.Treeview", "rowheight") or 20)
+            plan_minimum = self.plan_frame.winfo_reqheight() - (int(self.plan_table.cget("height")) - 1) * row_height
+            notebook_chrome = self.notebook.winfo_reqheight() - max(
+                frame.winfo_reqheight() for frame in self.notebook.winfo_children())
+            notebook_minimum = max(165, notebook_chrome + plan_minimum)
+            self.content.rowconfigure(4, minsize=notebook_minimum)
+            # Hidden tabs need not force their full requested row count on a
+            # small host window. Retain scrolling below this usable minimum.
+            signature = (width, self.content.winfo_reqheight(), self.notebook.winfo_reqheight(),
+                         self.canvas.winfo_height(), notebook_minimum)
+            minimum = max(1, signature[1] - max(signature[2], notebook_minimum) + notebook_minimum)
             height = max(minimum, self.canvas.winfo_height())
             self.canvas.itemconfigure(self._canvas_window, width=width, height=height)
             self.canvas.configure(scrollregion=(0, 0, width, height))
@@ -832,7 +999,6 @@ class CollectionPage(ttk.Frame):
             for label in (self.status_label, self.progress_label, self.stats_label, self.position_label,
                           self.estimate_label, self.scope_help_label, self.limit_help_label):
                 label.configure(wraplength=wrap)
-            self.config_label.configure(wraplength=max(250, width - 330))
             if signature != self._layout_signature:
                 self._layout_signature = signature
                 # A wrap/tab change can settle a later idle pass at the same
@@ -842,15 +1008,25 @@ class CollectionPage(ttk.Frame):
             pass
 
     def apply_theme(self, palette: Mapping[str, str]) -> None:
-        """Repaint local Tk widgets only; host owns ttk styles/options/theme."""
+        """Repaint this page and its derived styles; host owns theme/options."""
         if self._closing:
             return
         self.palette = {**LIGHT_PALETTE, **dict(palette)}
         p = self.palette
+        # Keep the host's fonts, colours and accessible states; only this
+        # dense form uses smaller vertical padding than the other workspaces.
+        style = ttk.Style(self)
+        style.configure("Collection.TEntry", padding=(7, 4))
+        style.configure("Collection.TCombobox", padding=(6, 4))
+        style.configure("Collection.TSpinbox", padding=(6, 4))
+        style.configure("Collection.Small.TButton", padding=(9, 3))
+        style.configure("Collection.Primary.TButton", padding=(12, 4))
+        style.configure("Collection.TNotebook.Tab", padding=(14, 5))
+        style.configure("Collection.Treeview.Heading", padding=(9, 4))
         self.canvas.configure(background=p["background"])
         self.log_view.configure(background=p["log"], foreground=p["log_text"], insertbackground=p["log_text"],
                                 selectbackground=p["log_selection"], selectforeground=p["log_selected_text"])
-        for box in (self.city_box, self.track_box):
+        for box in (self.city_box, self.track_box, self.browser_mode_box):
             configure_combobox_popdown(box, p)
         for status, color in (("success", p["green"]), ("no_data", p["muted"]),
                               ("paused", p["amber"]), ("failed", p["red"])):
@@ -892,10 +1068,16 @@ class CollectionPage(ttk.Frame):
 
     def _capture_request(self) -> CollectionRequest:
         selection = CollectionSelection.parse(self.city.get(), self.track.get(), self.limit.get(), self.pages.get())
+        page_wait_min, page_wait_max = collector.validate_page_wait(self.page_wait_min.get(), self.page_wait_max.get())
+        browser_workers = int(_positive(self.browser_workers.get(), "每浏览器采集并发数", maximum=MAX_BROWSER_WORKERS))
+        mode_text = self.browser_mode.get()
+        mode = next((key for key, label in BROWSER_MODES.items() if mode_text in (key, label)), None)
+        if mode is None:
+            raise ValueError("采集浏览器请选择 Chrome + Edge 或仅 Chrome。")
         cached = deepcopy(self._plan_config) if self._cached_config_path == self.config_path else None
         combinations = tuple(sorted(self._checked_combinations)) if self._checked_combinations is not None else None
         return CollectionRequest(self.collection_root.get().strip(), self.scraper_root.get().strip(), self.config_path,
-                                 selection, cached, combinations)
+                                 selection, cached, combinations, mode, page_wait_min, page_wait_max, browser_workers)
 
     def _track_changed(self, *_args: object) -> None:
         if self._track_syncing or self._closing:
@@ -1170,12 +1352,14 @@ class CollectionPage(ttk.Frame):
             widget.state(["!disabled"] if editable else ["disabled"])
         if self.on_use_source is None:
             self.use_source_button.state(["disabled"])
-        for box in (self.city_box, self.track_box):
+        for box in (self.city_box, self.track_box, self.browser_mode_box):
             box.configure(state="readonly" if editable else "disabled")
         self.plan_table.state(["!disabled"] if editable else ["disabled"])
         self.pause_button.state(["!disabled"] if self._busy and self._control and not self._control.requested else ["disabled"])
         self.stop_button.state(["!disabled"] if self._busy and self._control and self._control.requested != "stopped" else ["disabled"])
-        self.continue_button.state(["!disabled"] if self._busy and self._waiting and self._control and not self._control.requested else ["disabled"])
+        for browser, button in (("chrome", self.continue_button), ("edge", self.edge_continue_button)):
+            waiting = self._lane_states.get(browser, {}).get("waiting", False)
+            button.state(["!disabled"] if self._busy and waiting and self._control and not self._control.requested else ["disabled"])
 
     def start(self) -> None:
         self._start_operation(setup_only=False)
@@ -1195,13 +1379,28 @@ class CollectionPage(ttk.Frame):
             self.status_text.set(redact_log(error))
             return
         self._control = control = CollectionControl()
-        self._runner = runner = _OwnedCommand()
+        browsers = ("chrome", "edge") if request.browser_mode == "dual" else ("chrome",)
+        lanes = tuple(_CollectionLane(browser, index, len(browsers)) for index, browser in enumerate(browsers))
+        for lane in lanes:
+            lane.slots = tuple(_CollectionSlot(index + 1, lane.shard + len(browsers) * index,
+                                               len(browsers) * request.browser_workers,
+                                               lane.runner if request.browser_workers == 1 else _OwnedCommand())
+                               for index in range(request.browser_workers))
+        self._lanes = {lane.browser: lane for lane in lanes}
+        self._runner = lanes[0].runner
+        self._lane_states = {lane.browser: {"state": "等待检查", "position": "尚未开始", "waiting": False,
+                                           "slots": {str(slot.number): {"state": "等待检查", "position": "尚未开始", "waiting": False}
+                                                     for slot in lane.slots}}
+                             for lane in lanes}
+        if setup_only or request.browser_workers > 1:
+            for state in self._lane_states.values():
+                state["slots"]["setup"] = {"state": "等待检查", "position": "浏览器登录准备", "waiting": False}
         self._operation = "browser" if setup_only else "collect"
         self._operation_result = None
         self._preview_id += 1  # An old, slow disk preview cannot replace live progress.
         self._waiting = False
         self.status_text.set("正在后台检查配置、输出路径与上游采集器…")
-        self.position_text.set("当前组合 / 页：尚未开始；准备专用 Chrome 时需人工登录后继续。")
+        self._render_lane_positions()
         self._set_busy(True)
         self._render_controls()
 
@@ -1211,6 +1410,10 @@ class CollectionPage(ttk.Frame):
             log_handle: Any = None
             temporary: tempfile.TemporaryDirectory[str] | None = None
             log_unavailable = False
+            log_lock = threading.Lock()
+            lane_threads: list[threading.Thread] = []
+            command_results: dict[tuple[str, str], dict[str, Any]] = {}
+            result_lock = threading.Lock()
             outcome: dict[str, Any] = {"error": None, "code": None, "setup_only": setup_only}
             started_at = collector.now_iso()
 
@@ -1218,21 +1421,123 @@ class CollectionPage(ttk.Frame):
                 nonlocal log_unavailable
                 if kind == "log":
                     value = redact_log(value).rstrip("\r\n")
-                    if log_handle:
-                        try:
-                            log_handle.write(value + "\n")
-                            log_handle.flush()
-                        except OSError:
-                            if not log_unavailable:
-                                self._emit("log", "[collection-desktop.log 暂不可写；状态仍以采集清单为准]")
-                            log_unavailable = True
-                    self._emit("log", value)
+                    with log_lock:
+                        if log_handle:
+                            try:
+                                log_handle.write(value + "\n")
+                                log_handle.flush()
+                            except OSError:
+                                if not log_unavailable:
+                                    self._emit("log", "[collection-desktop.log 暂不可写；状态仍以采集清单为准]")
+                                log_unavailable = True
+                        self._emit("log", value)
                 else:
                     self._emit(kind, value)
 
             def monitor() -> None:
                 if root is not None and not setup_only:
                     self._emit("progress", read_collection_progress(root))
+
+            def lane_emit(lane: _CollectionLane, kind: str, value: Any, slot_key: str = "1") -> None:
+                label = (f"{lane.label} 登录" if slot_key == "setup" else
+                         lane.label if request.browser_workers == 1 else f"{lane.label} #{slot_key}")
+                if kind == "log":
+                    emit("log", f"[{label}] {value}")
+                else:
+                    slot_runner = next((slot.runner for slot in lane.slots if str(slot.number) == slot_key), None)
+                    active_combination = slot_runner and slot_runner.result and slot_runner.result.combination
+                    if kind == "waiting" and value and active_combination and lane.gate_file is not None:
+                        # The CLI also marks real security responses before a
+                        # peer can begin another group. Keep fake/older prompt
+                        # sources bounded by the same owned session marker.
+                        try:
+                            with lane.gate_file.open("x", encoding="utf-8"):
+                                pass
+                        except FileExistsError:
+                            pass
+                        except OSError as caught:
+                            emit("log", f"[{label}] 无法记录验证暂停：{redact_log(caught)}")
+                    self._emit("lane", {"browser": lane.browser, "slot": slot_key, "kind": kind, "value": value})
+
+            def run_command(lane: _CollectionLane, slot_key: str, runner: _OwnedCommand,
+                            command: list[str], *, collecting: bool) -> CommandResult | None:
+                result: CommandResult | None = None
+                error: str | None = None
+                try:
+                    if not control.requested:
+                        lane_emit(lane, "state", "准备专用浏览器 / 登录" if not collecting else "采集中", slot_key)
+                        environment = {GATE_STOP_FILE_ENV: str(lane.gate_file)} if collecting and lane.gate_file is not None else None
+                        result = runner.run(command, control, lambda kind, value: lane_emit(lane, kind, value, slot_key),
+                                            hold_tree=True, extra_env=environment)
+                except Exception as caught:
+                    # An individual target/session failure never stops peers.
+                    error = redact_log(caught)
+                    result = runner.result
+                    lane_emit(lane, "log", f"未完成：{error}；其他槽位继续运行。", slot_key)
+                finally:
+                    # Reclaim a dead side's short lock promptly; a healthy
+                    # peer may already be waiting to publish its next record.
+                    if result and root is not None and collecting:
+                        _clear_owned_lock(root, result, lambda line: lane_emit(lane, "log", line, slot_key))
+                    with result_lock:
+                        command_results[(lane.browser, slot_key)] = {"result": result, "error": error,
+                                                                    "runner": runner, "collecting": collecting}
+                    state = ("已暂停" if control.requested == "paused" else "已停止" if control.requested else
+                             "异常退出" if error else "已结束" if result and result.code == 0 else "未全部完成")
+                    lane_emit(lane, "finished", state, slot_key)
+                return result
+
+            def start_slot(lane: _CollectionLane, slot: _CollectionSlot) -> None:
+                slot_key = str(slot.number)
+                command = make_collect_command(run_request, run_root, scraper, browser=lane.browser,
+                                               shard=slot.shard, total_shards=slot.total_shards,
+                                               setup_browser=request.browser_workers == 1)
+                lane_emit(lane, "log", f"CDP {lane.port}；分片 {slot.shard + 1}/{slot.total_shards}；"
+                          f"本次 {len(collector.shard_specs(specs, slot.shard, slot.total_shards))} 组", slot_key)
+                lane_emit(lane, "log", subprocess.list2cmdline(command), slot_key)
+                run_command(lane, slot_key, slot.runner, command, collecting=True)
+
+            def run_lane(lane: _CollectionLane) -> None:
+                slot_threads: list[threading.Thread] = []
+                try:
+                    if setup_only or request.browser_workers > 1:
+                        command = make_collect_command(run_request, setup_root / lane.browser, scraper, setup_only=True,
+                                                       browser=lane.browser, shard=lane.shard, total_shards=lane.total_shards)
+                        lane_emit(lane, "log", subprocess.list2cmdline(command), "setup")
+                        result = run_command(lane, "setup", lane.runner, command, collecting=False)
+                        if setup_only or control.requested or result is None or result.code != 0:
+                            for slot in lane.slots:
+                                lane_emit(lane, "finished", "仅准备浏览器" if setup_only else "浏览器未就绪，未启动", str(slot.number))
+                            return
+                    for slot in lane.slots:
+                        if not collector.shard_specs(specs, slot.shard, slot.total_shards):
+                            lane_emit(lane, "finished", "无分配组合", str(slot.number))
+                            continue
+                        if control.requested or (lane.gate_file is not None and lane.gate_file.exists()):
+                            lane_emit(lane, "finished", "验证暂停，未启动" if not control.requested else "已停止，未启动", str(slot.number))
+                            continue
+                        try:
+                            slot_threads.append(self._spawn(f"collection-{lane.browser}-{slot.number}",
+                                                           lambda lane=lane, slot=slot: start_slot(lane, slot)))
+                        except Exception as caught:
+                            error = redact_log(caught)
+                            with result_lock:
+                                command_results[(lane.browser, str(slot.number))] = {
+                                    "result": None, "error": error, "runner": slot.runner, "collecting": True}
+                            lane_emit(lane, "log", f"启动失败：{error}", str(slot.number))
+                            lane_emit(lane, "finished", "启动失败", str(slot.number))
+                except Exception as caught:
+                    error = redact_log(caught)
+                    with result_lock:
+                        command_results[(lane.browser, "supervisor")] = {
+                            "result": None, "error": error, "runner": lane.runner, "collecting": False}
+                    lane_emit(lane, "log", f"浏览器调度未完成：{error}")
+                    for slot in lane.slots:
+                        if slot.runner.result is None:
+                            lane_emit(lane, "finished", "启动失败", str(slot.number))
+                finally:
+                    for thread in slot_threads:
+                        thread.join()
 
             try:
                 root = validate_collection_root(request.root_text)
@@ -1258,12 +1563,18 @@ class CollectionPage(ttk.Frame):
                 if control.requested:
                     return
                 self._emit("scraper", (request.scraper_text, str(scraper)))
+                # Temporary preparation manifests and browser gate markers
+                # belong to this operation, never the persisted source scope.
+                temporary = tempfile.TemporaryDirectory(prefix="boss-collection-browser-")
+                temporary_base = Path(temporary.name)
+                setup_root = temporary_base / "setup"
+                gates_root = temporary_base / "gates"
+                gates_root.mkdir()
+                if not setup_only:
+                    for lane in lanes:
+                        lane.gate_file = gates_root / f"{lane.browser}.stop"
                 if setup_only:
-                    # The legacy setup-only CLI initializes a manifest before
-                    # opening Chrome. Isolate those writes from the real source.
-                    temporary = tempfile.TemporaryDirectory(prefix="boss-collection-browser-")
-                    temporary_base = Path(temporary.name)
-                    run_root = temporary_base / "setup"
+                    run_root = setup_root
                     snapshot = plans.save_plan_config(run_plan, temporary_base / "plans")
                 else:
                     root.mkdir(parents=True, exist_ok=True)
@@ -1276,28 +1587,76 @@ class CollectionPage(ttk.Frame):
                     except OSError:
                         self._emit("log", "[collection-desktop.log 暂不可写；状态仍以采集清单为准]")
                 run_request = replace(request, config_path=snapshot)
-                command = make_collect_command(run_request, run_root, scraper, setup_only=setup_only)
                 emit("log", f"\n[{started_at}] {'准备浏览器 / 人工登录（不采集）' if setup_only else '开始 / 续采（仅原始列表）'}")
                 emit("log", f"原方案：{request.config_path}；{'临时方案（不写采集输出根）' if setup_only else '本次实际组合快照'}：{snapshot}")
-                emit("log", subprocess.list2cmdline(command))
-                emit("log", "专用 Chrome 已有登录也需人工确认；不会复制普通浏览器 Cookie 或绕过安全验证。")
-                self._emit("state", "正在准备专用 Chrome；请在浏览器中人工登录并按页面提示继续。" if setup_only
-                           else "正在运行原始列表采集器；已完成组合会跳过，登录 / 验证需人工确认。")
-                result = runner.run(command, control, emit, monitor)
-                outcome["code"] = result.code
-                if not setup_only and control.requested and runner.shutdown_complete:
-                    preserve_interrupted_combination(root, specs, request.selection.pages, result,
-                                                     control.requested, started_at, lambda line: emit("log", line))
-                if not control.requested and result.code != 0 and not setup_only:
+                emit("log", f"翻页等待 {request.page_wait_min:g}–{request.page_wait_max:g} 秒；每浏览器最多 {request.browser_workers} 个独立采集槽。")
+                emit("log", "每侧使用独立浏览器、CDP 端口与 profile；各侧人工完成后点击对应的继续按钮。")
+                self._emit("state", "正在准备浏览器；请分别人工登录并点击各侧继续。" if setup_only
+                           else "正在并发采集原始列表；各侧状态独立，已完成组合会跳过。")
+                for lane in lanes:
+                    assigned = collector.shard_specs(specs, lane.shard, lane.total_shards)
+                    if not setup_only and not assigned:
+                        for slot in lane.slots:
+                            lane_emit(lane, "finished", "无分配组合", str(slot.number))
+                        if request.browser_workers > 1:
+                            lane_emit(lane, "finished", "无分配组合", "setup")
+                        continue
+                    try:
+                        lane_threads.append(self._spawn(f"collection-{lane.browser}", lambda lane=lane: run_lane(lane)))
+                    except Exception as caught:
+                        error = redact_log(caught)
+                        slot_key = "setup" if setup_only or request.browser_workers > 1 else "1"
+                        with result_lock:
+                            command_results[(lane.browser, slot_key)] = {
+                                "result": None, "error": error, "runner": lane.runner, "collecting": not setup_only}
+                        lane_emit(lane, "log", f"启动失败：{error}", slot_key)
+                        for key in (("setup",) if setup_only else tuple(str(slot.number) for slot in lane.slots)):
+                            lane_emit(lane, "finished", "启动失败", key)
+                last_monitor = 0.0
+                while any(thread.is_alive() for thread in lane_threads):
+                    for thread in lane_threads:
+                        thread.join(0.05)
+                    if time.monotonic() - last_monitor >= 0.7:
+                        monitor()
+                        last_monitor = time.monotonic()
+                errors = [f"{BROWSER_NAMES[browser]} #{slot}：{value['error']}"
+                          for (browser, slot), value in command_results.items() if value["error"]]
+                outcome["error"] = "；".join(errors) or None
+                codes = [value["result"].code for value in command_results.values() if value["result"]]
+                if any(lane.gate_file is not None and lane.gate_file.exists() for lane in lanes):
+                    codes.append(20)
+                outcome["code"] = 1 if errors else next((code for code in codes if code != 0), 0)
+                if not control.requested and outcome["code"] != 0 and not setup_only:
                     emit("log", "本次采集未全部完成；请查看落盘失败 / 暂停记录，人工处理后使用开始 / 续采。")
-                monitor()
             except Exception as error:
                 outcome["error"] = redact_log(error)
                 emit("log", f"未完成：{outcome['error']}")
-                if root is not None:
-                    monitor()
             finally:
-                outcome["requested"] = control.requested
+                # Do not release temporary roots, logs, or the host interlock
+                # while an already-started owned lane is still shutting down.
+                if any(thread.is_alive() for thread in lane_threads):
+                    control.stop()
+                    for thread in lane_threads:
+                        thread.join()
+                try:
+                    if root is not None and not setup_only:
+                        # Clear both dead owners before either interruption is
+                        # saved: the peer may have held the shared lock.
+                        for value in command_results.values():
+                            if value["result"] and value["collecting"]:
+                                _clear_owned_lock(root, value["result"], lambda line: emit("log", line))
+                        for (browser, slot_key), value in command_results.items():
+                            result = value.get("result")
+                            reason = control.requested or ("failed" if value.get("error") else None)
+                            if result and reason and value["collecting"] and value["runner"].command_complete:
+                                preserve_interrupted_combination(root, specs, request.selection.pages, result,
+                                                                 reason, started_at,
+                                                                 lambda line, browser=browser, slot_key=slot_key: lane_emit(
+                                                                     self._lanes[browser], "log", line, slot_key))
+                        monitor()
+                except Exception as caught:
+                    outcome["error"] = outcome["error"] or redact_log(caught)
+                    emit("log", f"最终进度保存 / 读取未完成：{redact_log(caught)}")
                 if log_handle:
                     try:
                         log_handle.close()
@@ -1308,6 +1667,14 @@ class CollectionPage(ttk.Frame):
                         temporary.cleanup()
                     except OSError:
                         emit("log", "浏览器准备的临时文件暂未清理；采集输出根未被改写。")
+                # Keep even an early successful side's browser tree owned
+                # through final progress I/O. A cancellation at that point
+                # must still stop every browser created by this operation.
+                with control._lock:
+                    for lane in lanes:
+                        for runner in lane.all_runners:
+                            runner.release_tree(preserve_detached=control._requested is None)
+                    outcome["requested"] = control._requested
                 self._emit("finished", outcome)
         self._operation_thread = self._spawn("collection-worker", operate)
 
@@ -1315,6 +1682,10 @@ class CollectionPage(ttk.Frame):
         if not self._closing and self._busy and self._control:
             self._control.pause()
             self._waiting = False
+            for state in self._lane_states.values():
+                state["waiting"] = False
+                for slot_state in state["slots"].values():
+                    slot_state["waiting"] = False
             self.status_text.set("正在暂停本次自有采集进程；已完成组合和已有检查点保留，当前组合可续采。")
             self._render_controls()
 
@@ -1322,15 +1693,108 @@ class CollectionPage(ttk.Frame):
         if not self._closing and self._busy and self._control:
             self._control.stop()
             self._waiting = False
+            for state in self._lane_states.values():
+                state["waiting"] = False
+                for slot_state in state["slots"].values():
+                    slot_state["waiting"] = False
             self.status_text.set("正在停止本次自有采集进程；不会删除 raw、清单或检查点。")
             self._render_controls()
 
-    def continue_after_gate(self) -> None:
-        if self._closing or not self._busy or not self._waiting or not self._control or self._control.requested:
+    def continue_after_gate(self, browser: str = "chrome") -> None:
+        if self._closing or not self._busy or not self._control or self._control.requested:
             return
-        self._waiting = False
-        self._control.continue_requested.set()
-        self.status_text.set("已确认人工处理完成；等待采集器继续 / 重试当前组合…")
+        lane = self._lanes.get(browser)
+        state = self._lane_states.get(browser, {})
+        if not lane or not state.get("waiting"):
+            return
+        runners = {str(slot.number): slot.runner for slot in lane.slots}
+        runners["setup"] = lane.runner
+        confirmed = 0
+        # Snapshot only currently waiting slots. An active target cannot receive
+        # a queued Enter when it later happens to encounter another gate.
+        for slot_key, slot_state in state["slots"].items():
+            if slot_state["waiting"] and runners[slot_key].request_continue():
+                slot_state.update(waiting=False, state="已确认，等待继续 / 重试")
+                confirmed += 1
+        if not confirmed:
+            return
+        self._sync_lane_state(browser)
+        self._waiting = any(value["waiting"] for value in self._lane_states.values())
+        self._render_lane_positions()
+        self.status_text.set(f"已确认 {lane.label} 的 {confirmed} 个等待槽；仅继续 / 重试当前已等待的操作。")
+        self._render_controls()
+
+    def _render_lane_positions(self) -> None:
+        self.position_text.set("\n".join(
+            f"{BROWSER_NAMES[browser]} · CDP {self._lanes[browser].port} · {state['state']} · "
+            + (state["position"] if len(self._lanes[browser].slots) == 1 else
+               f"最多 {len(self._lanes[browser].slots)} 槽；各槽组合 / 页见“浏览器槽位”")
+            for browser, state in self._lane_states.items()))
+        expected_rows = set()
+        for browser, state in self._lane_states.items():
+            for slot_key, slot_state in state["slots"].items():
+                row_id = f"{browser}-{slot_key}"
+                expected_rows.add(row_id)
+                values = (f"{BROWSER_NAMES[browser]} / {self._lanes[browser].port}", "登录准备" if slot_key == "setup" else slot_key,
+                          slot_state["state"], slot_state["position"])
+                if self.slot_table.exists(row_id):
+                    self.slot_table.item(row_id, values=values)
+                else:
+                    self.slot_table.insert("", "end", iid=row_id, values=values)
+        for row_id in self.slot_table.get_children():
+            if row_id not in expected_rows:
+                self.slot_table.delete(row_id)
+
+    def _sync_lane_state(self, browser: str) -> None:
+        state = self._lane_states[browser]
+        slots = state["slots"]
+        state["waiting"] = any(item["waiting"] for item in slots.values())
+        if len(self._lanes[browser].slots) == 1 and "setup" not in slots:
+            state.update(state=slots["1"]["state"], position=slots["1"]["position"])
+            return
+        setup = slots.get("setup", {})
+        numeric = [item for key, item in slots.items() if key != "setup"]
+        running = sum(item["state"] in ("采集中", "继续采集 / 准备", "已确认，等待继续 / 重试") for item in numeric)
+        waiting = sum(item["waiting"] for item in numeric)
+        done = sum(item["state"] in ("已结束", "无分配组合", "仅准备浏览器") for item in numeric)
+        if setup.get("waiting") or setup.get("state") == "准备专用浏览器 / 登录":
+            state["state"] = setup["state"]
+        elif running or waiting:
+            state["state"] = f"运行 {running} / 等待 {waiting} / 完成 {done}"
+        elif all(item["state"] == "无分配组合" for item in numeric):
+            state["state"] = "无分配组合"
+        elif done == len(numeric):
+            state["state"] = "已结束"
+        elif any(item["state"] == "等待检查" for item in numeric):
+            state["state"] = "等待启动采集槽"
+        else:
+            state["state"] = "已暂停" if self._control and self._control.requested == "paused" else "部分未完成"
+
+    def _apply_lane_event(self, value: dict[str, Any]) -> None:
+        browser, kind, item = value["browser"], value["kind"], value["value"]
+        state = self._lane_states.get(browser)
+        if state is None:
+            return
+        slot_key = str(value.get("slot", "1"))
+        slot_state = state["slots"].get(slot_key)
+        if slot_state is None:
+            return
+        if kind == "position":
+            state["position"] = slot_state["position"] = redact_log(item)
+        elif kind == "state":
+            if not self._control or not self._control.requested:
+                slot_state["state"] = str(item)
+        elif kind == "finished":
+            slot_state.update(waiting=False, state=str(item))
+        elif kind == "waiting":
+            if not self._control or self._control.requested:
+                return
+            slot_state.update(waiting=bool(item), state="等待人工登录 / 验证" if item else "继续采集 / 准备")
+            if item:
+                self.status_text.set(f"{BROWSER_NAMES[browser]} 等待人工登录 / 安全验证；完成后点击该侧的继续按钮。")
+        self._sync_lane_state(browser)
+        self._waiting = any(value["waiting"] for value in self._lane_states.values())
+        self._render_lane_positions()
         self._render_controls()
 
     def _choose_root(self) -> None:
@@ -1419,11 +1883,20 @@ class CollectionPage(ttk.Frame):
     def _finish_operation_if_safe(self) -> None:
         if self._operation_result is None or (self._operation_thread and self._operation_thread.is_alive()):
             return
-        if self._runner and not self._runner.shutdown_complete:
+        if any(not runner.shutdown_complete for lane in self._lanes.values() for runner in lane.all_runners):
             self.status_text.set("正在等待本次自有进程 / 输出线程退出；尚不能安全开始另一项操作。")
             return
         result, self._operation_result = self._operation_result, None
         self._waiting = False
+        for state in self._lane_states.values():
+            state["waiting"] = False
+            if state["state"] == "等待检查":
+                state["state"] = "未启动"
+            for slot_state in state["slots"].values():
+                slot_state["waiting"] = False
+                if slot_state["state"] == "等待检查":
+                    slot_state["state"] = "未启动"
+        self._render_lane_positions()
         if result["error"]:
             self.status_text.set(f"未完成：{result['error']}")
         elif result.get("requested"):
@@ -1449,6 +1922,8 @@ class CollectionPage(ttk.Frame):
                 self._append_log(value)
             elif kind == "progress":
                 self._apply_progress(value)
+            elif kind == "lane":
+                self._apply_lane_event(value)
             elif kind == "position":
                 self.position_text.set("当前组合 / 页：" + redact_log(value))
             elif kind == "state":
