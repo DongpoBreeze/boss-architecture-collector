@@ -2260,8 +2260,13 @@ class CollectionTkTests(unittest.TestCase):
         # Hosted CI desktops can cap the requested 760 px client height.
         # Exercise that restriction and a larger system-font/DPI request;
         # neither case may consume the detail tabs down to a heading only.
+        # Tk scaling is shared by later Tk roots in this process, even after
+        # this interpreter is destroyed. Restore it before window cleanup.
+        self.addCleanup(self.root.tk.call, "tk", "scaling", self.root.tk.call("tk", "scaling"))
+        default_font = tkfont.nametofont("TkDefaultFont", root=self.root)
+        self.addCleanup(default_font.configure, **default_font.actual())
         self.root.tk.call("tk", "scaling", 1.5)
-        tkfont.nametofont("TkDefaultFont", root=self.root).configure(family="Segoe UI", size=9)
+        default_font.configure(family="Segoe UI", size=9)
         header = ttk.Frame(self.root, height=64)
         header.pack(fill="x")
         header.pack_propagate(False)
@@ -2273,6 +2278,7 @@ class CollectionTkTests(unittest.TestCase):
         page.limit.set("2")
         page.start()
         self.pump_until(lambda: len(observed) == 4 and len(page.slot_table.get_children()) == 18)
+        self.pump_until(lambda: bool(page.plan_table.get_children()))
         self.root.maxsize(1024, 720)
         self.root.geometry("1024x760")
         self.root.deiconify()
