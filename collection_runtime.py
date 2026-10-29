@@ -8,6 +8,9 @@ module initialization, rather than silently keeping its original delay.
 
 Keep this module standard-library-only: the upstream Python executes this file
 directly, including when the orchestrator is installed in another environment.
+The CLI emits UTF-8 on stdout/stderr because the orchestrator decodes its pipes
+as UTF-8.  Initialize that contract before argparse or upstream module loading;
+neither the host locale nor PYTHONUTF8 (ignored by Python -I) establishes it.
 """
 
 from __future__ import annotations
@@ -31,6 +34,21 @@ _UPSTREAM_MODULE = "_boss_architecture_collection_upstream"
 
 class RuntimeCompatibilityError(RuntimeError):
     """The upstream pagination implementation cannot be safely adapted."""
+
+
+def configure_output_encoding() -> None:
+    """Make CLI pipes UTF-8 without replacing or discarding Unicode output.
+
+    In-process callers may redirect output to a text-only stream such as
+    StringIO, which needs no byte encoding.  A real stream's reconfiguration
+    errors are allowed to surface rather than silently retaining a locale
+    encoding.  Importing this module alone does not alter application streams.
+    """
+
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is not None:
+            reconfigure(encoding="utf-8", errors="strict")
 
 
 def validate_page_wait(minimum: float, maximum: float) -> tuple[float, float]:
@@ -183,6 +201,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 
 def main(argv: list[str] | None = None) -> int:
+    configure_output_encoding()
     args = parse_args(argv)
     script = args.scraper_root.expanduser().resolve() / "scripts" / "boss_cdp_raw.py"
     try:

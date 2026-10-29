@@ -253,11 +253,11 @@ class PackagingArtifactTests(unittest.TestCase):
             shutil.copy2(PROJECT / relative, target)
 
     @classmethod
-    def _run(cls, command, cwd, *, success=True):
+    def _run(cls, command, cwd, *, success=True, errors="replace"):
         result = subprocess.run(
             command, cwd=cwd, env=cls.environment, stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding="utf-8",
-            errors="replace", timeout=120,
+            errors=errors, timeout=120,
         )
         if success and result.returncode:
             raise AssertionError(f"Command failed ({result.returncode}): {command!r}\n{result.stdout[-16000:]}")
@@ -400,9 +400,12 @@ class PackagingArtifactTests(unittest.TestCase):
             source = textwrap.dedent('''\
                 import argparse
                 import json
+                import sys
                 from pathlib import Path
                 from types import SimpleNamespace
 
+                print("上游初始化：中文 ✓")
+                print("上游诊断：中文 ✓", file=sys.stderr)
                 waits = []
                 time = SimpleNamespace(sleep=waits.append)
                 random = SimpleNamespace(uniform=lambda lower, upper: (lower + upper) / 2)
@@ -427,14 +430,33 @@ class PackagingArtifactTests(unittest.TestCase):
             output = base / "result.json"
             prior = str(base / "历史 检查点.json")
             runtime = self._run([str(self.python), "-I", "-c", "import collection_runtime; print(collection_runtime.__file__)"], self.outside)
-            self._run([
-                str(self.python), "-I", runtime.stdout.strip(),
-                "--scraper-root", str(scraper), "--page-wait-min", "1.25", "--page-wait-max", "2.75",
-                "--", "--output", str(output), "--merge", prior,
-            ], self.outside)
-            self.assertEqual(json.loads(output.read_text(encoding="utf-8")), {
-                "waits": [3, 2.0, 3, 2.0, 3], "merge": prior,
-            })
+            bootstrap = (
+                "import runpy, sys; "
+                "sys.stdout.reconfigure(encoding=sys.argv.pop(1), errors='strict'); "
+                "sys.stderr.reconfigure(encoding=sys.stdout.encoding, errors='strict'); "
+                "print('INITIAL=' + sys.stdout.encoding + ';UTF8_MODE=' + str(sys.flags.utf8_mode), flush=True); "
+                "runpy.run_path(sys.argv.pop(1), run_name='__main__')"
+            )
+            # Keep the real -I script entrypoint.  The extra runs deliberately
+            # recreate English Windows/ASCII streams even on a Chinese host;
+            # no -X utf8 or ignored environment setting hides that contract.
+            for encoding in (None, "cp1252", "ascii"):
+                with self.subTest(initial_encoding=encoding):
+                    entrypoint = ([str(self.python), "-I", runtime.stdout.strip()] if encoding is None else
+                                  [str(self.python), "-I", "-X", "utf8=0", "-c", bootstrap, encoding, runtime.stdout.strip()])
+                    result = self._run([
+                        *entrypoint,
+                        "--scraper-root", str(scraper), "--page-wait-min", "1.25", "--page-wait-max", "2.75",
+                        "--", "--output", str(output), "--merge", prior,
+                    ], self.outside, errors="strict")
+                    if encoding is not None:
+                        self.assertIn(f"INITIAL={encoding};UTF8_MODE=0", result.stdout)
+                    self.assertIn("上游初始化：中文 ✓", result.stdout)
+                    self.assertIn("上游诊断：中文 ✓", result.stdout)
+                    self.assertEqual(result.stdout.count("翻页等待"), 2)
+                    self.assertEqual(json.loads(output.read_text(encoding="utf-8")), {
+                        "waits": [3, 2.0, 3, 2.0, 3], "merge": prior,
+                    })
             self.assertEqual(script.read_text(encoding="utf-8"), source)
             self.assertEqual(list(script.parent.iterdir()), [script])
             self.assertEqual(list(self.outside.iterdir()), [])

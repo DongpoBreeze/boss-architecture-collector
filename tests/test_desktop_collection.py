@@ -10,6 +10,7 @@ import tempfile
 import threading
 import time
 import tkinter as tk
+from tkinter import font as tkfont
 from tkinter import ttk
 import unittest
 from unittest.mock import Mock, patch
@@ -2252,6 +2253,61 @@ class CollectionTkTests(unittest.TestCase):
             page.notebook.select(page.plan_frame)
             self.root.update()
             self.assertGreater(page.plan_table.winfo_height(), 55)
+        page.stop()
+        self.pump_until(lambda: not page.busy)
+
+    def test_short_host_and_larger_windows_fonts_keep_controls_and_full_table_rows_visible(self):
+        # Hosted CI desktops can cap the requested 760 px client height.
+        # Exercise that restriction and a larger system-font/DPI request;
+        # neither case may consume the detail tabs down to a heading only.
+        self.root.tk.call("tk", "scaling", 1.5)
+        tkfont.nametofont("TkDefaultFont", root=self.root).configure(family="Segoe UI", size=9)
+        header = ttk.Frame(self.root, height=64)
+        header.pack(fill="x")
+        header.pack_propagate(False)
+        processes = {(browser, index): FakeProcess(
+            f"RUN {spec['combination']} (now), pages=10\n[2/10 页] 本页1条\n")
+            for index, (browser, spec) in enumerate(zip(("chrome", "edge"), self.specs))}
+        observed, _all = self.attach_slots(processes)
+        page = self.make_page(browser_mode="dual", browser_workers="8")
+        page.limit.set("2")
+        page.start()
+        self.pump_until(lambda: len(observed) == 4 and len(page.slot_table.get_children()) == 18)
+        self.root.maxsize(1024, 720)
+        self.root.geometry("1024x760")
+        self.root.deiconify()
+        for theme in ("dark", "light"):
+            configure_styles(self.root, palette_for(theme))
+            style = ttk.Style(self.root)
+            host_paddings = {name: style.lookup(name, "padding") for name in (
+                "TEntry", "TCombobox", "TSpinbox", "Small.TButton", "Primary.TButton", "TNotebook.Tab", "Treeview.Heading")}
+            page.apply_theme(palette_for(theme))
+            for tab, target in ((page.plan_frame, page.plan_table), (page.log_frame, page.log_view),
+                                (page.slot_frame, page.slot_table)):
+                page.notebook.select(tab)
+                self.root.update()
+                self.assertEqual((self.root.winfo_width(), self.root.winfo_height()), (1024, 720))
+                self.assertGreater(target.winfo_height(), 55)
+                for widget in (page.root_entry, page.scraper_entry, page.start_button, page.prepare_browser_button,
+                               page.pause_button, page.stop_button, page.continue_button, page.edge_continue_button,
+                               page.page_wait_min_entry, page.page_wait_max_entry, page.browser_workers_spin,
+                               page.browser_mode_box, page.refresh_button, page.open_root_button, page.use_source_button,
+                               page.edit_plan_button, page.load_plan_button, target):
+                    with self.subTest(theme=theme, tab=str(tab), widget=str(widget)):
+                        x = widget.winfo_rootx() - self.root.winfo_rootx()
+                        y = widget.winfo_rooty() - self.root.winfo_rooty()
+                        self.assertGreaterEqual(x, 0)
+                        self.assertGreaterEqual(y, 64)
+                        self.assertLessEqual(x + widget.winfo_width(), self.root.winfo_width())
+                        self.assertLessEqual(y + widget.winfo_height(), self.root.winfo_height())
+                if isinstance(target, ttk.Treeview):
+                    bounds = target.bbox(target.get_children()[0])
+                    self.assertTrue(bounds, "a complete first data row must remain visible below its heading")
+                    self.assertLessEqual(bounds[1] + bounds[3], target.winfo_height())
+            self.assertEqual(host_paddings, {name: style.lookup(name, "padding") for name in host_paddings})
+            self.assertGreater(page.root_entry.winfo_width(), 120)
+            self.assertGreater(page.scraper_entry.winfo_width(), 120)
+        self.assertEqual(self.errors, [])
         page.stop()
         self.pump_until(lambda: not page.busy)
 

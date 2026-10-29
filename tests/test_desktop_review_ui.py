@@ -1858,6 +1858,8 @@ class ReviewTkTests(unittest.TestCase):
         self.root.update()
         identity = self.app._page_ids[1]
         before = identity in self.app._stage_info()["keep_ids"]
+        self.app.results_table.see(identity)
+        self.root.update_idletasks()
         x, y, width, height = self.app.results_table.bbox(identity, "keep")
         self.app.results_table.event_generate("<Button-1>", x=x + width // 2, y=y + height // 2)
         self.wait_idle()
@@ -3367,6 +3369,28 @@ class ReviewTkTests(unittest.TestCase):
                 self.assertGreaterEqual(self.app.results_table.winfo_height(), 60, f"{theme} / {stage}")
                 self.assertGreaterEqual(self.app.log_view.winfo_height(), 40)
                 self.assertFalse(self.app.settings_frame.winfo_manager())
+
+    def test_short_windows_desktop_keeps_review_rows_and_log_visible(self):
+        self.complete_through("report")
+        # A hosted Windows desktop can cap a requested 820-pixel window.
+        # Exercise the supported minimum client height on every machine.
+        self.root.maxsize(1024, 720)
+        self.root.geometry("1024x820")
+        self.root.deiconify()
+        for theme in ("dark", "light"):
+            self.app._set_theme(theme, persist=False)
+            for stage in ("shortlist", "fetch-jd", "llm"):
+                self.app._select_stage(stage)
+                self.root.update()
+                with self.subTest(theme=theme, stage=stage):
+                    self.assertEqual(self.root.winfo_height(), 720)
+                    self.assertGreaterEqual(self.app.results_table.winfo_height(), 60)
+                    self.assertGreaterEqual(self.app.log_view.winfo_height(), 40)
+                    for widget in (self.app.confirm_button, self.app.detail_notebook,
+                                   self.app.log_view):
+                        self.assertTrue(widget.winfo_ismapped())
+                        self.assertLessEqual(widget.winfo_rooty() + widget.winfo_height(),
+                                             self.root.winfo_rooty() + self.root.winfo_height())
 
     def test_close_cancels_poll_filter_and_all_owned_after_callbacks(self):
         self.app.search.set("pending filter")

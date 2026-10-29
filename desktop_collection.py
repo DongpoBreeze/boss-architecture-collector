@@ -706,7 +706,7 @@ class CollectionPage(ttk.Frame):
         self._lane_states: dict[str, dict[str, Any]] = {}
         self._control: CollectionControl | None = None
         self._traces: list[tuple[tk.Variable, str]] = []
-        self._layout_signature: tuple[int, int, int, int] | None = None
+        self._layout_signature: tuple[int, ...] | None = None
         self._track_syncing = False
         self._plan_config: dict[str, Any] | None = None
         self._cached_config_path: Path | None = None
@@ -786,82 +786,89 @@ class CollectionPage(ttk.Frame):
         settings = ttk.Frame(self.content, style="Card.TFrame", padding=(10, 3))
         settings.grid(row=1, column=0, sticky="ew")
         settings.columnconfigure(1, weight=1)
-        ttk.Label(settings, text="采集输出根", style="Card.TLabel").grid(row=0, column=0, sticky="w", padx=(0, 10))
-        self.root_entry = ttk.Entry(settings, textvariable=self.collection_root)
+        paths = ttk.Frame(settings, style="Card.TFrame")
+        paths.grid(row=0, column=0, columnspan=3, sticky="ew")
+        paths.columnconfigure(1, weight=1, uniform="collection_paths")
+        paths.columnconfigure(4, weight=1, uniform="collection_paths")
+        ttk.Label(paths, text="采集输出根", style="Card.TLabel").grid(row=0, column=0, sticky="w", padx=(0, 8))
+        self.root_entry = ttk.Entry(paths, textvariable=self.collection_root, style="Collection.TEntry")
         self.root_entry.grid(row=0, column=1, sticky="ew", padx=(0, 6), pady=2)
-        self.choose_root_button = ttk.Button(settings, text="选择 / 新建目录", style="Small.TButton", command=self._choose_root)
-        self.choose_root_button.grid(row=0, column=2)
-        ttk.Label(settings, text="上游 scraper", style="Card.TLabel").grid(row=1, column=0, sticky="w", padx=(0, 10))
-        self.scraper_entry = ttk.Entry(settings, textvariable=self.scraper_root)
-        self.scraper_entry.grid(row=1, column=1, sticky="ew", padx=(0, 6), pady=2)
-        self.choose_scraper_button = ttk.Button(settings, text="选择（留空自动找）", style="Small.TButton", command=self._choose_scraper)
-        self.choose_scraper_button.grid(row=1, column=2)
+        self.choose_root_button = ttk.Button(paths, text="选择 / 新建目录", style="Collection.Small.TButton", command=self._choose_root)
+        self.choose_root_button.grid(row=0, column=2, padx=(0, 12))
+        ttk.Label(paths, text="上游 scraper", style="Card.TLabel").grid(row=0, column=3, sticky="w", padx=(0, 8))
+        self.scraper_entry = ttk.Entry(paths, textvariable=self.scraper_root, style="Collection.TEntry")
+        self.scraper_entry.grid(row=0, column=4, sticky="ew", padx=(0, 6), pady=2)
+        self.choose_scraper_button = ttk.Button(paths, text="选择（留空自动找）", style="Collection.Small.TButton", command=self._choose_scraper)
+        self.choose_scraper_button.grid(row=0, column=5)
         filters = ttk.Frame(settings, style="Card.TFrame")
-        filters.grid(row=2, column=0, columnspan=3, sticky="ew", pady=(4, 3))
+        filters.grid(row=1, column=0, columnspan=3, sticky="ew", pady=(4, 3))
         ttk.Label(filters, text="城市", style="Card.TLabel").pack(side="left")
-        self.city_box = ttk.Combobox(filters, textvariable=self.city, values=CITY_CHOICES, state="readonly", width=8)
+        self.city_box = ttk.Combobox(filters, textvariable=self.city, values=CITY_CHOICES, state="readonly", width=8,
+                                   style="Collection.TCombobox")
         self.city_box.pack(side="left", padx=(6, 14))
         ttk.Label(filters, text="检索分组", style="Card.TLabel").pack(side="left")
-        self.track_box = ttk.Combobox(filters, textvariable=self.track_label, values=tuple(TRACK_LABELS.values()), state="readonly", width=9)
+        self.track_box = ttk.Combobox(filters, textvariable=self.track_label, values=tuple(TRACK_LABELS.values()), state="readonly", width=9,
+                                    style="Collection.TCombobox")
         self.track_box.pack(side="left", padx=(6, 14))
         ttk.Label(filters, text="本次最多检索", style="Card.TLabel").pack(side="left")
-        self.limit_entry = ttk.Entry(filters, textvariable=self.limit, width=7)
+        self.limit_entry = ttk.Entry(filters, textvariable=self.limit, width=7, style="Collection.TEntry")
         self.limit_entry.pack(side="left", padx=(6, 4))
         ttk.Label(filters, text="组，空 = 全部", style="Hint.TLabel").pack(side="left", padx=(0, 14))
         ttk.Label(filters, text="每组页数", style="Card.TLabel").pack(side="left")
-        self.pages_spin = ttk.Spinbox(filters, textvariable=self.pages, from_=1, to=10, width=5)
+        self.pages_spin = ttk.Spinbox(filters, textvariable=self.pages, from_=1, to=10, width=5, style="Collection.TSpinbox")
         self.pages_spin.pack(side="left", padx=(6, 5))
         ttk.Label(filters, text="1–10 页，仅列表", style="Hint.TLabel").pack(side="left")
         self.scope_help_label = ttk.Label(settings, textvariable=self.scope_help, style="Hint.TLabel", wraplength=900)
-        self.scope_help_label.grid(row=3, column=0, columnspan=3, sticky="ew", pady=(2, 0))
+        self.scope_help_label.grid(row=2, column=0, columnspan=3, sticky="ew", pady=(2, 0))
         runtime = ttk.Frame(settings, style="Card.TFrame")
-        runtime.grid(row=4, column=0, columnspan=3, sticky="ew", pady=(2, 0))
+        runtime.grid(row=3, column=0, columnspan=3, sticky="ew", pady=(2, 0))
         ttk.Label(runtime, text="翻页等待（秒）最短", style="Card.TLabel").pack(side="left")
-        self.page_wait_min_entry = ttk.Entry(runtime, textvariable=self.page_wait_min, width=6)
+        self.page_wait_min_entry = ttk.Entry(runtime, textvariable=self.page_wait_min, width=6, style="Collection.TEntry")
         self.page_wait_min_entry.pack(side="left", padx=(5, 8))
         ttk.Label(runtime, text="最长", style="Card.TLabel").pack(side="left")
-        self.page_wait_max_entry = ttk.Entry(runtime, textvariable=self.page_wait_max, width=6)
+        self.page_wait_max_entry = ttk.Entry(runtime, textvariable=self.page_wait_max, width=6, style="Collection.TEntry")
         self.page_wait_max_entry.pack(side="left", padx=(5, 15))
         ttk.Label(runtime, text="每浏览器采集并发数", style="Card.TLabel").pack(side="left")
-        self.browser_workers_spin = ttk.Spinbox(runtime, textvariable=self.browser_workers, from_=1, to=MAX_BROWSER_WORKERS, width=4)
+        self.browser_workers_spin = ttk.Spinbox(runtime, textvariable=self.browser_workers, from_=1, to=MAX_BROWSER_WORKERS, width=4,
+                                              style="Collection.TSpinbox")
         self.browser_workers_spin.pack(side="left", padx=(5, 8))
         self.limit_help_label = ttk.Label(runtime, text="1–8 槽；上限先于分片，完成组跳过", style="Hint.TLabel")
         self.limit_help_label.pack(side="left")
         plan_actions = ttk.Frame(settings, style="Card.TFrame")
-        plan_actions.grid(row=5, column=0, columnspan=3, sticky="ew", pady=(4, 2))
-        self.edit_plan_button = ttk.Button(plan_actions, text="编辑检索条件…", style="Small.TButton", command=self.open_plan_editor)
+        plan_actions.grid(row=4, column=0, columnspan=3, sticky="ew", pady=(4, 2))
+        self.edit_plan_button = ttk.Button(plan_actions, text="编辑检索条件…", style="Collection.Small.TButton", command=self.open_plan_editor)
         self.edit_plan_button.pack(side="left", padx=(0, 6))
-        self.load_plan_button = ttk.Button(plan_actions, text="加载方案…", style="Small.TButton", command=self.load_plan)
+        self.load_plan_button = ttk.Button(plan_actions, text="加载方案…", style="Collection.Small.TButton", command=self.load_plan)
         self.load_plan_button.pack(side="left", padx=(0, 8))
         # Long snapshot paths remain available in the operation log; this
         # single-line label must not consume space needed by runtime controls.
         self.config_label = ttk.Label(plan_actions, textvariable=self.config_text, style="Hint.TLabel", width=1)
         self.config_label.pack(side="left", fill="x", expand=True)
         self.estimate_label = ttk.Label(settings, textvariable=self.estimate_text, style="Hint.TLabel", wraplength=900)
-        self.estimate_label.grid(row=6, column=0, columnspan=3, sticky="ew")
+        self.estimate_label.grid(row=5, column=0, columnspan=3, sticky="ew")
         actions = ttk.Frame(self.content)
         actions.grid(row=2, column=0, sticky="ew", pady=2)
         first = ttk.Frame(actions)
         first.pack(fill="x")
-        self.start_button = ttk.Button(first, text="开始 / 续采", style="Primary.TButton", command=self.start)
-        self.prepare_browser_button = ttk.Button(first, text="准备浏览器 / 登录", style="Small.TButton", command=self.prepare_browser)
-        self.pause_button = ttk.Button(first, text="暂停", style="Small.TButton", command=self.pause)
-        self.stop_button = ttk.Button(first, text="停止", style="Small.TButton", command=self.stop)
-        self.continue_button = ttk.Button(first, text="Chrome 人工完成，继续", style="Small.TButton", command=self.continue_after_gate)
-        self.edge_continue_button = ttk.Button(first, text="Edge 人工完成，继续", style="Small.TButton",
+        self.start_button = ttk.Button(first, text="开始 / 续采", style="Collection.Primary.TButton", command=self.start)
+        self.prepare_browser_button = ttk.Button(first, text="准备浏览器 / 登录", style="Collection.Small.TButton", command=self.prepare_browser)
+        self.pause_button = ttk.Button(first, text="暂停", style="Collection.Small.TButton", command=self.pause)
+        self.stop_button = ttk.Button(first, text="停止", style="Collection.Small.TButton", command=self.stop)
+        self.continue_button = ttk.Button(first, text="Chrome 人工完成，继续", style="Collection.Small.TButton", command=self.continue_after_gate)
+        self.edge_continue_button = ttk.Button(first, text="Edge 人工完成，继续", style="Collection.Small.TButton",
                                               command=lambda: self.continue_after_gate("edge"))
         for widget in (self.start_button, self.prepare_browser_button, self.pause_button, self.stop_button,
                        self.continue_button, self.edge_continue_button):
             widget.pack(side="left", padx=(0, 6))
         second = ttk.Frame(actions)
         second.pack(fill="x", pady=(4, 0))
-        self.refresh_button = ttk.Button(second, text="刷新进度", style="Small.TButton", command=self.refresh_progress)
-        self.open_root_button = ttk.Button(second, text="打开采集目录", style="Small.TButton", command=self.open_collection_directory)
-        self.use_source_button = ttk.Button(second, text="用此数据新建后处理任务", style="Small.TButton", command=self.use_source)
+        self.refresh_button = ttk.Button(second, text="刷新进度", style="Collection.Small.TButton", command=self.refresh_progress)
+        self.open_root_button = ttk.Button(second, text="打开采集目录", style="Collection.Small.TButton", command=self.open_collection_directory)
+        self.use_source_button = ttk.Button(second, text="用此数据新建后处理任务", style="Collection.Small.TButton", command=self.use_source)
         for widget in (self.refresh_button, self.open_root_button, self.use_source_button):
             widget.pack(side="left", padx=(0, 6))
         self.browser_mode_box = ttk.Combobox(second, textvariable=self.browser_mode, values=tuple(BROWSER_MODES.values()),
-                                            state="readonly", width=16)
+                                            state="readonly", width=16, style="Collection.TCombobox")
         self.browser_mode_box.pack(side="right")
         ttk.Label(second, text="采集浏览器").pack(side="right", padx=(8, 6))
         progress = ttk.Frame(self.content)
@@ -877,23 +884,24 @@ class CollectionPage(ttk.Frame):
         self.stats_label.grid(row=3, column=0, sticky="ew")
         self.position_label = ttk.Label(progress, textvariable=self.position_text, style="Muted.TLabel", wraplength=940)
         self.position_label.grid(row=4, column=0, sticky="ew")
-        self.notebook = ttk.Notebook(self.content)
+        self.notebook = ttk.Notebook(self.content, style="Collection.TNotebook")
         self.notebook.grid(row=4, column=0, sticky="nsew")
         self.plan_frame = ttk.Frame(self.notebook)
         self.plan_frame.columnconfigure(0, weight=1)
         self.plan_frame.rowconfigure(1, weight=1)
         plan_toolbar = ttk.Frame(self.plan_frame)
         plan_toolbar.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(3, 3))
-        self.select_all_button = ttk.Button(plan_toolbar, text="全选可见范围", style="Small.TButton", command=lambda: self.select_visible_combinations(True))
+        self.select_all_button = ttk.Button(plan_toolbar, text="全选可见范围", style="Collection.Small.TButton", command=lambda: self.select_visible_combinations(True))
         self.select_all_button.pack(side="left", padx=(0, 5))
-        self.clear_selection_button = ttk.Button(plan_toolbar, text="清空可见范围", style="Small.TButton", command=lambda: self.select_visible_combinations(False))
+        self.clear_selection_button = ttk.Button(plan_toolbar, text="清空可见范围", style="Collection.Small.TButton", command=lambda: self.select_visible_combinations(False))
         self.clear_selection_button.pack(side="left", padx=(0, 12))
         ttk.Label(plan_toolbar, text="查找关键词 / 城市").pack(side="left")
-        self.plan_search_entry = ttk.Entry(plan_toolbar, textvariable=self.plan_search, width=22)
+        self.plan_search_entry = ttk.Entry(plan_toolbar, textvariable=self.plan_search, width=22, style="Collection.TEntry")
         self.plan_search_entry.pack(side="left", padx=6)
         ttk.Label(plan_toolbar, text="勾选后再应用本次上限", style="Muted.TLabel").pack(side="left")
         plan_columns = ("checked", "index", "group", "city", "keyword", "salary", "experience", "degree", "pages", "execution")
-        self.plan_table = ttk.Treeview(self.plan_frame, columns=plan_columns, show="headings", height=3, selectmode="extended")
+        self.plan_table = ttk.Treeview(self.plan_frame, columns=plan_columns, show="headings", height=3, selectmode="extended",
+                                     style="Collection.Treeview")
         for key, title, width in zip(plan_columns,
                 ("勾选", "序号", "检索分组", "城市", "关键词", "薪资", "经验", "学历", "页数", "本次计划"),
                 (48, 48, 85, 65, 225, 78, 85, 62, 48, 110)):
@@ -926,7 +934,7 @@ class CollectionPage(ttk.Frame):
         table_frame.columnconfigure(0, weight=1)
         table_frame.rowconfigure(0, weight=1)
         columns = ("combination", "scope", "status", "pages", "jobs")
-        self.progress_table = ttk.Treeview(table_frame, columns=columns, show="headings", height=4)
+        self.progress_table = ttk.Treeview(table_frame, columns=columns, show="headings", height=4, style="Collection.Treeview")
         for key, title, width in zip(columns, ("组合", "城市 / 分组", "落盘状态", "已落盘页", "条目"), (380, 145, 130, 95, 65)):
             self.progress_table.heading(key, text=title)
             self.progress_table.column(key, width=width, minwidth=55, stretch=key == "combination")
@@ -940,7 +948,8 @@ class CollectionPage(ttk.Frame):
         slot_frame = ttk.Frame(self.notebook)
         slot_frame.columnconfigure(0, weight=1)
         slot_frame.rowconfigure(0, weight=1)
-        self.slot_table = ttk.Treeview(slot_frame, columns=("browser", "slot", "state", "position"), show="headings", height=4)
+        self.slot_table = ttk.Treeview(slot_frame, columns=("browser", "slot", "state", "position"), show="headings", height=4,
+                                     style="Collection.Treeview")
         for key, title, width in (("browser", "浏览器 / 端口", 130), ("slot", "并发槽", 65),
                                   ("state", "状态", 175), ("position", "当前组合 / 页", 540)):
             self.slot_table.heading(key, text=title)
@@ -968,12 +977,21 @@ class CollectionPage(ttk.Frame):
             return
         try:
             width = max(1, self.canvas.winfo_width())
-            # The notebook requests the height of its larger, hidden tree tab.
-            # It can safely shrink to the explicit row minimum while the log
-            # stays usable; do not force that hidden tab's full request on a
-            # 1024x760 host window (or retain an old, narrow-wrap request).
-            signature = (width, self.content.winfo_reqheight(), self.notebook.winfo_reqheight(), self.canvas.winfo_height())
-            minimum = max(1, signature[1] - signature[2] + 165)
+            # Tab chrome, toolbar and heading heights depend on the installed
+            # fonts and Tk scaling. Reserve a complete plan row using their
+            # measured requests, rather than squeezing everything into a fixed
+            # 165 px notebook that can leave only a heading on Windows CI.
+            row_height = int(ttk.Style(self).lookup("Collection.Treeview", "rowheight") or 20)
+            plan_minimum = self.plan_frame.winfo_reqheight() - (int(self.plan_table.cget("height")) - 1) * row_height
+            notebook_chrome = self.notebook.winfo_reqheight() - max(
+                frame.winfo_reqheight() for frame in self.notebook.winfo_children())
+            notebook_minimum = max(165, notebook_chrome + plan_minimum)
+            self.content.rowconfigure(4, minsize=notebook_minimum)
+            # Hidden tabs need not force their full requested row count on a
+            # small host window. Retain scrolling below this usable minimum.
+            signature = (width, self.content.winfo_reqheight(), self.notebook.winfo_reqheight(),
+                         self.canvas.winfo_height(), notebook_minimum)
+            minimum = max(1, signature[1] - max(signature[2], notebook_minimum) + notebook_minimum)
             height = max(minimum, self.canvas.winfo_height())
             self.canvas.itemconfigure(self._canvas_window, width=width, height=height)
             self.canvas.configure(scrollregion=(0, 0, width, height))
@@ -990,11 +1008,21 @@ class CollectionPage(ttk.Frame):
             pass
 
     def apply_theme(self, palette: Mapping[str, str]) -> None:
-        """Repaint local Tk widgets only; host owns ttk styles/options/theme."""
+        """Repaint this page and its derived styles; host owns theme/options."""
         if self._closing:
             return
         self.palette = {**LIGHT_PALETTE, **dict(palette)}
         p = self.palette
+        # Keep the host's fonts, colours and accessible states; only this
+        # dense form uses smaller vertical padding than the other workspaces.
+        style = ttk.Style(self)
+        style.configure("Collection.TEntry", padding=(7, 4))
+        style.configure("Collection.TCombobox", padding=(6, 4))
+        style.configure("Collection.TSpinbox", padding=(6, 4))
+        style.configure("Collection.Small.TButton", padding=(9, 3))
+        style.configure("Collection.Primary.TButton", padding=(12, 4))
+        style.configure("Collection.TNotebook.Tab", padding=(14, 5))
+        style.configure("Collection.Treeview.Heading", padding=(9, 4))
         self.canvas.configure(background=p["background"])
         self.log_view.configure(background=p["log"], foreground=p["log_text"], insertbackground=p["log_text"],
                                 selectbackground=p["log_selection"], selectforeground=p["log_selected_text"])

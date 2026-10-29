@@ -3,6 +3,7 @@ from contextlib import redirect_stderr, redirect_stdout
 import inspect
 import io
 import json
+import os
 from pathlib import Path
 import shutil
 import subprocess
@@ -88,6 +89,58 @@ class CollectionRuntimeTests(unittest.TestCase):
         script.parent.mkdir(parents=True)
         script.write_text(source, encoding="utf-8")
         return script
+
+    def run_with_legacy_stdio(self, encoding, arguments, cwd):
+        # -I ignores PYTHONUTF8/PYTHONIOENCODING.  Force the actual pipe
+        # encodings as well, so this exercises English Windows/ASCII behavior
+        # even on a development machine whose locale supports Chinese.
+        bootstrap = (
+            "import runpy, sys; "
+            "sys.stdout.reconfigure(encoding=sys.argv.pop(1), errors='strict'); "
+            "sys.stderr.reconfigure(encoding=sys.stdout.encoding, errors='strict'); "
+            "print('INITIAL=' + sys.stdout.encoding + ';UTF8_MODE=' + str(sys.flags.utf8_mode), flush=True); "
+            "runpy.run_path(sys.argv.pop(1), run_name='__main__')"
+        )
+        environment = dict(os.environ, PYTHONUTF8="1", PYTHONIOENCODING="ascii:strict")
+        return subprocess.run([
+            sys.executable, "-I", "-X", "utf8=0", "-c", bootstrap, encoding,
+            str(Path(runtime.__file__).resolve()), *arguments,
+        ], cwd=cwd, env=environment, capture_output=True, timeout=10)
+
+    def test_isolated_cli_emits_strict_utf8_from_cp1252_and_ascii_before_loading_upstream(self):
+        for encoding in ("cp1252", "ascii"):
+            with self.subTest(encoding=encoding), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                source = UPSTREAM_SOURCE.replace(
+                    "import sys\n", 'import sys\nprint("上游初始化：中文 ✓")\nprint("上游诊断：中文 ✓", file=sys.stderr)\n'
+                )
+                script = self.write_upstream(root, source)
+                output = root / "out.json"
+                result = self.run_with_legacy_stdio(encoding, [
+                    "--scraper-root", str(root), "--page-wait-min", "0.25", "--page-wait-max", "0.25",
+                    "--", "--output", str(output),
+                ], root)
+                stdout, stderr = result.stdout.decode("utf-8", errors="strict"), result.stderr.decode("utf-8", errors="strict")
+                self.assertEqual(result.returncode, 0, stdout + stderr)
+                self.assertIn(f"INITIAL={encoding};UTF8_MODE=0", stdout)
+                self.assertIn("上游初始化：中文 ✓", stdout)
+                self.assertIn("上游诊断：中文 ✓", stderr)
+                self.assertIn("翻页等待", stdout)
+                self.assertEqual(json.loads(output.read_text(encoding="utf-8"))["events"], [2, 0.5, 0.25, 0.5])
+                self.assertEqual(script.read_text(encoding="utf-8"), source)
+
+    def test_isolated_help_and_argument_errors_use_utf8_before_upstream_is_loaded(self):
+        for arguments, exit_code, diagnostic in (
+            (["--help"], 0, "为上游列表采集配置翻页等待"),
+            (["--scraper-root", "unused", "--page-wait-min", "nan", "--", "--help"], 2, "翻页等待时间必须为有限数字"),
+        ):
+            with self.subTest(arguments=arguments), tempfile.TemporaryDirectory() as directory:
+                result = self.run_with_legacy_stdio("ascii", arguments, Path(directory))
+                stdout, stderr = result.stdout.decode("utf-8", errors="strict"), result.stderr.decode("utf-8", errors="strict")
+                self.assertEqual(result.returncode, exit_code, stdout + stderr)
+                self.assertIn("INITIAL=ascii;UTF8_MODE=0", stdout)
+                self.assertIn(diagnostic, stdout + stderr)
+                self.assertEqual(list(Path(directory).iterdir()), [])
 
     def test_actual_sleep_bounds_change_and_initial_scroll_waits_are_preserved(self):
         for minimum, maximum in ((0, 0), (1.25, 7.5), (300, 300)):

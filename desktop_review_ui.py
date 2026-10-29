@@ -973,7 +973,7 @@ class ReviewDesktopApp:
         self.binding_details_button = ttk.Button(bound_actions, text="输入 / 输出绑定", style="Small.TButton", command=self._toggle_bindings)
         self.binding_details_button.pack(side="left", padx=4)
 
-        nav = self.stage_navigation = ttk.Frame(self.root, padding=(18, 4, 18, 5))
+        nav = self.stage_navigation = ttk.Frame(self.root, padding=(18, 2, 18, 3))
         nav.grid(row=2, column=0, sticky="ew")
         self.stage_buttons: dict[str, ttk.Button] = {}
         for index, stage in enumerate(REVIEW_STAGES):
@@ -987,9 +987,9 @@ class ReviewDesktopApp:
         self.root.bind("<Configure>", self._resize_notice, add="+")
 
         self.main_pane = ttk.Panedwindow(self.root, orient="vertical")
-        self.main_pane.grid(row=4, column=0, sticky="nsew", padx=18, pady=(0, 12))
+        self.main_pane.grid(row=4, column=0, sticky="nsew", padx=18, pady=(0, 8))
         self.main_pane.bind("<Configure>", self._keep_log_reachable, add="+")
-        work = ttk.Frame(self.main_pane, style="Card.TFrame", padding=(10, 8))
+        work = ttk.Frame(self.main_pane, style="Card.TFrame", padding=(10, 4))
         self.main_pane.add(work, weight=5)
         work.columnconfigure(0, weight=1)
         work.rowconfigure(4, weight=1)
@@ -1000,14 +1000,14 @@ class ReviewDesktopApp:
         self.status_badge = tk.Label(work_heading, textvariable=self.status_text, padx=8, pady=3, font=("Microsoft YaHei UI", 9))
         self.status_badge.grid(row=0, column=1, sticky="e")
         description = ttk.Frame(work, style="Card.TFrame")
-        description.grid(row=1, column=0, sticky="ew", pady=(4, 5))
+        description.grid(row=1, column=0, sticky="ew", pady=(3, 3))
         description.columnconfigure(0, weight=1)
         self.description_label = ttk.Label(description, textvariable=self.stage_description, style="Hint.TLabel", wraplength=820)
         self.description_label.grid(row=0, column=0, sticky="ew")
         self.reset_button = ttk.Button(description, text="重置本阶段", style="Small.TButton", command=self._reset_stage)
         self.reset_button.grid(row=0, column=1, sticky="ne", padx=(8, 0))
         controls = ttk.Frame(work, style="Card.TFrame")
-        controls.grid(row=2, column=0, sticky="ew", pady=(0, 5))
+        controls.grid(row=2, column=0, sticky="ew", pady=(0, 3))
         self.run_button = ttk.Button(controls, text="运行本步", style="Review.Primary.TButton", command=self._run_stage)
         self.run_button.pack(side="left", padx=(0, 6))
         self.pause_button = ttk.Button(controls, text="暂停", style="Small.TButton", command=self._pause_stage)
@@ -1024,7 +1024,7 @@ class ReviewDesktopApp:
                                             command=self._edit_review_rules)
 
         progress_area = ttk.Frame(work, style="Card.TFrame")
-        progress_area.grid(row=3, column=0, sticky="ew", pady=(0, 6))
+        progress_area.grid(row=3, column=0, sticky="ew", pady=(0, 3))
         progress_area.columnconfigure(0, weight=1)
         self.jd_settings_frame = ttk.Frame(progress_area, style="Card.TFrame")
         jd_options_line = ttk.Frame(self.jd_settings_frame, style="Card.TFrame")
@@ -1215,7 +1215,7 @@ class ReviewDesktopApp:
         self.detail_toggle_button.grid(row=2, column=0, sticky="w", pady=(5, 0))
 
         footer = ttk.Frame(work, style="Card.TFrame")
-        footer.grid(row=5, column=0, sticky="ew", pady=(7, 0))
+        footer.grid(row=5, column=0, sticky="ew", pady=(4, 0))
         footer.columnconfigure(0, weight=1)
         ttk.Label(footer, textvariable=self.count_text, style="Hint.TLabel").grid(row=0, column=0, sticky="w")
         self.open_report_button = ttk.Button(footer, text="打开报告", style="Review.Primary.TButton",
@@ -2215,7 +2215,9 @@ class ReviewDesktopApp:
             stage_status = stage_info.get("status", "pending")
             label = "已确认 · " + str(len(stage_info.get("keep_ids", []))) if stage_info.get("confirmed") and stage_status == "completed" else STATUS_LABELS.get(stage_status, stage_status)
             button = self.stage_buttons[stage]
-            button.configure(text=f"{index + 1}  {STAGE_LABELS[stage]}\n{label}", style="Review.ActiveStep.TButton" if stage == key else "Review.StaleStep.TButton" if stage_status == "stale" else "Review.Step.TButton")
+            # Keep the phase and its status on one line so short Windows
+            # desktops retain usable result rows below the review controls.
+            button.configure(text=f"{index + 1}  {STAGE_LABELS[stage]} · {label}", style="Review.ActiveStep.TButton" if stage == key else "Review.StaleStep.TButton" if stage_status == "stale" else "Review.Step.TButton")
             locked = bound and index > 0 and not self._stage_info(STAGES[index - 1]).get("confirmed") and stage_status == "pending"
             self._enabled(button, not self._busy and not self._closing and not locked)
         self.stage_title.set(f"{STAGES.index(key) + 1}. {STAGE_LABELS[key]}")

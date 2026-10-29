@@ -157,7 +157,10 @@ class WorkspaceMixin:
             variable.trace_add("write", lambda *_: self._apply_result_filters())
         self.root.bind("<Control-f>", self._focus_result_search)
         self.root.bind("<F5>", lambda _: self._refresh_current_view())
-        self.root.bind_all("<MouseWheel>", self._scroll_settings, add="+")
+        # Child widgets include their toplevel in their bindtags. Keeping
+        # this callback on our window also lets Python 3.10 destroy it;
+        # that version's bind_all leaves the Tcl command unowned.
+        self.root.bind("<MouseWheel>", self._scroll_settings, add="+")
         self._update_stage_hint()
         self._set_theme(self.theme.get(), persist=False)
         self._workspace_ready = True
