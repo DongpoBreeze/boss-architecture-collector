@@ -1,0 +1,762 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://boss-architecture-collector.local/schemas/delivery_jobs.v1.schema.json",
+  "title": "Independent BOSS delivery jobs v1",
+  "description": "Only the current confirmed final keep set from import, shortlist, fetch-jd and llm. job_key is stable for the same task record across exports; job_id is the task-local source identity and is never a BOSS target id. Duplicate BOSS targets are blocked in full; no raw source paths, provider data or report fields are allowed.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "export_id",
+    "generated_at",
+    "source_task",
+    "summary",
+    "jobs",
+    "blocked_jobs"
+  ],
+  "properties": {
+    "schema_version": {
+      "type": "string",
+      "const": "1.0"
+    },
+    "export_id": {
+      "type": "string",
+      "pattern": "^[a-f0-9]{32}$"
+    },
+    "generated_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "source_task": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "task_id",
+        "name",
+        "city",
+        "track",
+        "created_at",
+        "review_revision",
+        "review_stages"
+      ],
+      "properties": {
+        "task_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "name": {
+          "type": "string",
+          "minLength": 1
+        },
+        "city": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "track": {
+          "type": "string",
+          "enum": [
+            "all",
+            "current",
+            "target"
+          ]
+        },
+        "created_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "review_revision": {
+          "type": "string",
+          "pattern": "^[a-f0-9]{64}$"
+        },
+        "review_stages": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "import",
+            "shortlist",
+            "fetch-jd",
+            "llm"
+          ],
+          "properties": {
+            "import": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "shortlist": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "fetch-jd": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "llm": {
+              "type": "integer",
+              "minimum": 0
+            }
+          }
+        }
+      }
+    },
+    "summary": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "selected_count",
+        "ready_count",
+        "blocked_count"
+      ],
+      "properties": {
+        "selected_count": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "ready_count": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "blocked_count": {
+          "type": "integer",
+          "minimum": 0
+        }
+      }
+    },
+    "jobs": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/job"
+      }
+    },
+    "blocked_jobs": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/blocked_job"
+      }
+    }
+  },
+  "$defs": {
+    "job": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "job_key",
+        "job_id",
+        "boss_job_id",
+        "job_url",
+        "title",
+        "company",
+        "city",
+        "location",
+        "district",
+        "business_district",
+        "address",
+        "salary",
+        "experience",
+        "education",
+        "skills",
+        "job_labels",
+        "jd",
+        "ai_review",
+        "selection",
+        "navigation"
+      ],
+      "properties": {
+        "job_key": {
+          "type": "string",
+          "pattern": "^job_[a-f0-9]{64}$"
+        },
+        "job_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "boss_job_id": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$"
+        },
+        "job_url": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "pattern": "^https://www\\.zhipin\\.com/job_detail/[A-Za-z0-9][A-Za-z0-9_-]{0,127}\\.html$"
+        },
+        "title": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "company": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "city": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "location": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "district": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "business_district": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "address": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "salary": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "experience": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "education": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "skills": {
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "type": "string",
+            "minLength": 1
+          },
+          "uniqueItems": true
+        },
+        "job_labels": {
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "type": "string",
+            "minLength": 1
+          },
+          "uniqueItems": true
+        },
+        "jd": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "ai_review": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "format",
+            "status",
+            "judgment",
+            "reason",
+            "validation"
+          ],
+          "properties": {
+            "format": {
+              "type": [
+                "string",
+                "null"
+              ],
+              "enum": [
+                "simple-v1",
+                null
+              ]
+            },
+            "status": {
+              "type": "string",
+              "enum": [
+                "success",
+                "failed",
+                "missing",
+                "invalid"
+              ]
+            },
+            "judgment": {
+              "type": [
+                "string",
+                "null"
+              ],
+              "enum": [
+                "符合",
+                "不符合",
+                "信息不足",
+                null
+              ]
+            },
+            "reason": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "validation": {
+              "type": "string",
+              "enum": [
+                "input_match",
+                "missing_review",
+                "review_failed",
+                "invalid_status",
+                "job_identity_changed",
+                "jd_incomplete",
+                "input_changed",
+                "invalid_review_format",
+                "missing_signature",
+                "prompt_unavailable",
+                "not_applicable"
+              ]
+            }
+          }
+        },
+        "selection": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "stage",
+            "confirmed",
+            "keep",
+            "source",
+            "manual_keep"
+          ],
+          "properties": {
+            "stage": {
+              "const": "llm",
+              "type": "string"
+            },
+            "confirmed": {
+              "const": true,
+              "type": "boolean"
+            },
+            "keep": {
+              "const": true,
+              "type": "boolean"
+            },
+            "source": {
+              "type": "string",
+              "enum": [
+                "manual",
+                "ai"
+              ]
+            },
+            "manual_keep": {
+              "type": [
+                "boolean",
+                "null"
+              ],
+              "enum": [
+                true,
+                null
+              ]
+            }
+          }
+        },
+        "navigation": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "original_job_url",
+            "lid",
+            "ka",
+            "from",
+            "security_id",
+            "encrypt_boss_id"
+          ],
+          "properties": {
+            "original_job_url": {
+              "type": [
+                "string",
+                "null"
+              ],
+              "pattern": "^https?://(?:[A-Za-z0-9-]+\\.)*zhipin\\.com(?::80|:443)?/job_detail/[A-Za-z0-9][A-Za-z0-9_-]{0,127}\\.html(?:\\?[A-Za-z0-9_.=&%~:/+@-]+)?$"
+            },
+            "lid": {
+              "type": ["string", "null"],
+              "maxLength": 512,
+              "pattern": "^[A-Za-z0-9._~:/+=@-]{1,512}$"
+            },
+            "ka": {
+              "type": ["string", "null"],
+              "maxLength": 512,
+              "pattern": "^[A-Za-z0-9._~:/+=@-]{1,512}$"
+            },
+            "from": {
+              "type": ["string", "null"],
+              "maxLength": 512,
+              "pattern": "^[A-Za-z0-9._~:/+=@-]{1,512}$"
+            },
+            "security_id": {
+              "type": ["string", "null"],
+              "maxLength": 512,
+              "pattern": "^[A-Za-z0-9._~:/+=@-]{1,512}$"
+            },
+            "encrypt_boss_id": {
+              "description": "Opaque recruiter navigation hint. Never a job target identifier.",
+              "type": ["string", "null"],
+              "maxLength": 512,
+              "pattern": "^[A-Za-z0-9._~:/+=@-]{1,512}$"
+            }
+          }
+        }
+      },
+      "anyOf": [
+        {
+          "properties": {
+            "boss_job_id": {
+              "type": "string",
+              "minLength": 1
+            }
+          }
+        },
+        {
+          "properties": {
+            "job_url": {
+              "type": "string",
+              "minLength": 1
+            }
+          }
+        }
+      ]
+    },
+    "blocked_job": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "job_key",
+        "job_id",
+        "boss_job_id",
+        "job_url",
+        "title",
+        "company",
+        "city",
+        "location",
+        "district",
+        "business_district",
+        "address",
+        "salary",
+        "experience",
+        "education",
+        "skills",
+        "job_labels",
+        "jd",
+        "ai_review",
+        "selection",
+        "navigation",
+        "blocked_reasons"
+      ],
+      "properties": {
+        "job_key": {
+          "type": "string",
+          "pattern": "^job_[a-f0-9]{64}$"
+        },
+        "job_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "boss_job_id": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$"
+        },
+        "job_url": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "pattern": "^https://www\\.zhipin\\.com/job_detail/[A-Za-z0-9][A-Za-z0-9_-]{0,127}\\.html$"
+        },
+        "title": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "company": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "city": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "location": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "district": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "business_district": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "address": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "salary": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "experience": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "education": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "skills": {
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "type": "string",
+            "minLength": 1
+          },
+          "uniqueItems": true
+        },
+        "job_labels": {
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "type": "string",
+            "minLength": 1
+          },
+          "uniqueItems": true
+        },
+        "jd": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "ai_review": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "format",
+            "status",
+            "judgment",
+            "reason",
+            "validation"
+          ],
+          "properties": {
+            "format": {
+              "type": [
+                "string",
+                "null"
+              ],
+              "enum": [
+                "simple-v1",
+                null
+              ]
+            },
+            "status": {
+              "type": "string",
+              "enum": [
+                "success",
+                "failed",
+                "missing",
+                "invalid"
+              ]
+            },
+            "judgment": {
+              "type": [
+                "string",
+                "null"
+              ],
+              "enum": [
+                "符合",
+                "不符合",
+                "信息不足",
+                null
+              ]
+            },
+            "reason": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "validation": {
+              "type": "string",
+              "enum": [
+                "input_match",
+                "missing_review",
+                "review_failed",
+                "invalid_status",
+                "job_identity_changed",
+                "jd_incomplete",
+                "input_changed",
+                "invalid_review_format",
+                "missing_signature",
+                "prompt_unavailable",
+                "not_applicable"
+              ]
+            }
+          }
+        },
+        "selection": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "stage",
+            "confirmed",
+            "keep",
+            "source",
+            "manual_keep"
+          ],
+          "properties": {
+            "stage": {
+              "const": "llm",
+              "type": "string"
+            },
+            "confirmed": {
+              "const": true,
+              "type": "boolean"
+            },
+            "keep": {
+              "const": true,
+              "type": "boolean"
+            },
+            "source": {
+              "type": "string",
+              "enum": [
+                "manual",
+                "ai"
+              ]
+            },
+            "manual_keep": {
+              "type": [
+                "boolean",
+                "null"
+              ],
+              "enum": [
+                true,
+                null
+              ]
+            }
+          }
+        },
+        "navigation": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "original_job_url",
+            "lid",
+            "ka",
+            "from",
+            "security_id",
+            "encrypt_boss_id"
+          ],
+          "properties": {
+            "original_job_url": {
+              "type": [
+                "string",
+                "null"
+              ],
+              "pattern": "^https?://(?:[A-Za-z0-9-]+\\.)*zhipin\\.com(?::80|:443)?/job_detail/[A-Za-z0-9][A-Za-z0-9_-]{0,127}\\.html(?:\\?[A-Za-z0-9_.=&%~:/+@-]+)?$"
+            },
+            "lid": {
+              "type": ["string", "null"],
+              "maxLength": 512,
+              "pattern": "^[A-Za-z0-9._~:/+=@-]{1,512}$"
+            },
+            "ka": {
+              "type": ["string", "null"],
+              "maxLength": 512,
+              "pattern": "^[A-Za-z0-9._~:/+=@-]{1,512}$"
+            },
+            "from": {
+              "type": ["string", "null"],
+              "maxLength": 512,
+              "pattern": "^[A-Za-z0-9._~:/+=@-]{1,512}$"
+            },
+            "security_id": {
+              "type": ["string", "null"],
+              "maxLength": 512,
+              "pattern": "^[A-Za-z0-9._~:/+=@-]{1,512}$"
+            },
+            "encrypt_boss_id": {
+              "description": "Opaque recruiter navigation hint. Never a job target identifier.",
+              "type": ["string", "null"],
+              "maxLength": 512,
+              "pattern": "^[A-Za-z0-9._~:/+=@-]{1,512}$"
+            }
+          }
+        },
+        "blocked_reasons": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "enum": [
+              "missing_boss_identifier",
+              "invalid_boss_identifier",
+              "invalid_job_url",
+              "conflicting_identifiers",
+              "ai_review_invalid",
+              "duplicate_target"
+            ]
+          }
+        }
+      }
+    }
+  }
+}

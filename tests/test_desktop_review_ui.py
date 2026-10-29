@@ -16,6 +16,7 @@ from unittest.mock import Mock, PropertyMock, patch
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
 
+import delivery_export
 import desktop_review_ui as ui
 import desktop_ui
 import project_llm_settings
@@ -310,7 +311,7 @@ class ReviewTkTests(unittest.TestCase):
     def wait_idle(self, app=None, root=None, timeout=8):
         app, root = app or self.app, root or self.root
         deadline = time.monotonic() + timeout
-        while app._busy and time.monotonic() < deadline:
+        while (app._busy or app.delivery_page.busy) and time.monotonic() < deadline:
             root.update()
             time.sleep(.005)
         root.update()
@@ -396,6 +397,15 @@ class ReviewTkTests(unittest.TestCase):
         if self.app.task is None:
             self.create_task()
         for key in STAGES[:STAGES.index(stage) + 1]:
+            if key == "report":
+                # Old report executors remain an explicit backend contract;
+                # the default UI no longer navigates to or runs this stage.
+                self.fake_executor(self.app.task, key, on_event=lambda *_args: None)
+                if confirm_last:
+                    self.app.task.confirm(key)
+                self.app._refresh_task()
+                self.wait_idle()
+                return
             if self.app.stage.get() != key:
                 self.app._select_stage(key)
             self.app._run_stage()
@@ -440,11 +450,11 @@ class ReviewTkTests(unittest.TestCase):
         self.complete_through("llm")
         return list(self.app._stage_info()["pending_ids"])
 
-    def test_reset_button_is_visible_on_all_five_pages_and_disabled_until_a_first_run(self):
+    def test_reset_button_is_visible_on_all_four_steps_and_disabled_until_a_first_run(self):
         self.assertTrue(self.app.reset_button.instate(["disabled"]))
         self.create_task()
         self.root.deiconify()
-        for stage in STAGES:
+        for stage in ui.REVIEW_STAGES:
             self.app._select_stage(stage)
             self.root.update()
             self.assertTrue(self.app.reset_button.winfo_ismapped())
@@ -455,7 +465,7 @@ class ReviewTkTests(unittest.TestCase):
     def test_cancelling_each_stage_reset_keeps_every_file_and_manifest_unchanged(self):
         self.complete_through("report", confirm_last=True)
         self.ask.return_value = False
-        for stage in STAGES:
+        for stage in ui.REVIEW_STAGES:
             with self.subTest(stage=stage):
                 self.app._select_stage(stage)
                 before = self.task_json()
@@ -472,7 +482,7 @@ class ReviewTkTests(unittest.TestCase):
 
     def test_stage_reset_clears_current_outputs_without_running_and_separate_run_executes(self):
         self.complete_through("report", confirm_last=True)
-        for stage in reversed(STAGES):
+        for stage in reversed(ui.REVIEW_STAGES):
             with self.subTest(stage=stage):
                 self.app._select_stage(stage)
                 before = self.task_json()
@@ -494,7 +504,7 @@ class ReviewTkTests(unittest.TestCase):
                 index = STAGES.index(stage)
                 for earlier in STAGES[:index]:
                     self.assertEqual(after["stages"][earlier], before["stages"][earlier])
-                for later in STAGES[index + 1:]:
+                for later in ui.REVIEW_STAGES[index + 1:]:
                     self.assertEqual(after["stages"][later]["status"], "stale")
                     self.assertFalse(after["stages"][later]["confirmed"])
 
@@ -522,7 +532,7 @@ class ReviewTkTests(unittest.TestCase):
         self.wait_idle()
         self.assertEqual(len(self.calls), count)
         self.assertEqual(self.app._stage_info()["status"], "pending")
-        self.app._select_stage("report")
+        self.app._select_stage("llm")
         self.assertTrue(self.app.open_report_button.instate(["disabled"]))
         self.assertTrue(self.app.reset_button.instate(["disabled"]))
         self.assertFalse(self.app._stage_info()["confirmed"])
@@ -601,7 +611,7 @@ class ReviewTkTests(unittest.TestCase):
         self.assertFalse(self.parent.exists())
         with patch("llm_client.load_codex_config", side_effect=AssertionError("navigation read model credentials")), \
              patch("project_llm_settings.load_api_key", side_effect=AssertionError("idle UI read saved API key")):
-            for stage in STAGES:
+            for stage in ui.REVIEW_STAGES:
                 self.app._select_stage(stage)
         self.pump()
         self.assertEqual(self.calls, [])
@@ -617,8 +627,11 @@ class ReviewTkTests(unittest.TestCase):
         app = self.app
         source_before = app.source_root.get()
         self.assertEqual(app.workspace.get(), "review")
-        self.assertEqual(tuple(app.stage_buttons), STAGES)
+        self.assertEqual(tuple(app.stage_buttons), ui.REVIEW_STAGES)
         self.assertFalse(app.collection_page.winfo_manager())
+        self.assertEqual(app.collection_page.browser_mode.get(), "Chrome + Edge")
+        self.assertEqual(tuple(app.collection_page.browser_mode_box["values"]), ("Chrome + Edge", "仅 Chrome"))
+        self.assertEqual(app.collection_page.browser_workers.get(), "3")
         for theme in ("dark", "light"):
             app._set_theme(theme, persist=False)
             with patch.object(ui.subprocess, "Popen") as launch:
@@ -630,12 +643,25 @@ class ReviewTkTests(unittest.TestCase):
                 self.assertFalse(app.stage_navigation.winfo_manager())
                 self.assertFalse(app.setup_frame.winfo_manager())
                 self.assertFalse(app.collection_page.busy)
+                collection_mode = "仅 Chrome" if theme == "dark" else "Chrome + Edge"
+                app.collection_page.browser_mode.set(collection_mode)
+                app.collection_page.browser_workers.set("2")
+                app.collection_page.page_wait_min.set("1.25")
+                app.collection_page.page_wait_max.set("2.75")
                 app.review_button.invoke()
                 self.root.update()
                 self.assertEqual(app.workspace.get(), "review")
                 self.assertTrue(app.main_pane.winfo_ismapped())
                 self.assertTrue(app.setup_frame.winfo_ismapped())
                 self.assertFalse(app.collection_page.winfo_manager())
+                app.collector_button.invoke()
+                self.root.update()
+                self.assertEqual(app.collection_page.browser_mode.get(), collection_mode)
+                self.assertEqual(app.collection_page.browser_workers.get(), "2")
+                self.assertEqual(app.collection_page.page_wait_min.get(), "1.25")
+                self.assertEqual(app.collection_page.page_wait_max.get(), "2.75")
+                app.review_button.invoke()
+                self.root.update()
                 launch.assert_not_called()
             for button in (app.collector_button, app.review_button, app.theme_button):
                 self.assertTrue(button.winfo_ismapped())
@@ -1531,7 +1557,7 @@ class ReviewTkTests(unittest.TestCase):
 
     def test_each_stage_stops_at_review_and_confirm_only_loads_next_step(self):
         self.create_task()
-        for index, stage in enumerate(STAGES):
+        for index, stage in enumerate(ui.REVIEW_STAGES):
             self.assertEqual(self.app.stage.get(), stage)
             before = len(self.calls)
             self.app.run_button.invoke()
@@ -1542,87 +1568,80 @@ class ReviewTkTests(unittest.TestCase):
             self.assertNotIn("disabled", self.app.confirm_button.state())
             self.app.confirm_button.invoke()
             self.wait_idle()
-            self.assertEqual(len(self.calls), before + 1, "confirmation must not invoke any executor")
-            self.assertEqual(self.app.stage.get(), STAGES[min(index + 1, 4)])
-        self.assertEqual([call[0] for call in self.calls], list(STAGES))
+            self.assertEqual(len(self.calls), before + 1, "confirmation must not invoke an executor")
+            self.assertEqual(self.app.stage.get(), ui.REVIEW_STAGES[min(index + 1, 3)])
+        self.assertEqual([call[0] for call in self.calls], list(ui.REVIEW_STAGES))
         self.assertTrue(all(call[1] != self.app.ui_thread_id for call in self.calls))
-        self.assertTrue(self.app.manifest["stages"]["report"]["confirmed"])
+        self.assertFalse(self.app.manifest["stages"]["report"]["confirmed"])
+        self.assertEqual(self.app.manifest["stages"]["report"]["status"], "pending")
         self.assertIn("50", self.app.binding_scope.get())
-        self.assertEqual(len(self.app._rows["report"]), 50)
+        self.assertNotIn("report", self.app._rows)
         self.assertEqual(self.errors.call_count, 0)
+        self.assertFalse((self.app.task.path / "delivery-exports").exists())
         with patch.object(self.app, "_open_path") as opener:
             self.app.json_button.invoke()
-            self.wait_idle()
-            self.assertEqual(opener.call_args.args[0].name, "merged_jobs_index.json")
             self.app.markdown_button.invoke()
-            self.wait_idle()
-            self.assertEqual(opener.call_args.args[0].name, "海投分层清单.md")
+            opener.assert_not_called()
 
-    def test_report_page_open_button_waits_for_generation_but_not_final_confirmation(self):
+    def test_final_confirmation_offers_delivery_navigation_without_generating_report_or_export(self):
         self.complete_through("llm")
-        self.assertFalse(self.app.open_report_button.winfo_manager(), "report action belongs to the report page")
-        self.app.confirm_button.invoke()
-        self.wait_idle()
-        self.assertEqual(self.app.stage.get(), "report")
-        self.assertEqual(self.app.open_report_button.cget("text"), "打开报告")
-        self.assertEqual(self.app.open_report_button.winfo_manager(), "grid")
-        self.assertIn("disabled", self.app.open_report_button.state())
-        with patch.object(self.app, "_open_path") as opener:
-            self.app.open_report_button.invoke()
-            opener.assert_not_called()
-            self.app.run_button.invoke()
+        with patch.object(delivery_export, "export_task") as export:
+            self.app.confirm_button.invoke()
             self.wait_idle()
-            opener.assert_not_called()
-            self.assertFalse(self.app._stage_info()["confirmed"])
-            self.assertNotIn("disabled", self.app.open_report_button.state())
-            self.assertIn("打开报告", self.app.notice.get())
+            self.assertEqual(self.app.stage.get(), "llm")
+            self.assertIn("03", self.app.notice.get())
+            self.assertEqual(self.app.go_delivery_button.winfo_manager(), "grid")
+            self.assertFalse(self.app.open_report_button.winfo_manager())
+            self.assertIn("disabled", self.app.open_report_button.state())
             before = len(self.calls)
-            path = self.app._artifacts["markdown"]
-            self.app.open_report_button.invoke()
+            self.app.go_delivery_button.invoke()
             self.wait_idle()
-            opener.assert_called_once_with(path)
-            self.assertEqual(len(self.calls), before, "opening must not rerun processing")
-            self.assertFalse(self.app._stage_info()["confirmed"], "opening must not confirm the report")
+            self.assertEqual(self.app.workspace.get(), "delivery")
+            self.assertEqual(len(self.calls), before)
+            export.assert_not_called()
+        self.assertEqual(self.app.manifest["stages"]["report"]["status"], "pending")
         self.assertEqual((self.source / "raw/current/shanghai/jobs.json").read_bytes(), self.raw_before)
 
-    def test_report_open_button_rechecks_staleness_before_opening(self):
+    def test_historical_report_buttons_stay_hidden_when_upstream_becomes_stale(self):
         self.complete_through("report")
         other = ReviewTask.open(self.app.task.path)
         other.set_keep("shortlist", ["job-001"], False)
-        self.assertNotIn("disabled", self.app.open_report_button.state(), "UI has not refreshed yet")
         with patch.object(self.app, "_open_path") as opener:
             self.app.open_report_button.invoke()
+            self.app._refresh_task()
             self.wait_idle()
             opener.assert_not_called()
         self.assertEqual(self.app._stage_info("report")["status"], "stale")
+        self.assertFalse(self.app.open_report_button.winfo_manager())
         self.assertIn("disabled", self.app.open_report_button.state())
-        self.assertTrue(self.errors.called)
 
-    def test_report_open_button_does_not_open_a_missing_report_file(self):
+    def test_missing_historical_report_artifact_does_not_affect_default_review(self):
         self.complete_through("report")
-        self.app._artifacts["markdown"].unlink()
+        ui._artifact_paths(self.app.task, self.app.task.snapshot())["markdown"].unlink()
         with patch.object(self.app, "_open_path") as opener:
             self.app.open_report_button.invoke()
+            self.app._refresh_task()
             self.wait_idle()
             opener.assert_not_called()
         self.assertIn("disabled", self.app.open_report_button.state())
-        self.assertTrue(self.errors.called)
+        self.assertNotIn("markdown", self.app._artifacts)
+        self.assertFalse(self.errors.called)
 
-    def test_opening_an_existing_task_exposes_its_report_without_regeneration(self):
+    def test_opening_a_historical_report_task_returns_to_final_review_without_regeneration(self):
         self.complete_through("report")
         path = self.app.task.path
-        report = self.app._artifacts["markdown"]
+        report = ui._artifact_paths(self.app.task, self.app.task.snapshot())["markdown"]
+        saved = report.read_bytes()
         before = len(self.calls)
         root, app = self.make_window()
         app._open_task(path)
         self.wait_idle(app, root)
-        self.assertEqual(app.stage.get(), "report")
-        self.assertEqual(app.open_report_button.winfo_manager(), "grid")
-        self.assertNotIn("disabled", app.open_report_button.state())
-        with patch.object(app, "_open_path") as opener:
-            app.open_report_button.invoke()
-            self.wait_idle(app, root)
-            opener.assert_called_once_with(report)
+        self.assertEqual(app.stage.get(), "llm")
+        self.assertFalse(app.open_report_button.winfo_manager())
+        self.assertIn("disabled", app.open_report_button.state())
+        self.assertNotIn("report", app._rows)
+        self.assertNotIn("markdown", app._artifacts)
+        self.assertEqual(report.read_bytes(), saved)
         self.assertEqual(len(self.calls), before)
         self.browser.assert_not_called()
 
@@ -2040,7 +2059,7 @@ class ReviewTkTests(unittest.TestCase):
     def test_queue_change_after_confirmation_invalidates_downstream_without_running(self):
         self.complete_through("report", confirm_last=True)
         app = self.app
-        artifacts, calls = dict(app._artifacts), len(self.calls)
+        artifacts, calls = ui._artifact_paths(app.task, app.task.snapshot()), len(self.calls)
         app._select_stage("shortlist")
         expected = self.queue_ids("relevant")
         app.relevant_only_button.invoke()
@@ -2356,7 +2375,7 @@ class ReviewTkTests(unittest.TestCase):
 
     def test_upstream_edits_invalidate_downstream_and_protect_confirmation_and_reports(self):
         self.complete_through("report", confirm_last=True)
-        paths = dict(self.app._artifacts)
+        paths = ui._artifact_paths(self.app.task, self.app.task.snapshot())
         call_count = len(self.calls)
         self.app._select_stage("shortlist")
         self.app._set_keep(["job-001"], False)
@@ -2365,7 +2384,7 @@ class ReviewTkTests(unittest.TestCase):
             self.assertEqual(self.app._stage_info(stage)["status"], "stale")
         self.assertIn("失效", self.app.notice.get())
         self.assertTrue(paths["json"].is_file(), "old outputs must remain inspectable on disk")
-        self.app._select_stage("report")
+        self.app._select_stage("llm")
         self.assertIn("disabled", self.app.confirm_button.state())
         self.assertIn("disabled", self.app.open_report_button.state())
         self.assertIn("disabled", self.app.json_button.state())
@@ -2391,22 +2410,24 @@ class ReviewTkTests(unittest.TestCase):
         self.assertEqual(self.app._stage_info("report")["status"], "stale")
         self.assertIn("disabled", self.app.json_button.state())
 
-    def test_final_report_table_and_counts_come_from_the_complete_report_json(self):
+    def test_explicit_legacy_capture_uses_complete_report_and_default_review_ignores_it(self):
         self.complete_through("report")
-        report = json.loads(self.app._artifacts["json"].read_text(encoding="utf-8"))
+        task = self.app.task
+        view = ui._capture_task(task)
+        report_path = view["artifacts"]["json"]
+        report = json.loads(report_path.read_text(encoding="utf-8"))
         by_id = {job_id(job): job for job in report}
-        self.assertEqual(len(self.app._rows["report"]), len(by_id))
-        for job in self.app._rows["report"]:
+        self.assertEqual(len(view["rows"]["report"]), len(by_id))
+        for job in view["rows"]["report"]:
             self.assertEqual(job["classification"], by_id[job_id(job)]["classification"])
-        counts = self.app._stage_info()["stats"]["classification_counts"]
-        self.assertIn(f"全量追踪 {len(report)}", self.app.count_text.get())
-        self.assertIn(f"暂不投 {counts['暂不投']}", self.app.count_text.get())
-        # A malformed replacement is never treated as a new report view.
-        write_json(self.app._artifacts["json"], report[:-1])
+        self.assertNotIn("report", self.app._rows)
+        write_json(report_path, report[:-1])
+        with self.assertRaises(ui.TaskStateError):
+            ui._capture_task(task)
         self.app._refresh_task()
         self.wait_idle()
         self.assertIn("disabled", self.app.json_button.state())
-        self.assertTrue(self.errors.called)
+        self.assertFalse(self.errors.called)
 
     def test_explicit_open_restores_fixed_scope_and_choices_without_running(self):
         self.complete_through("shortlist")
@@ -2652,45 +2673,33 @@ class ReviewTkTests(unittest.TestCase):
         self.assertEqual(task.snapshot(), before)
         self.assertIn("只读历史", app.detail_text.get("1.0", "end-1c"))
 
-    def test_confirmed_ai_manual_keep_shows_report_pool_and_current_counts_with_raw_pending_evidence(self):
+    def test_confirmed_ai_manual_choices_reach_delivery_without_rewriting_pending_evidence(self):
         pending = self.complete_ai_with_pending()
         app = self.app
         app._set_keep([pending[0]], True)
         self.wait_idle()
         app._set_keep([pending[1]], False)
         self.wait_idle()
+        evidence = copy.deepcopy(next(row for row in app._rows["llm"] if job_id(row) == pending[0])["llm_review"])
         app._confirm_stage()
         self.wait_idle()
-        self.assertEqual(app.stage.get(), "report")
-        app.executor = ui.execute_stage
-        with patch.object(review_pipeline, "_run_child", side_effect=AssertionError("no external process is allowed")), \
-                patch("llm_client.load_codex_config", side_effect=AssertionError("no credentials are allowed")):
-            app._run_stage()
-            self.wait_idle()
-        self.assertEqual(app._stage_info()["status"], "completed", self.errors.call_args_list)
-        rows = {job_id(row): row for row in app._rows["report"]}
-        kept = rows[pending[0]]
-        self.assertTrue(kept["analysis_pending"], "the AI evidence remains pending after a human decision")
-        self.assertEqual(kept["classification"], "海投池")
-        self.assertTrue(app._kept(kept))
+        self.assertEqual(app.stage.get(), "llm")
+        with patch.object(review_pipeline, "_run_child", side_effect=AssertionError("no external process is allowed")),              patch("llm_client.load_codex_config", side_effect=AssertionError("no credentials are allowed")):
+            preview = delivery_export.preview_task(app.task)
+        rows = {row["job_id"]: row for row in preview["jobs"] + preview["blocked_jobs"]}
+        self.assertIn(pending[0], rows)
+        self.assertNotIn(pending[1], rows)
+        self.assertEqual(rows[pending[0]]["selection"]["source"], "manual")
+        current = next(row for row in app._rows["llm"] if job_id(row) == pending[0])
+        self.assertEqual(current["llm_review"], evidence)
+        self.assertTrue(current["analysis_pending"])
         app.filter.set("保留")
         self.pump()
         self.assertIn(pending[0], app._page_ids)
-        self.assertEqual(app.results_table.set(pending[0], "keep"), "☑")
-        self.assertIn("已确认人工保留", app.results_table.set(pending[0], "reason"))
-        self.assertNotIn("不在保留或剔除名单", app.results_table.set(pending[0], "reason"))
-        app._focus_id = pending[0]
-        app._show_detail()
-        self.assertIn("已有分层：海投池", app.detail_text.get("1.0", "end-1c"))
-        self.assertIn("已确认人工保留", app.detail_text.get("1.0", "end-1c"))
-        app.filter.set("待核实")
-        self.pump()
-        self.assertNotIn(pending[0], app._page_ids)
         self.assertNotIn(pending[1], app._page_ids)
-        current = app._stage_info()["stats"]["classification_counts"]["待核实"]
-        self.assertEqual(app.filter_buttons["待核实"].cget("text"), f"待核实 {current}")
-        self.assertIn(f"待核实 {current}", app.count_text.get())
-        self.assertIn("disabled", app.detail_toggle_button.state())
+        self.assertEqual(app.results_table.set(pending[0], "keep"), "☑")
+        self.assertNotIn("report", app._rows)
+        self.assertEqual(app._stage_info("report")["status"], "pending")
 
     def test_running_ai_checkpoint_updates_three_exclusive_lists_and_pending_filter(self):
         self.complete_through("fetch-jd", confirm_last=True)
@@ -3007,10 +3016,10 @@ class ReviewTkTests(unittest.TestCase):
             self.assertEqual(app.results_table.item(identity, "tags"), ("stale",))
         self.assertEqual(self.task_json(), saved)
 
-    def test_preview_import_jd_and_report_do_not_inherit_suggestion_colors(self):
+    def test_preview_import_and_jd_do_not_inherit_suggestion_colors(self):
         self.complete_through("report")
         app = self.app
-        for stage in ("import", "fetch-jd", "report", "llm"):
+        for stage in ("import", "fetch-jd", "llm"):
             with self.subTest(stage=stage):
                 app._select_stage(stage)
                 if stage == "llm":
@@ -3152,15 +3161,16 @@ class ReviewTkTests(unittest.TestCase):
         self.wait_idle()
         self.assertEqual(len(self.calls), count)
         self.assertEqual(self.app.stage.get(), "shortlist")
-        for stage in STAGES[1:]:
+        for stage in ui.REVIEW_STAGES[1:]:
             self.assertEqual(self.app.stage.get(), stage)
             self.app._run_stage()
             self.wait_idle()
             self.assertEqual(self.app._stage_info()["input_ids"], [])
             self.app._confirm_stage()
             self.wait_idle()
-        self.assertEqual(len(self.app._rows["report"]), 50)
-        self.assertTrue(all(job["excluded_at"] == "import" for job in self.app._rows["report"]))
+        self.assertEqual(delivery_export.preview_task(self.app.task)["summary"]["selected_count"], 0)
+        self.assertNotIn("report", self.app._rows)
+        self.assertFalse((self.app.task.path / "delivery-exports").exists())
 
     def test_browser_and_collector_only_run_after_explicit_actions(self):
         self.create_task()
@@ -3246,9 +3256,7 @@ class ReviewTkTests(unittest.TestCase):
             self.assertEqual(self.calls[-1][2]["jd_workers"], jd_workers)
             self.assertEqual(self.calls[-1][2]["batch_size"], 30)
 
-    def test_real_local_executor_empty_downstream_chain_matches_report_without_services(self):
-        # Actual importer intentionally recognizes complete search-combination
-        # filenames rather than arbitrary JSON files in raw/.
+    def test_real_local_executor_empty_chain_exports_empty_delivery_without_services(self):
         write_json(self.source / "raw/current/shanghai/current__shanghai__aiarch__20_50__1_3.json",
                    {"city": "上海", "filters": {"salary": "20-50K", "experience": "1-3年"}, "jobs": self.jobs})
         write_json(self.source / "raw/target/shanghai/target__shanghai__aiarch__20_50__3_5.json",
@@ -3259,32 +3267,30 @@ class ReviewTkTests(unittest.TestCase):
             self.app._run_stage()
             self.wait_idle()
             self.assertEqual(self.app._stage_info()["status"], "completed", self.errors.call_args_list)
-            imported = len(self.app._stage_info()["keep_ids"])
-            self.assertEqual(imported, 50)
+            self.assertEqual(len(self.app._stage_info()["keep_ids"]), 50)
             self.app._confirm_stage()
             self.wait_idle()
             self.app._run_stage()
             self.wait_idle()
             self.assertEqual(self.app.stage.get(), "shortlist")
-            self.assertEqual(self.app._stage_info()["status"], "completed", self.errors.call_args_list)
             self.app._set_keep([job_id(job) for job in self.app._rows["shortlist"]], False)
             self.wait_idle()
             self.app._confirm_stage()
             self.wait_idle()
-            for stage in ("fetch-jd", "llm", "report"):
+            for stage in ("fetch-jd", "llm"):
                 self.assertEqual(self.app.stage.get(), stage)
                 self.app._run_stage()
                 self.wait_idle()
                 self.assertEqual(self.app._stage_info()["status"], "completed", self.errors.call_args_list)
                 self.app._confirm_stage()
                 self.wait_idle()
+            self.assertFalse((self.app.task.path / "delivery-exports").exists())
+            document = json.loads(delivery_export.export_task(self.app.task).read_text(encoding="utf-8"))
             child.assert_not_called()
-        report = json.loads(self.app._artifacts["json"].read_text(encoding="utf-8"))
-        self.assertEqual(len(report["jobs"]), imported)
-        self.assertTrue(all(job["classification"] == "暂不投" for job in report["jobs"]))
-        self.assertTrue(all(job["excluded_at"] == "shortlist" for job in self.app._rows["report"]))
-        self.assertEqual(self.app._stage_info()["stats"]["classification_counts"]["暂不投"], imported)
-        self.assertIn(f"暂不投 {imported}", self.app.count_text.get())
+        self.assertEqual(document["summary"], {"selected_count": 0, "ready_count": 0, "blocked_count": 0})
+        self.assertEqual(document["jobs"], [])
+        self.assertEqual(document["blocked_jobs"], [])
+        self.assertEqual(self.app._stage_info("report")["status"], "pending")
         self.assertEqual((self.source / "raw/current/shanghai/jobs.json").read_bytes(), self.raw_before)
         self.browser.assert_not_called()
 
@@ -3313,7 +3319,7 @@ class ReviewTkTests(unittest.TestCase):
 
     def test_artifact_file_reparse_points_are_rejected_even_when_inside_the_task(self):
         self.complete_through("report")
-        path = self.app._artifacts["json"]
+        path = ui._artifact_paths(self.app.task, self.app.task.snapshot())["json"]
         actual_lstat = Path.lstat
 
         def reparse(candidate, *args, **kwargs):
@@ -3330,10 +3336,10 @@ class ReviewTkTests(unittest.TestCase):
         self.root.deiconify()
         for theme in ("dark", "light"):
             self.app._set_theme(theme, persist=False)
-            for stage in ("shortlist", "fetch-jd", "llm", "report"):
+            for stage in ("shortlist", "fetch-jd", "llm"):
                 self.app._select_stage(stage)
                 self.root.update()
-                widgets = [self.app.theme_button, self.app.run_button, self.app.reset_button, self.app.pause_button,
+                widgets = [self.app.theme_button, self.app.delivery_button, self.app.run_button, self.app.reset_button, self.app.pause_button,
                            self.app.stop_button, self.app.continue_button, self.app.confirm_button,
                            self.app.select_page_button, self.app.exclude_button, self.app.restore_button,
                            self.app.recommend_button, self.app.search_entry, self.app.results_table,
@@ -3347,9 +3353,8 @@ class ReviewTkTests(unittest.TestCase):
                                     self.app.browser_mode_box, self.app.prepare_browser_button,
                                     self.app.chrome_status_label, self.app.edge_status_label))
                 elif stage == "llm":
-                    widgets.extend((self.app.workers_spin, self.app.model_config_label, self.app.edit_rules_button))
-                elif stage == "report":
-                    widgets.append(self.app.open_report_button)
+                    widgets.extend((self.app.workers_spin, self.app.model_config_label, self.app.edit_rules_button,
+                                    self.app.go_delivery_button))
                 for widget in widgets:
                     x = widget.winfo_rootx() - self.root.winfo_rootx()
                     y = widget.winfo_rooty() - self.root.winfo_rooty()

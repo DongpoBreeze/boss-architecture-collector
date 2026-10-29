@@ -752,7 +752,7 @@ class WorkspaceMixin:
             return
         if not isinstance(manifest, dict):
             return
-        if manifest.get("city") in ("全部城市", "上海", "深圳", "杭州", "广州", "成都"):
+        if manifest.get("city") in ("全部城市", "上海", "深圳", "杭州", "广州", "成都", "北京"):
             self.city.set(manifest["city"])
         if manifest.get("track") in ("当前+成长", "当前岗位", "成长目标"):
             self.track.set(manifest["track"])

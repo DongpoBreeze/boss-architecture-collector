@@ -2,6 +2,8 @@ param(
     [ValidateSet("all", "current", "target")]
     [string]$Batch = "all",
     [int]$Pages = 10,
+    [double]$PageWaitMin = 12,
+    [double]$PageWaitMax = 22,
     [ValidateScript({ $_ -eq "" -or $_ -eq "chrome" -or $_ -eq "edge" })]
     [string]$Browser = "",
     [int]$CdpPort = 0,
@@ -51,6 +53,11 @@ if (-not (Test-Path -LiteralPath $config -PathType Leaf)) {
 }
 if ($Pages -lt 1 -or $Pages -gt 10) {
     throw "-Pages must be between 1 and 10"
+}
+if ([double]::IsNaN($PageWaitMin) -or [double]::IsInfinity($PageWaitMin) -or
+    [double]::IsNaN($PageWaitMax) -or [double]::IsInfinity($PageWaitMax) -or
+    $PageWaitMin -lt 0 -or $PageWaitMax -gt 300 -or $PageWaitMin -gt $PageWaitMax) {
+    throw "Page waits must be finite seconds with 0 <= PageWaitMin <= PageWaitMax <= 300"
 }
 if ($TotalShards -lt 1) {
     throw "-TotalShards must be at least 1"
@@ -127,6 +134,8 @@ $arguments += "--batch"
 $arguments += $Batch
 $arguments += "--pages"
 $arguments += [string]$Pages
+$arguments += @("--page-wait-min", $PageWaitMin.ToString([Globalization.CultureInfo]::InvariantCulture))
+$arguments += @("--page-wait-max", $PageWaitMax.ToString([Globalization.CultureInfo]::InvariantCulture))
 $arguments += "--browser"
 $arguments += $Browser
 if ($CdpPort -ne 0) {

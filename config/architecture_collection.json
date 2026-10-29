@@ -9,7 +9,8 @@
     {"id": "shenzhen", "name": "深圳"},
     {"id": "hangzhou", "name": "杭州"},
     {"id": "guangzhou", "name": "广州"},
-    {"id": "chengdu", "name": "成都"}
+    {"id": "chengdu", "name": "成都"},
+    {"id": "beijing", "name": "北京"}
   ],
   "salaries": [
     {"id": "10_20", "label": "10-20K", "code": "405"},

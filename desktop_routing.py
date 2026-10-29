@@ -33,7 +33,7 @@ _BATCH_FILE = re.compile(r"prepared/jd_shortlists/detail_batches/details_\d{4,}\
 _TRACKS = {"当前+成长": "all", "当前岗位": "current", "成长目标": "target",
            "all": "all", "current": "current", "target": "target"}
 _CITIES = {"上海": "shanghai", "深圳": "shenzhen", "杭州": "hangzhou",
-           "广州": "guangzhou", "成都": "chengdu"}
+           "广州": "guangzhou", "成都": "chengdu", "北京": "beijing"}
 _POST_STAGES = ("列表前处理", "JD补抓", "Codex语义复核", "生成报告")
 _STAGES = {
     "仅采集": ("岗位采集",),

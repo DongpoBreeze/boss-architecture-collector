@@ -1,6 +1,6 @@
 """Locate validated, read-only defaults without putting mutable state beside them.
 
-Source launches use the existing config/prompts files.  Normal wheel installs
+Source launches use the existing config, prompt, and schema files.  Wheel installs
 use only the generated resource package, with no cwd or source-tree fallback.
 This module calculates paths; it never creates directories or reads credentials.
 """

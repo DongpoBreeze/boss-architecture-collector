@@ -173,14 +173,16 @@ class CollectionHelpersTests(unittest.TestCase):
         write_json(self.root / "collection_manifest.json", value)
 
     def test_all_city_track_page_and_limit_choices_use_real_build_specs(self):
+        config = deepcopy(self.config)
+        config["cities"].append({"id": "beijing", "name": "北京"})
         for city in ui.CITY_CHOICES:
             for track in ui.TRACK_CHOICES:
                 for pages in (1, 10):
                     with self.subTest(city=city, track=track, pages=pages):
                         selection = ui.CollectionSelection.parse(city, track, "", str(pages))
-                        specs = collector.build_specs(self.config, selection.track, selection.limit, selection.cities)
+                        specs = collector.build_specs(config, selection.track, selection.limit, selection.cities)
                         per_city = {"all": 3, "current": 2, "target": 1}[track]
-                        self.assertEqual(len(specs), per_city * (5 if city == "全部城市" else 1))
+                        self.assertEqual(len(specs), per_city * (6 if city == "全部城市" else 1))
                         self.assertEqual(selection.pages, pages)
         selected = ui.CollectionSelection.parse("全部", "all", "2", "3")
         self.assertEqual(len(collector.build_specs(self.config, selected.track, selected.limit, selected.cities)), 2)
@@ -188,7 +190,7 @@ class CollectionHelpersTests(unittest.TestCase):
 
     def test_invalid_selectors_and_numeric_bounds_are_rejected(self):
         for city, track, limit, pages in (
-            ("北京", "all", "", "1"), ("上海", "other", "", "1"),
+            ("不存在的城市", "all", "", "1"), ("上海", "other", "", "1"),
             ("上海", "current", "0", "1"), ("上海", "current", "-1", "1"),
             ("上海", "all", "1.5", "1"), ("上海", "all", "", "0"),
             ("上海", "all", "", "11"), ("上海", "all", "", "1.5"),
@@ -212,6 +214,19 @@ class CollectionHelpersTests(unittest.TestCase):
             self.assertFalse(parsed.verbose_upstream)
             self.assertNotIn("process_architecture.py", " ".join(command))
             self.assertNotIn("--stage", command)
+
+    def test_runtime_request_defaults_and_custom_wait_command_preserve_positional_interface(self):
+        request = ui.CollectionRequest(str(self.root), "", self.config_path, ui.CollectionSelection())
+        self.assertEqual((request.page_wait_min, request.page_wait_max, request.browser_workers), (12.0, 22.0, 3))
+        request = ui.CollectionRequest(str(self.root), "", self.config_path, ui.CollectionSelection(),
+                                       page_wait_min=0.25, page_wait_max=1.75, browser_workers=8)
+        args = collector.parse_args(ui.make_collect_command(request, self.root, self.base / "scraper",
+                                                            browser="edge", shard=15, total_shards=16,
+                                                            setup_browser=False)[3:])
+        self.assertEqual((args.page_wait_min, args.page_wait_max), (0.25, 1.75))
+        self.assertEqual((args.shard, args.total_shards, args.browser, args.cdp_port), (15, 16, "edge", 9223))
+        self.assertFalse(args.setup_browser)
+        self.assertFalse(args.setup_only)
 
     def test_new_root_preview_is_read_only_and_total_is_unknown(self):
         self.assertEqual(ui.validate_collection_root(self.root), self.root.resolve())
@@ -389,18 +404,36 @@ class CollectionHelpersTests(unittest.TestCase):
         ui._clear_owned_lock(self.root, ui.CommandResult(-15, 111), lambda _: None)
         self.assertFalse(lock.exists())
 
+    def test_owner_interpreter_lock_is_reclaimed_only_when_both_known_processes_exited(self):
+        self.root.mkdir()
+        lock = self.root / "collection_manifest.json.lock"
+        lock.write_text("pid=222\ncreated_at=now\n", encoding="utf-8")
+        result = ui.CommandResult(-15, 111, collector_pid=222)
+        with patch.object(ui, "_pid_alive", side_effect=lambda pid: pid == 222):
+            ui._clear_owned_lock(self.root, result, lambda _: None)
+            self.assertTrue(lock.exists(), "live actual interpreter still owns its lock")
+        with patch.object(ui, "_pid_alive", side_effect=lambda pid: pid == 111):
+            ui._clear_owned_lock(self.root, result, lambda _: None)
+            self.assertTrue(lock.exists(), "live launcher has not fully stopped")
+        with patch.object(ui, "_pid_alive", return_value=False):
+            ui._clear_owned_lock(self.root, result, lambda _: None)
+            self.assertFalse(lock.exists())
+            lock.write_text("pid=333\ncreated_at=now\n", encoding="utf-8")
+            ui._clear_owned_lock(self.root, result, lambda _: None)
+            self.assertTrue(lock.exists(), "an exited but unowned PID is not sufficient")
+
     def test_chinese_group_labels_keep_programmatic_cli_values_compatible(self):
         for internal, label in ui.TRACK_LABELS.items():
             self.assertEqual(ui.CollectionSelection.parse("上海", label, "", "2").track, internal)
             self.assertEqual(ui.CollectionSelection.parse("上海", internal, "", "2").track, internal)
 
-    def test_default_plan_preview_is_560_and_shanghai_112_without_disk_progress(self):
+    def test_default_plan_preview_is_672_and_shanghai_112_without_disk_progress(self):
         path = PROJECT_ROOT / "config" / "architecture_collection.json"
         before = path.read_bytes()
         config = collector.load_config(path)
         all_plan = ui.build_collection_preview(config, ui.CollectionSelection())
         shanghai = ui.build_collection_preview(config, ui.CollectionSelection(city="上海", pages=3))
-        self.assertEqual((all_plan["full"], all_plan["estimate"], len(all_plan["plan_rows"])), (560, 560, 560))
+        self.assertEqual((all_plan["full"], all_plan["estimate"], len(all_plan["plan_rows"])), (672, 672, 672))
         self.assertEqual((shanghai["full"], shanghai["estimate"]), (112, 112))
         self.assertEqual(sum(row["track"] == "current" for row in shanghai["plan_rows"]), 88)
         self.assertEqual(sum(row["track"] == "target" for row in shanghai["plan_rows"]), 24)
@@ -494,12 +527,33 @@ class OwnedCommandTests(unittest.TestCase):
         self.wait_for(lambda: any(kind == "waiting" for kind, _ in events))
         self.assertEqual(process.stdin.writes, [])
         self.assertFalse(runner.shutdown_complete)
-        control.continue_requested.set()
+        self.assertTrue(runner.request_continue())
         worker.join(3)
         self.assertFalse(worker.is_alive())
         self.assertEqual(error, [])
         self.assertEqual(result[0].code, 0)
         self.assertEqual(process.stdin.writes, ["\n"])
+        self.assertTrue(runner.shutdown_complete)
+
+    def test_process_identity_requires_this_launch_token_and_accepts_only_first_owner(self):
+        process = FakeProcess()
+        self.processes.append(process)
+        runner = ui._OwnedCommand()
+        events = []
+        tokens = []
+
+        def launch(_command, **options):
+            token = options["env"][collector.DESKTOP_OWNER_TOKEN_ENV]
+            tokens.append(token)
+            process.finish(0, f"{collector.DESKTOP_OWNER_PREFIX} token={'f' * 32} pid=999\n"
+                           f"{collector.DESKTOP_OWNER_PREFIX} token={token} pid=222\n"
+                           f"{collector.DESKTOP_OWNER_PREFIX} token={token} pid=333\n")
+            return process
+        with patch.object(ui.subprocess, "Popen", side_effect=launch):
+            result = runner.run(["fake-collect"], ui.CollectionControl(), lambda kind, value: events.append((kind, value)))
+        self.assertEqual(result.collector_pid, 222)
+        self.assertNotIn(tokens[0], str(events))
+        self.assertNotIn("pid=999", str(events))
         self.assertTrue(runner.shutdown_complete)
 
     def test_entire_output_is_redacted_before_events_and_overlong_line_is_hidden(self):
@@ -573,8 +627,8 @@ class LocalOwnedProcessTests(unittest.TestCase):
 
         def emit(kind, value):
             events.append((kind, value))
-            if kind == "waiting":
-                control.continue_requested.set()
+            if kind == "waiting" and value:
+                self.assertTrue(runner.request_continue())
         command = [sys.executable, "-u", "-c", (
             "import sys; print('Cookie: sid=REAL_PIPE_PRIVATE_COOKIE',flush=True); "
             "sys.stdout.write('验证完成后按 Enter 继续: ');sys.stdout.flush(); "
@@ -610,6 +664,42 @@ class LocalOwnedProcessTests(unittest.TestCase):
         self.assertFalse(_pid_alive(descendants[0]))
         self.assertLess(time.monotonic() - started, 6)
         self.assertTrue(runner.shutdown_complete)
+
+    @unittest.skipUnless(sys.platform == "win32", "Windows venv interpreter identity and owned jobs")
+    def test_real_local_venv_identity_recovers_actual_interpreter_lock_after_pause(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            spec = {"combination": "offline-only", "track": "current", "city_id": "offline"}
+            control, runner = ui.CollectionControl(), ui._OwnedCommand()
+            lock_owner = []
+            logs = []
+
+            def emit(kind, value):
+                if kind == "log":
+                    logs.append(value)
+                    if "holding-offline-manifest-lock" in value:
+                        lock_owner.append((root / "collection_manifest.json.lock").read_text(encoding="utf-8"))
+                        control.pause()
+            script = (
+                "import os,sys,time;from pathlib import Path;import collect_architecture as c;"
+                "root=Path(sys.argv[1]);"
+                "print(f'{c.DESKTOP_OWNER_PREFIX} token={os.environ[c.DESKTOP_OWNER_TOKEN_ENV]} pid={os.getpid()}',flush=True);"
+                "print('RUN offline-only (now), pages=2',flush=True);"
+                "\nwith c.manifest_lock(root/'collection_manifest.json'):"
+                "\n print('holding-offline-manifest-lock',flush=True)"
+                "\n time.sleep(30)\n"
+            )
+            result = runner.run([sys.executable, "-u", "-c", script, str(root)], control, emit)
+            self.assertTrue(runner.shutdown_complete)
+            self.assertEqual(control.requested, "paused")
+            self.assertIsNotNone(result.collector_pid)
+            self.assertIn(f"pid={result.collector_pid}\n", lock_owner[0])
+            if (Path(sys.executable).parent.parent / "pyvenv.cfg").exists():
+                self.assertNotEqual(result.pid, result.collector_pid, "venv redirector and actual Python must both be tracked")
+            ui.preserve_interrupted_combination(root, [spec], 2, result, "paused", "2026-01-01", logs.append)
+            self.assertFalse((root / "collection_manifest.json.lock").exists())
+            manifest = collector.read_json(root / "collection_manifest.json")
+            self.assertEqual(collector.record_for(manifest, "offline-only")["status"], "paused")
 
 
 class CollectionTkTests(unittest.TestCase):
@@ -673,8 +763,12 @@ class CollectionTkTests(unittest.TestCase):
         self.root.destroy()
         self.pages.clear()
 
-    def make_page(self, **kwargs):
+    def make_page(self, browser_mode="chrome", browser_workers="1", **kwargs):
         page = ui.CollectionPage(self.root, config_path=self.config_path, initial_root=str(self.output), **kwargs)
+        if browser_mode is not None:
+            page.browser_mode.set(ui.BROWSER_MODES[browser_mode])
+        if browser_workers is not None:
+            page.browser_workers.set(str(browser_workers))
         page.pack(fill="both", expand=True)
         self.pages.append(page)
         self.root.update()
@@ -701,6 +795,54 @@ class CollectionTkTests(unittest.TestCase):
                 before_launch(command)
             return process
         self.popen.side_effect = launch
+
+    def attach_browsers(self, processes, before_launch=None):
+        self.processes.extend(value for value in processes.values() if isinstance(value, FakeProcess))
+        observed = {}
+        lock = threading.Lock()
+
+        def launch(command, **options):
+            self.assertNotEqual(threading.get_ident(), self.main_thread)
+            self.assertEqual(Path(command[2]).name, "collect_architecture.py")
+            self.assertIs(options["stdin"], subprocess.PIPE)
+            args = collector.parse_args(command[3:])
+            with lock:
+                observed[args.browser] = args
+            if before_launch:
+                before_launch(args)
+            process = processes[args.browser]
+            if isinstance(process, Exception):
+                raise process
+            return process
+        self.popen.side_effect = launch
+        return observed
+
+    def attach_slots(self, processes, before_launch=None):
+        processes = dict(processes)
+        for browser in ("chrome", "edge"):
+            if (browser, "setup") not in processes:
+                prepared = FakeProcess("browser prepared\n")
+                prepared.finish(0)
+                processes[(browser, "setup")] = prepared
+        self.processes.extend(value for value in processes.values() if isinstance(value, FakeProcess))
+        observed, lock = [], threading.Lock()
+
+        def launch(command, **options):
+            self.assertNotEqual(threading.get_ident(), self.main_thread)
+            self.assertEqual(Path(command[2]).name, "collect_architecture.py")
+            self.assertIs(options["stdin"], subprocess.PIPE)
+            args = collector.parse_args(command[3:])
+            key = (args.browser, "setup" if args.setup_only else args.shard)
+            with lock:
+                observed.append((key, args, options))
+            if before_launch:
+                before_launch(args, key, options)
+            process = processes[key]
+            if isinstance(process, Exception):
+                raise process
+            return process
+        self.popen.side_effect = launch
+        return observed, processes
 
     def write_manifest(self, records, specs=None):
         specs = self.specs if specs is None else specs
@@ -737,20 +879,726 @@ class CollectionTkTests(unittest.TestCase):
         self.executor.assert_not_called()
         changed.assert_not_called()
 
+    def test_default_dual_selection_and_read_only_navigation_never_launch(self):
+        page = self.make_page(browser_mode=None)
+        self.assertEqual(page.browser_mode.get(), ui.BROWSER_MODES["dual"])
+        self.pump_until(lambda: len(page._plan_rows) == 15)
+        page.browser_mode.set(ui.BROWSER_MODES["chrome"])
+        page.notebook.select(page.log_frame)
+        page.apply_theme(palette_for("dark"))
+        page.notebook.select(page.plan_frame)
+        page.refresh_progress()
+        self.pump_until(lambda: not page._preview_active)
+        self.assertEqual(page.browser_mode.get(), ui.BROWSER_MODES["chrome"])
+        self.popen.assert_not_called()
+        self.resolver.assert_not_called()
+
+    def test_runtime_defaults_validation_and_page_local_settings_are_read_only(self):
+        page = self.make_page(browser_mode=None, browser_workers=None)
+        self.assertEqual((page.page_wait_min.get(), page.page_wait_max.get(), page.browser_workers.get()), ("12", "22", "3"))
+        self.assertEqual(page._capture_request().browser_workers, 3)
+        for minimum, maximum, workers in (("", "22", "3"), ("nan", "22", "3"), ("1", "inf", "3"),
+                                           ("-0.1", "22", "3"), ("2", "1", "3"), ("1", "300.1", "3"),
+                                           ("1", "2", "0"), ("1", "2", "9"), ("1", "2", "1.5")):
+            with self.subTest(minimum=minimum, maximum=maximum, workers=workers):
+                page.page_wait_min.set(minimum)
+                page.page_wait_max.set(maximum)
+                page.browser_workers.set(workers)
+                page.start()
+                self.assertFalse(page.busy)
+                self.assertTrue(page.status_text.get())
+                self.popen.assert_not_called()
+                self.resolver.assert_not_called()
+        for workers in (1, 3, 8):
+            page.browser_workers.set(str(workers))
+            for minimum, maximum in ((0, 0), (0.25, 1.75), (300, 300)):
+                page.page_wait_min.set(str(minimum))
+                page.page_wait_max.set(str(maximum))
+                request = page._capture_request()
+                self.assertEqual((request.page_wait_min, request.page_wait_max, request.browser_workers), (minimum, maximum, workers))
+        page.notebook.select(page.slot_frame)
+        page.apply_theme(palette_for("dark"))
+        page.notebook.select(page.plan_frame)
+        self.assertEqual((page.page_wait_min.get(), page.page_wait_max.get(), page.browser_workers.get()), ("300", "300", "8"))
+        self.assertFalse(self.output.exists())
+        self.popen.assert_not_called()
+
+    def test_multiple_targets_really_overlap_per_browser_and_cover_frozen_scope_at_3_and_8(self):
+        expanded = deepcopy(self.config)
+        expanded["current"]["keywords"].append({"id": "parallel", "query": "离线并发fixture"})
+        write_json(self.config_path, expanded)
+        all_specs = collector.build_specs(expanded)
+        for workers in (3, 8):
+            with self.subTest(workers=workers):
+                run_output = self.base / f"parallel-{workers}"
+                chosen = all_specs[2:19]
+                per_browser = {browser: min(workers, len(chosen[index::2])) for index, browser in enumerate(("chrome", "edge"))}
+                barriers = {browser: threading.Barrier(count) for browser, count in per_browser.items()}
+                started = {browser: threading.Event() for browser in per_browser}
+                processes = {}
+                for index, browser in enumerate(("chrome", "edge")):
+                    for slot in range(workers):
+                        shard = index + 2 * slot
+                        assigned = collector.shard_specs(chosen, shard, 2 * workers)
+                        if assigned:
+                            processes[(browser, shard)] = FakeProcess(
+                                f"RUN {assigned[0]['combination']} (now), pages=3\n[1/3 页] 本页1条\n")
+
+                def overlap(args, key, _options):
+                    if not args.setup_only:
+                        barriers[args.browser].wait(4)
+                        started[args.browser].set()
+                observed, all_processes = self.attach_slots(processes, overlap)
+                page = self.make_page(browser_mode="dual", browser_workers=str(workers))
+                page.collection_root.set(str(run_output))
+                self.pump_until(lambda: len(page._plan_rows) == len(all_specs))
+                page.toggle_combination(all_specs[0]["combination"])
+                page.toggle_combination(all_specs[1]["combination"])
+                page.limit.set("17")
+                page.pages.set("3")
+                page.page_wait_min.set("0.25")
+                page.page_wait_max.set("1.75")
+                page.start()
+                responsive = []
+                self.root.after(0, lambda: responsive.append(True))
+                self.pump_until(lambda: all(event.is_set() for event in started.values()))
+                self.assertTrue(responsive)
+                self.assertTrue(page.busy)
+                setup_calls = [item for item in observed if item[1].setup_only]
+                worker_calls = [item for item in observed if not item[1].setup_only]
+                self.assertEqual([key[0] for key, _args, _options in setup_calls].count("chrome"), 1)
+                self.assertEqual([key[0] for key, _args, _options in setup_calls].count("edge"), 1)
+                self.assertEqual(len(worker_calls), sum(per_browser.values()))
+                self.assertEqual(len({options["env"][collector.DESKTOP_OWNER_TOKEN_ENV] for _key, _args, options in worker_calls}), len(worker_calls))
+                expected = [spec["combination"] for spec in chosen]
+                seen = []
+                for (browser, shard), args, options in worker_calls:
+                    self.assertFalse(args.setup_browser)
+                    self.assertEqual((args.page_wait_min, args.page_wait_max), (0.25, 1.75))
+                    self.assertEqual(args.total_shards, workers * 2)
+                    self.assertEqual(args.root, run_output)
+                    full = collector.build_specs(collector.load_config(args.config), args.batch, args.limit, args.cities)
+                    self.assertEqual([spec["combination"] for spec in full], expected)
+                    assigned = collector.shard_specs(full, shard, args.total_shards)
+                    seen.extend(spec["combination"] for spec in assigned)
+                    self.assertEqual(shard % 2, 0 if browser == "chrome" else 1)
+                    self.assertEqual(args.cdp_port, 9222 if browser == "chrome" else 9223)
+                    self.assertTrue(Path(options["env"][ui.GATE_STOP_FILE_ENV]).parent.is_dir())
+                self.assertEqual(len(seen), len(set(seen)))
+                self.assertEqual(set(seen), set(expected))
+                for widget in (page.page_wait_min_entry, page.page_wait_max_entry, page.browser_workers_spin):
+                    self.assertTrue(widget.instate(["disabled"]))
+                for process in processes.values():
+                    process.finish(0, "BATCH_DONE\n")
+                self.pump_until(lambda: not page.busy)
+                self.assertTrue(all(not args.root.exists() for _key, args, _options in setup_calls))
+                self.assertTrue(all(not Path(options["env"][ui.GATE_STOP_FILE_ENV]).exists() for _key, _args, options in worker_calls))
+                self.assertEqual(len(page.slot_table.get_children()), 2 * workers + 2)
+                page.destroy()
+                self.pages.remove(page)
+
+    def test_single_browser_three_targets_prepare_once_and_empty_shards_stay_idle(self):
+        first = FakeProcess(f"RUN {self.specs[0]['combination']} (now), pages=10\n[1/10 页] 本页1条\n")
+        second = FakeProcess(f"RUN {self.specs[1]['combination']} (now), pages=10\n[2/10 页] 本页1条\n")
+        observed, _processes = self.attach_slots({("chrome", 0): first, ("chrome", 1): second})
+        page = self.make_page(browser_workers="3")
+        page.limit.set("2")
+        page.start()
+        self.pump_until(lambda: len(observed) == 3 and "2/10" in page._lane_states["chrome"]["slots"]["2"]["position"])
+        self.assertTrue(all(args.browser == "chrome" for _key, args, _options in observed))
+        self.assertEqual(sum(args.setup_only for _key, args, _options in observed), 1)
+        self.assertEqual(page._lane_states["chrome"]["slots"]["3"]["state"], "无分配组合")
+        self.assertTrue(page.edge_continue_button.instate(["disabled"]))
+        page.stop()
+        self.pump_until(lambda: not page.busy)
+
+    def test_one_slot_login_does_not_gate_collection_but_later_verification_bounds_resume(self):
+        process = FakeProcess("登录完成后按 Enter 开始采集: ")
+        entries = []
+
+        def on_input(_value):
+            entries.append(True)
+            if len(entries) == 1:
+                process.stdout.feed(f"\nRUN {self.specs[0]['combination']} (now), pages=10\n[1/10 页] 本页1条\n")
+            else:
+                process.finish(20, "\nBROWSER_GATE_PAUSED\n")
+        process.on_input = on_input
+        self.attach_fake(process)
+        page = self.make_page()
+        page.start()
+        self.pump_until(lambda: page._lane_states["chrome"]["waiting"])
+        gate = page._lanes["chrome"].gate_file
+        self.assertFalse(gate.exists(), "initial browser login is not a security gate for a running combination")
+        page.continue_after_gate("chrome")
+        self.pump_until(lambda: "/10" in page.position_text.get())
+        process.stdout.feed("验证完成后按 Enter 继续，q 退出: ")
+        self.pump_until(lambda: page._lane_states["chrome"]["waiting"])
+        self.assertTrue(gate.is_file())
+        page.continue_after_gate("chrome")
+        self.pump_until(lambda: not page.busy)
+        self.assertEqual(process.stdin.writes, ["\n", "\n"])
+        self.assertIn("未全部完成", page.status_text.get())
+        self.assertFalse(gate.exists())
+
+    def test_browser_preparation_is_once_per_side_and_only_readies_its_own_targets(self):
+        processes = {(browser, shard): FakeProcess(f"RUN {self.specs[shard]['combination']} (now), pages=10\n")
+                     for browser, shards in (("chrome", (0, 2, 4)), ("edge", (1, 3, 5))) for shard in shards}
+        edge_setup = FakeProcess("登录完成后按 Enter 开始采集: ")
+        edge_setup.on_input = lambda _value: edge_setup.finish(0, "\nprepared\n")
+        processes[("edge", "setup")] = edge_setup
+        observed, _all = self.attach_slots(processes)
+        page = self.make_page(browser_mode="dual", browser_workers="3")
+        page.start()
+        self.pump_until(lambda: page._lane_states["edge"]["waiting"] and sum(not args.setup_only for _key, args, _opts in observed) == 3)
+        self.assertEqual({args.browser for _key, args, _opts in observed if not args.setup_only}, {"chrome"})
+        page.continue_after_gate("chrome")
+        self.assertEqual(edge_setup.stdin.writes, [])
+        page.continue_after_gate("edge")
+        self.pump_until(lambda: sum(not args.setup_only for _key, args, _opts in observed) == 6)
+        self.assertEqual(edge_setup.stdin.writes, ["\n"])
+        self.assertEqual(sum(args.setup_only for _key, args, _opts in observed), 2)
+        page.stop()
+        self.pump_until(lambda: not page.busy)
+
+    def test_same_browser_continue_confirms_only_current_waiters_and_preserves_gate_boundary(self):
+        processes = {(browser, shard): FakeProcess(f"RUN {self.specs[shard]['combination']} (now), pages=10\n[1/10 页] 本页1条\n")
+                     for browser, shards in (("chrome", (0, 2, 4)), ("edge", (1, 3, 5))) for shard in shards}
+        observed, _all = self.attach_slots(processes)
+        page = self.make_page(browser_mode="dual", browser_workers="3")
+        page.start()
+        self.pump_until(lambda: len(observed) == 8 and all(slot.runner.result for lane in page._lanes.values() for slot in lane.slots))
+        for shard in (0, 2):
+            process = processes[("chrome", shard)]
+            process.on_input = lambda _value, process=process: process.finish(0, "\nBROWSER_GATE_PAUSED\n")
+            process.stdout.feed("验证完成后按 Enter 继续，q 退出: ")
+        self.pump_until(lambda: all(page._lane_states["chrome"]["slots"][str(slot)]["waiting"] for slot in (1, 2)))
+        gate = page._lanes["chrome"].gate_file
+        self.assertTrue(gate.is_file())
+        self.assertFalse(page._lanes["edge"].gate_file.exists())
+        page.continue_after_gate("chrome")
+        page.continue_after_gate("chrome")
+        self.pump_until(lambda: all(processes[("chrome", shard)].poll() == 0 for shard in (0, 2)))
+        for shard in (0, 2):
+            self.assertEqual(processes[("chrome", shard)].stdin.writes, ["\n"])
+        for key, process in processes.items():
+            if key not in (("chrome", 0), ("chrome", 2)):
+                self.assertEqual(process.stdin.writes, [])
+                self.assertEqual(process.terminated, 0)
+        self.assertTrue(gate.exists(), "manual confirmation does not erase the browser's bounded-exit marker")
+        last = processes[("chrome", 4)]
+        last.on_input = lambda _value: last.finish(0, "\nBROWSER_GATE_PAUSED\n")
+        last.stdout.feed("验证完成后按 Enter 继续，q 退出: ")
+        self.pump_until(lambda: page._lane_states["chrome"]["slots"]["3"]["waiting"])
+        self.assertEqual(last.stdin.writes, [], "a later gate requires another explicit confirmation")
+        page.continue_after_gate("edge")
+        self.assertEqual(last.stdin.writes, [])
+        page.continue_after_gate("chrome")
+        self.pump_until(lambda: last.poll() == 0)
+        self.assertEqual(last.stdin.writes, ["\n"])
+        self.assertTrue(page.busy)
+        for shard in (1, 3, 5):
+            processes[("edge", shard)].finish(0, "BATCH_DONE\n")
+        self.pump_until(lambda: not page.busy)
+        self.assertFalse(gate.exists())
+        self.assertIn("未全部完成", page.status_text.get())
+
+    def test_multislot_failed_browser_preparation_never_launches_its_targets_or_stops_peer(self):
+        failed_setup = FakeProcess("offline browser preparation failed\n")
+        failed_setup.finish(7)
+        processes = {("edge", "setup"): failed_setup}
+        for shard in (0, 2, 4):
+            processes[("chrome", shard)] = FakeProcess(f"RUN {self.specs[shard]['combination']} (now), pages=10\n")
+        observed, _all = self.attach_slots(processes)
+        page = self.make_page(browser_mode="dual", browser_workers="3")
+        page.start()
+        self.pump_until(lambda: len(observed) == 5 and all(
+            item["state"] == "浏览器未就绪，未启动" for key, item in page._lane_states["edge"]["slots"].items() if key != "setup"))
+        self.assertFalse(any(args.browser == "edge" and not args.setup_only for _key, args, _options in observed))
+        self.assertTrue(page.busy)
+        for key, process in processes.items():
+            if key[0] == "chrome":
+                self.assertIsNone(process.poll())
+                self.assertEqual(process.terminated, 0)
+                process.finish(0, "BATCH_DONE\n")
+        self.pump_until(lambda: not page.busy)
+        self.assertIn("未全部完成", page.status_text.get())
+
+    def test_dead_slot_releases_real_owned_interpreter_lock_without_stopping_other_slots(self):
+        first = FakeProcess()
+        peer = FakeProcess(f"RUN {self.specs[1]['combination']} (now), pages=10\n")
+        third = FakeProcess(f"RUN {self.specs[2]['combination']} (now), pages=10\n")
+        lock_created, peer_saved = threading.Event(), threading.Event()
+        real_owner = 2_000_001
+
+        def acquire_then_publish(args, key, options):
+            if args.setup_only:
+                return
+            if key == ("chrome", 0):
+                owner_token = options["env"][collector.DESKTOP_OWNER_TOKEN_ENV]
+                (args.root / "collection_manifest.json.lock").write_text(f"pid={real_owner}\n", encoding="utf-8")
+                first.stdout.feed(f"{collector.DESKTOP_OWNER_PREFIX} token={owner_token} pid={real_owner}\n"
+                                  f"RUN {self.specs[0]['combination']} (now), pages=10\n")
+                lock_created.set()
+            elif key == ("chrome", 1):
+                self.assertTrue(lock_created.wait(2))
+                first.finish(20)
+                collector.persist_manifest_record(args.root / "collection_manifest.json",
+                                                  {**self.specs[1], "status": "running"},
+                                                  expected_specs=self.specs, pages=10, root=args.root)
+                peer_saved.set()
+        observed, _all = self.attach_slots({("chrome", 0): first, ("chrome", 1): peer, ("chrome", 2): third}, acquire_then_publish)
+        page = self.make_page(browser_workers="3")
+        with patch.object(collector, "MANIFEST_LOCK_TIMEOUT", 2):
+            page.start()
+            self.pump_until(lambda: peer_saved.is_set() and len(observed) == 4)
+            self.assertEqual(page._lanes["chrome"].slots[0].runner.result.collector_pid, real_owner)
+            self.assertTrue(page.busy)
+            self.assertEqual((peer.terminated, third.terminated), (0, 0))
+            page.stop()
+            self.pump_until(lambda: not page.busy)
+
+    def test_multislot_pause_preserves_each_active_combination_and_owned_setup_tree(self):
+        active = self.specs[:6]
+        done = {**self.specs[10], "status": "success", "job_count": 7, "finished_at": "2020-01-01"}
+        self.write_manifest([done])
+        processes = {}
+        raw_before = {}
+        for shard, spec in enumerate(active):
+            raw = self.output / "raw" / spec["track"] / spec["city_id"] / f"{spec['combination']}.json"
+            write_json(raw, {"jobs": [{"id": f"partial-{shard}"}]})
+            raw_before[raw] = raw.read_bytes()
+            processes[("chrome" if shard % 2 == 0 else "edge", shard)] = FakeProcess(
+                f"RUN {spec['combination']} (now), pages=10\n[{shard + 1}/10 页] 本页1条\n")
+        observed, all_processes = self.attach_slots(processes)
+        page = self.make_page(browser_mode="dual", browser_workers="3")
+        page.start()
+        self.pump_until(lambda: len(observed) == 8 and all(
+            "/10" in item["position"] for state in page._lane_states.values()
+            for key, item in state["slots"].items() if key != "setup"))
+        lock_path = self.output / "collection_manifest.json.lock"
+        lock_path.write_text(f"pid={processes[('edge', 5)].pid}\n", encoding="utf-8")
+        page.pause()
+        self.pump_until(lambda: not page.busy)
+        manifest = collector.read_json(self.output / "collection_manifest.json")
+        self.assertEqual(manifest["expected_combinations"], [spec["combination"] for spec in self.specs])
+        for index, spec in enumerate(active):
+            record = collector.record_for(manifest, spec["combination"])
+            self.assertEqual((record["status"], record["pages_completed"], record["desktop_interruption"]), ("paused", index + 1, "paused"))
+            self.assertTrue(Path(record["checkpoint"]).is_file())
+        self.assertEqual(collector.record_for(manifest, done["combination"]), done)
+        self.assertEqual(page._snapshot["counts"]["paused"], 6)
+        for path, before in raw_before.items():
+            self.assertEqual(path.read_bytes(), before)
+        self.assertFalse(lock_path.exists())
+        if sys.platform == "win32":
+            trees = [tree for tree in FakeTree.instances if tree.child in all_processes.values()]
+            self.assertEqual(len(trees), 8)
+            self.assertTrue(all(tree.closed and tree.preserved is False for tree in trees))
+
+    def test_multislot_partial_launch_failure_leaves_other_targets_running(self):
+        processes = {(browser, shard): FakeProcess(f"RUN {self.specs[shard]['combination']} (now), pages=10\n")
+                     for browser, shards in (("chrome", (0, 2, 4)), ("edge", (1, 3, 5))) for shard in shards}
+        processes[("edge", 3)] = OSError("offline slot launch failure")
+        observed, _all = self.attach_slots(processes)
+        page = self.make_page(browser_mode="dual", browser_workers="3")
+        page.start()
+        self.pump_until(lambda: len(observed) == 8 and page._lane_states["edge"]["slots"]["2"]["state"] == "异常退出")
+        self.assertTrue(page.busy)
+        for process in processes.values():
+            if isinstance(process, FakeProcess):
+                self.assertIsNone(process.poll())
+                self.assertEqual(process.terminated, 0)
+        page.stop()
+        self.pump_until(lambda: not page.busy)
+        self.assertIn("offline slot launch failure", page.status_text.get())
+
+    def test_multislot_close_remains_nonblocking_and_waits_for_every_owned_target(self):
+        processes = {(browser, shard): FakeProcess(f"RUN {self.specs[shard]['combination']} (now), pages=10\n")
+                     for browser, shards in (("chrome", (0, 2, 4)), ("edge", (1, 3, 5))) for shard in shards}
+        for process in processes.values():
+            process.stop_release = threading.Event()
+            self.releases.append(process.stop_release)
+        observed, _all = self.attach_slots(processes)
+        page = self.make_page(browser_mode="dual", browser_workers="3")
+        page.start()
+        self.pump_until(lambda: len(observed) == 8)
+        began = time.monotonic()
+        page.request_close()
+        self.assertLess(time.monotonic() - began, 0.2)
+        self.assertFalse(page.shutdown_complete)
+        processes[("chrome", 0)].stop_release.set()
+        self.pump_until(lambda: processes[("chrome", 0)].poll() is not None)
+        self.assertFalse(page.shutdown_complete)
+        for process in processes.values():
+            process.stop_release.set()
+        self.pump_until(lambda: page.shutdown_complete)
+        self.assertTrue(all(process.terminated for process in processes.values()))
+        self.assertFalse(page.busy)
+        self.assertEqual(self.errors, [])
+
+    @unittest.skipUnless(sys.platform == "win32", "Windows owned browser jobs")
+    def test_multislot_final_progress_cancellation_stops_preparation_and_all_target_trees(self):
+        processes = {}
+        for browser, shards in (("chrome", (0, 2, 4)), ("edge", (1, 3, 5))):
+            for shard in shards:
+                process = FakeProcess("BATCH_DONE\n")
+                process.finish(0)
+                processes[(browser, shard)] = process
+        observed, all_processes = self.attach_slots(processes)
+        page = self.make_page(browser_mode="dual", browser_workers="3")
+        original_read = ui.read_collection_progress
+        cancelled = threading.Event()
+
+        def cancel_at_end(root):
+            if len(observed) == 8 and all(runner.result is not None and runner.command_complete
+                                         for lane in page._lanes.values() for runner in lane.all_runners):
+                page._control.stop()
+                cancelled.set()
+            return original_read(root)
+        with patch.object(ui, "read_collection_progress", side_effect=cancel_at_end):
+            page.start()
+            self.pump_until(lambda: not page.busy)
+        self.assertTrue(cancelled.is_set())
+        trees = [tree for tree in FakeTree.instances if tree.child in all_processes.values()]
+        self.assertEqual(len(trees), 8)
+        self.assertTrue(all(tree.closed and tree.preserved is False for tree in trees))
+        self.assertIn("已停止", page.status_text.get())
+
+    def test_maximum_slot_count_keeps_runtime_controls_and_scrollable_details_visible_at_1024(self):
+        header = ttk.Frame(self.root, height=64)
+        header.pack(fill="x")
+        header.pack_propagate(False)
+        processes = {("chrome", 0): FakeProcess(f"RUN {self.specs[0]['combination']} (now), pages=10\n[1/10 页] 本页1条\n"),
+                     ("edge", 1): FakeProcess(f"RUN {self.specs[1]['combination']} (now), pages=10\n[1/10 页] 本页1条\n")}
+        observed, _all = self.attach_slots(processes)
+        page = self.make_page(browser_mode="dual", browser_workers="8")
+        page.limit.set("2")
+        page.start()
+        self.pump_until(lambda: len(observed) == 4 and len(page.slot_table.get_children()) == 18)
+        self.root.geometry("1024x760")
+        self.root.deiconify()
+        for theme in ("dark", "light"):
+            configure_styles(self.root, palette_for(theme))
+            page.apply_theme(palette_for(theme))
+            for tab, target in ((page.slot_frame, page.slot_table), (page.log_frame, page.log_view), (page.plan_frame, page.plan_table)):
+                page.notebook.select(tab)
+                self.root.update()
+                for widget in (page.start_button, page.prepare_browser_button, page.pause_button, page.stop_button,
+                               page.continue_button, page.edge_continue_button, page.page_wait_min_entry,
+                               page.page_wait_max_entry, page.browser_workers_spin, page.browser_mode_box, target):
+                    with self.subTest(theme=theme, tab=str(tab), widget=str(widget)):
+                        x = widget.winfo_rootx() - self.root.winfo_rootx()
+                        y = widget.winfo_rooty() - self.root.winfo_rooty()
+                        self.assertGreaterEqual(x, 0)
+                        self.assertGreaterEqual(y, 0)
+                        self.assertLessEqual(x + widget.winfo_width(), 1024)
+                        self.assertLessEqual(y + widget.winfo_height(), 760)
+                self.assertGreater(target.winfo_height(), 55)
+        self.assertIn("最多 8 槽", page.position_text.get())
+        self.assertEqual(page.position_text.get().count("\n"), 1)
+        page.stop()
+        self.pump_until(lambda: not page.busy)
+
+    def test_dual_lanes_really_overlap_and_share_exact_checked_then_limited_scope(self):
+        first = FakeProcess(f"RUN {self.specs[2]['combination']} (now), pages=3\n[1/3 页] 本页1条\n")
+        second = FakeProcess(f"RUN {self.specs[3]['combination']} (now), pages=3\n[2/3 页] 本页1条\n")
+        barrier = threading.Barrier(2)
+        both_launched = threading.Event()
+        launch_threads = set()
+
+        def overlap(_args):
+            launch_threads.add(threading.get_ident())
+            # The first launch cannot return until the second worker reaches
+            # Popen too: sequential command construction cannot satisfy this.
+            barrier.wait(3)
+            both_launched.set()
+        observed = self.attach_browsers({"chrome": first, "edge": second}, overlap)
+        page = self.make_page(browser_mode="dual")
+        self.pump_until(lambda: len(page._plan_rows) == 15)
+        page.toggle_combination(self.specs[0]["combination"])
+        page.toggle_combination(self.specs[1]["combination"])
+        page.limit.set("5")
+        page.pages.set("3")
+        page.start()
+        responsive = []
+        self.root.after(0, lambda: responsive.append(True))
+        self.pump_until(lambda: both_launched.is_set() and "2/3" in page.position_text.get())
+        self.assertEqual(len(launch_threads), 2)
+        self.assertTrue(responsive)
+        self.assertTrue(page.busy)
+        for spec in self.specs[2:4]:
+            self.assertIn(spec["combination"], page.position_text.get())
+        self.assertEqual(observed["chrome"].root, observed["edge"].root)
+        self.assertEqual(observed["chrome"].config, observed["edge"].config)
+        self.assertEqual((observed["chrome"].cdp_port, observed["edge"].cdp_port), (9222, 9223))
+        self.assertNotEqual(observed["chrome"].profile_dir, observed["edge"].profile_dir)
+        scopes = {}
+        for browser, args in observed.items():
+            specs = collector.build_specs(collector.load_config(args.config), args.batch, args.limit, args.cities)
+            scopes[browser] = [spec["combination"] for spec in collector.shard_specs(specs, args.shard, args.total_shards)]
+            self.assertEqual(args.total_shards, 2)
+            self.assertFalse(args.setup_only)
+        expected = [spec["combination"] for spec in self.specs[2:7]]
+        self.assertEqual(scopes["chrome"], expected[::2])
+        self.assertEqual(scopes["edge"], expected[1::2])
+        self.assertFalse(set(scopes["chrome"]) & set(scopes["edge"]))
+        self.assertEqual(set(scopes["chrome"]) | set(scopes["edge"]), set(expected))
+        self.assertTrue(page.browser_mode_box.instate(["disabled"]))
+        first.finish(0, "BATCH_DONE\n")
+        self.pump_until(lambda: page._lane_states["chrome"]["state"] == "已结束")
+        self.assertTrue(page.busy, "a completed side does not release the host interlock")
+        if sys.platform == "win32":
+            self.assertIsNotNone(page._lanes["chrome"].runner.tree)
+            self.assertFalse(page._lanes["chrome"].runner.tree.closed)
+        second.finish(0, "BATCH_DONE\n")
+        self.pump_until(lambda: not page.busy)
+        before = page.position_text.get()
+        page.notebook.select(page.log_frame)
+        page.apply_theme(palette_for("dark"))
+        self.assertEqual(page.position_text.get(), before)
+        for label in ("[Chrome]", "[Edge]"):
+            self.assertIn(label, page.log_view.get("1.0", "end"))
+            self.assertIn(label, (self.output / "collection-desktop.log").read_text(encoding="utf-8"))
+        self.assertEqual(self.errors, [])
+
+    def test_dual_continue_buttons_only_confirm_their_current_waiting_side(self):
+        chrome = FakeProcess("登录完成后按 Enter 开始采集: ")
+        edge = FakeProcess(f"RUN {self.specs[1]['combination']} (now), pages=10\n[1/10 页] 本页1条\n")
+        chrome.on_input = lambda _value: chrome.finish(0, "\nBATCH_DONE\n")
+        edge.on_input = lambda _value: edge.finish(0, "\nBATCH_DONE\n")
+        self.attach_browsers({"chrome": chrome, "edge": edge})
+        page = self.make_page(browser_mode="dual")
+        page.start()
+        self.pump_until(lambda: page._lane_states["chrome"]["waiting"] and "1/10" in page.position_text.get())
+        self.assertFalse(page.continue_button.instate(["disabled"]))
+        self.assertTrue(page.edge_continue_button.instate(["disabled"]))
+        page.continue_after_gate("edge")
+        self.assertEqual(edge.stdin.writes, [])
+        page.continue_after_gate("chrome")
+        page.continue_after_gate("chrome")
+        self.pump_until(lambda: chrome.poll() == 0 and page._lane_states["chrome"]["state"] == "已结束")
+        self.assertEqual(chrome.stdin.writes, ["\n"])
+        self.assertEqual(edge.stdin.writes, [])
+        self.assertEqual(edge.terminated, 0)
+        self.assertTrue(page.busy)
+        edge.stdout.feed("验证完成后按 Enter 继续，q 退出: ")
+        self.pump_until(lambda: page._lane_states["edge"]["waiting"])
+        self.assertFalse(page.edge_continue_button.instate(["disabled"]))
+        self.assertTrue(page.continue_button.instate(["disabled"]))
+        page.continue_after_gate("chrome")
+        page.continue_after_gate("edge")
+        self.pump_until(lambda: not page.busy)
+        self.assertEqual(edge.stdin.writes, ["\n"])
+        self.assertEqual(chrome.stdin.writes, ["\n"])
+
+    def test_dual_setup_prepares_both_sides_in_removed_temporary_root(self):
+        chrome = FakeProcess("登录完成后按 Enter 开始采集: ")
+        edge = FakeProcess("登录完成后按 Enter 开始采集: ")
+        for process in (chrome, edge):
+            process.on_input = lambda _value, process=process: process.finish(0, "\nbrowser prepared\n")
+        observed = self.attach_browsers({"chrome": chrome, "edge": edge})
+        page = self.make_page(browser_mode="dual")
+        original_config = self.config_path.read_bytes()
+        page.prepare_browser()
+        self.pump_until(lambda: all(page._lane_states[browser]["waiting"] for browser in ("chrome", "edge")))
+        self.assertEqual(len(observed), 2)
+        for args in observed.values():
+            self.assertTrue(args.setup_only)
+            self.assertTrue(args.config.is_file())
+            self.assertNotEqual(args.root, self.output)
+        page.continue_after_gate("chrome")
+        self.pump_until(lambda: chrome.poll() == 0)
+        self.assertEqual(edge.stdin.writes, [])
+        self.assertTrue(page.busy)
+        page.continue_after_gate("edge")
+        self.pump_until(lambda: not page.busy)
+        self.assertTrue(all(not args.config.exists() and not args.root.exists() for args in observed.values()))
+        self.assertFalse(self.output.exists())
+        self.assertEqual(self.config_path.read_bytes(), original_config)
+        self.assertEqual(page.config_path, self.config_path)
+
+    def test_dual_single_group_leaves_edge_idle_and_empty_scope_launches_neither(self):
+        chrome = FakeProcess("BATCH_DONE\n")
+        chrome.finish(0)
+        observed = self.attach_browsers({"chrome": chrome})
+        page = self.make_page(browser_mode="dual")
+        page.limit.set("1")
+        page.start()
+        self.pump_until(lambda: not page.busy)
+        self.assertEqual(set(observed), {"chrome"})
+        self.assertEqual(page._lane_states["edge"]["state"], "无分配组合")
+        self.pump_until(lambda: len(page._visible_plan_rows) == 15)
+        page.select_visible_combinations(False)
+        self.popen.reset_mock()
+        page.start()
+        self.pump_until(lambda: not page.busy)
+        self.popen.assert_not_called()
+        self.assertIn("至少勾选 1 组", page.status_text.get())
+
+    def test_partial_browser_launch_failure_does_not_stop_the_running_side(self):
+        chrome = FakeProcess(f"RUN {self.specs[0]['combination']} (now), pages=10\n[2/10 页] 本页1条\n")
+        self.attach_browsers({"chrome": chrome, "edge": OSError("offline edge launch failed")})
+        page = self.make_page(browser_mode="dual")
+        page.start()
+        self.pump_until(lambda: page._lane_states["edge"]["state"] == "异常退出" and "2/10" in page.position_text.get())
+        self.assertTrue(page.busy)
+        self.assertEqual(chrome.terminated, 0)
+        self.assertIsNone(chrome.poll())
+        page.stop()
+        self.pump_until(lambda: not page.busy)
+        self.assertGreater(chrome.terminated, 0)
+        self.assertIn("Edge", page.status_text.get())
+        self.assertIn("offline edge launch failed", page.log_view.get("1.0", "end"))
+
+    def test_dead_side_releases_its_lock_while_peer_is_still_collecting(self):
+        chrome = FakeProcess(f"RUN {self.specs[0]['combination']} (now), pages=10\n")
+        edge = FakeProcess(f"RUN {self.specs[1]['combination']} (now), pages=10\n[1/10 页] 本页1条\n")
+        lock_created, peer_persisted = threading.Event(), threading.Event()
+
+        def persist_peer(args):
+            if args.browser == "chrome":
+                (args.root / "collection_manifest.json.lock").write_text(f"pid={chrome.pid}\n", encoding="utf-8")
+                lock_created.set()
+            else:
+                self.assertTrue(lock_created.wait(2))
+                chrome.finish(20)
+                collector.persist_manifest_record(args.root / "collection_manifest.json",
+                                                  {**self.specs[1], "status": "running"},
+                                                  expected_specs=self.specs, pages=10, root=args.root)
+                peer_persisted.set()
+        self.attach_browsers({"chrome": chrome, "edge": edge}, persist_peer)
+        page = self.make_page(browser_mode="dual")
+        with patch.object(collector, "MANIFEST_LOCK_TIMEOUT", 2):
+            page.start()
+            self.pump_until(lambda: peer_persisted.is_set() and "1/10" in page.position_text.get())
+            self.assertTrue(page.busy)
+            self.assertIsNone(edge.poll())
+            self.assertEqual(edge.terminated, 0)
+            self.assertEqual(page._lane_states["chrome"]["state"], "未全部完成")
+            manifest = collector.read_json(self.output / "collection_manifest.json")
+            self.assertEqual(collector.record_for(manifest, self.specs[1]["combination"])["status"], "running")
+            page.stop()
+            self.pump_until(lambda: not page.busy)
+
+    def test_dual_pause_preserves_both_checkpoints_full_scope_and_completed_record(self):
+        active = self.specs[:2]
+        done = {**self.specs[2], "status": "success", "job_count": 7, "finished_at": "2020-01-01"}
+        self.write_manifest([done])
+        raw_before = {}
+        for index, spec in enumerate(active):
+            raw = self.output / "raw" / spec["track"] / spec["city_id"] / f"{spec['combination']}.json"
+            write_json(raw, {"jobs": [{"id": f"partial-{index}"}]})
+            raw_before[raw] = raw.read_bytes()
+        existing = self.output / "checkpoints" / f"{active[1]['combination']}.partial.json"
+        write_json(existing, {"jobs": [{"id": "older-checkpoint"}]})
+        existing_before = existing.read_bytes()
+        chrome, edge = [FakeProcess(f"RUN {spec['combination']} (now), pages=10\n[{index + 2}/10 页] 本页1条\n")
+                        for index, spec in enumerate(active)]
+        self.attach_browsers({"chrome": chrome, "edge": edge})
+        page = self.make_page(browser_mode="dual")
+        page.start()
+        self.pump_until(lambda: "2/10" in page.position_text.get() and "3/10" in page.position_text.get())
+        # Forced termination can leave the peer's PID in the shared lock.
+        lock_path = self.output / "collection_manifest.json.lock"
+        lock_path.write_text(f"pid={edge.pid}\n", encoding="utf-8")
+        page.pause()
+        self.pump_until(lambda: not page.busy)
+        manifest = collector.read_json(self.output / "collection_manifest.json")
+        for index, spec in enumerate(active):
+            record = collector.record_for(manifest, spec["combination"])
+            self.assertEqual((record["status"], record["pages_completed"], record["desktop_interruption"]), ("paused", index + 2, "paused"))
+            self.assertTrue(Path(record["checkpoint"]).is_file())
+        self.assertEqual(existing.read_bytes(), existing_before)
+        self.assertEqual(collector.record_for(manifest, done["combination"]), done)
+        self.assertEqual(manifest["expected_combinations"], [spec["combination"] for spec in self.specs])
+        self.assertEqual(page._snapshot["counts"]["paused"], 2)
+        for path, before in raw_before.items():
+            self.assertEqual(path.read_bytes(), before)
+        self.assertTrue(all(process.terminated for process in (chrome, edge)))
+        self.assertFalse(lock_path.exists())
+
+    @unittest.skipUnless(sys.platform == "win32", "Windows owned browser jobs")
+    def test_completed_lane_keeps_browser_tree_owned_until_peer_is_stopped(self):
+        chrome = FakeProcess("BATCH_DONE\n")
+        chrome.finish(0)
+        edge = FakeProcess(f"RUN {self.specs[1]['combination']} (now), pages=10\n[1/10 页] 本页1条\n")
+        self.attach_browsers({"chrome": chrome, "edge": edge})
+        page = self.make_page(browser_mode="dual")
+        page.start()
+        self.pump_until(lambda: page._lane_states["chrome"]["state"] == "已结束" and "1/10" in page.position_text.get())
+        chrome_tree = page._lanes["chrome"].runner.tree
+        edge_tree = page._lanes["edge"].runner.tree
+        self.assertIsNotNone(chrome_tree)
+        self.assertFalse(chrome_tree.closed)
+        page.stop()
+        self.pump_until(lambda: not page.busy)
+        self.assertTrue(chrome_tree.closed)
+        self.assertFalse(chrome_tree.preserved)
+        self.assertTrue(edge_tree.closed)
+        self.assertFalse(edge_tree.preserved)
+
+    @unittest.skipUnless(sys.platform == "win32", "Windows owned browser jobs")
+    def test_dual_final_progress_cancellation_cannot_detach_either_browser(self):
+        chrome, edge = FakeProcess("BATCH_DONE\n"), FakeProcess("BATCH_DONE\n")
+        chrome.finish(0)
+        edge.finish(0)
+        observed = self.attach_browsers({"chrome": chrome, "edge": edge})
+        page = self.make_page(browser_mode="dual")
+        original_read = ui.read_collection_progress
+        cancelled = threading.Event()
+
+        def cancel_from_final_progress(root):
+            if len(observed) == 2 and all(lane.runner.command_complete for lane in page._lanes.values()):
+                page._control.stop()
+                cancelled.set()
+            return original_read(root)
+        with patch.object(ui, "read_collection_progress", side_effect=cancel_from_final_progress):
+            page.start()
+            self.pump_until(lambda: not page.busy)
+        self.assertTrue(cancelled.is_set())
+        trees = [tree for tree in FakeTree.instances if tree.child in (chrome, edge)]
+        self.assertEqual(len(trees), 2)
+        self.assertTrue(all(tree.closed and tree.preserved is False for tree in trees))
+        self.assertIn("已停止", page.status_text.get())
+
+    def test_dual_close_is_nonblocking_and_waits_for_both_owned_trees(self):
+        chrome, edge = FakeProcess("chrome running\n"), FakeProcess("edge running\n")
+        for process in (chrome, edge):
+            process.stop_release = threading.Event()
+            self.releases.append(process.stop_release)
+        observed = self.attach_browsers({"chrome": chrome, "edge": edge})
+        page = self.make_page(browser_mode="dual")
+        page.start()
+        self.pump_until(lambda: len(observed) == 2)
+        began = time.monotonic()
+        page.request_close()
+        self.assertLess(time.monotonic() - began, 0.2)
+        self.assertFalse(page.shutdown_complete)
+        chrome.stop_release.set()
+        self.pump_until(lambda: chrome.poll() is not None)
+        self.assertFalse(page.shutdown_complete)
+        edge.stop_release.set()
+        self.pump_until(lambda: page.shutdown_complete)
+        self.assertFalse(page.busy)
+        self.assertTrue(all(process.terminated for process in (chrome, edge)))
+        self.assertEqual(self.errors, [])
+
     def test_plan_preview_is_default_tab_and_shows_real_columns_and_chinese_groups(self):
         write_json(self.config_path, collector.load_config(PROJECT_ROOT / "config" / "architecture_collection.json"))
         page = self.make_page()
-        self.pump_until(lambda: len(page._plan_rows) == 560)
+        self.pump_until(lambda: len(page._plan_rows) == 672)
         self.assertEqual(page.notebook.select(), str(page.plan_frame))
         headings = [page.plan_table.heading(key)["text"] for key in page.plan_table["columns"]]
         self.assertEqual(headings, ["勾选", "序号", "检索分组", "城市", "关键词", "薪资", "经验", "学历", "页数", "本次计划"])
         self.assertEqual(tuple(page.track_box["values"]), ("全部分组", "当前求职", "成长参考"))
+        self.assertIn("北京", page.city_box["values"])
         self.assertIn("11 个关键词", page.scope_help.get())
         self.assertIn("6 个关键词", page.scope_help.get())
         self.assertIn("不是岗位最终分层", page.scope_help.get())
-        page.city.set("上海")
+        page.city.set("北京")
         self.pump_until(lambda: len(page._plan_rows) == 112)
         self.assertEqual(len(page.plan_table.get_children()), 112)
+        self.assertTrue(all(row["city_label"] == "北京" for row in page._plan_rows))
         self.assertIsNone(page._snapshot["total"])
         self.assertFalse(self.output.exists())
         self.popen.assert_not_called()
@@ -1375,7 +2223,12 @@ class CollectionTkTests(unittest.TestCase):
         header = ttk.Frame(self.root, height=64)
         header.pack(fill="x")
         header.pack_propagate(False)
-        page = self.make_page()
+        chrome, edge = [FakeProcess(f"RUN {spec['combination']} (now), pages=10\n[2/10 页] 本页1条\n")
+                        for spec in self.specs[:2]]
+        self.attach_browsers({"chrome": chrome, "edge": edge})
+        page = self.make_page(browser_mode="dual")
+        page.start()
+        self.pump_until(lambda: "2/10" in page.position_text.get() and page.config_path != self.config_path)
         self.root.geometry("1024x760")
         self.root.deiconify()
         self.assertEqual(page.notebook.select(), str(page.plan_frame))
@@ -1385,7 +2238,8 @@ class CollectionTkTests(unittest.TestCase):
             page.notebook.select(page.log_frame)
             self.root.update()
             for widget in (page.start_button, page.prepare_browser_button, page.pause_button, page.stop_button,
-                           page.continue_button, page.refresh_button, page.open_root_button, page.use_source_button,
+                           page.continue_button, page.edge_continue_button, page.browser_mode_box,
+                           page.refresh_button, page.open_root_button, page.use_source_button,
                            page.edit_plan_button, page.load_plan_button, page.log_view):
                 with self.subTest(theme=theme, widget=str(widget)):
                     x = widget.winfo_rootx() - self.root.winfo_rootx()
@@ -1398,6 +2252,8 @@ class CollectionTkTests(unittest.TestCase):
             page.notebook.select(page.plan_frame)
             self.root.update()
             self.assertGreater(page.plan_table.winfo_height(), 55)
+        page.stop()
+        self.pump_until(lambda: not page.busy)
 
     def test_close_is_nonblocking_cancels_own_callbacks_and_waits_for_owned_child_exit(self):
         process = FakeProcess("RUN example (now), pages=10\n")

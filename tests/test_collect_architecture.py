@@ -1,10 +1,14 @@
 import json
 import io
 import copy
+import os
+import subprocess
 import sys
 import tempfile
+import textwrap
+import threading
 import unittest
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from unittest.mock import patch
 
@@ -12,6 +16,9 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
 
 from collect_architecture import (  # noqa: E402
+    DEFAULT_PAGE_WAIT_MIN,
+    DEFAULT_PAGE_WAIT_MAX,
+    MAX_PAGE_WAIT,
     build_specs,
     invoke_spec,
     load_config,
@@ -24,6 +31,7 @@ from collect_architecture import (  # noqa: E402
     security_detected,
     should_display_upstream_line,
     valid_payload,
+    validate_page_wait,
 )
 from collection_plan import select_plan_combinations  # noqa: E402
 
@@ -48,10 +56,10 @@ class CollectionConfigTests(unittest.TestCase):
     def setUpClass(cls):
         cls.config = load_config(PROJECT_ROOT / "config" / "architecture_collection.json")
 
-    def test_full_matrix_has_560_unique_combinations(self):
+    def test_full_matrix_has_672_unique_combinations(self):
         specs = build_specs(self.config)
-        self.assertEqual(len(specs), 560)
-        self.assertEqual(len({spec["combination"] for spec in specs}), 560)
+        self.assertEqual(len(specs), 672)
+        self.assertEqual(len({spec["combination"] for spec in specs}), 672)
 
     def test_original_city_and_positional_interfaces_are_compatible(self):
         self.assertEqual(len(build_specs(self.config, "all", None, ["上海"])), 112)
@@ -64,7 +72,7 @@ class CollectionConfigTests(unittest.TestCase):
         selected = [full[123], full[-1]]
         plan = select_plan_combinations(self.config, [spec["combination"] for spec in selected])
         self.assertEqual(build_specs(plan, limit=1), [selected[0]])
-        self.assertEqual(build_specs(plan, "target", 1, ["成都"]), [selected[1]])
+        self.assertEqual(build_specs(plan, "target", 1, ["北京"]), [selected[1]])
         self.assertEqual(build_specs(plan, "current", None, ["上海"]), [])
         self.assertEqual(build_specs(plan, "target", None, ["深圳"]), [])
 
@@ -90,7 +98,7 @@ class CollectionConfigTests(unittest.TestCase):
             path.write_text(json.dumps(plan, ensure_ascii=False), encoding="utf-8")
             console = io.StringIO()
             with patch("collect_architecture.resolve_scraper_root") as resolver, redirect_stdout(console):
-                result = main(["--config", str(path), "--batch", "target", "--limit", "1", "--cities", "成都", "--dry-run"])
+                result = main(["--config", str(path), "--batch", "target", "--limit", "1", "--cities", "北京", "--dry-run"])
             resolver.assert_not_called()
             self.assertEqual(result, 0)
             self.assertIn(selected[1]["combination"], console.getvalue())
@@ -109,9 +117,9 @@ class CollectionConfigTests(unittest.TestCase):
     def test_added_keywords_cover_current_and_target(self):
         specs = build_specs(self.config)
         added = {"aiarch", "agentarch", "solconsult"}
-        self.assertEqual(sum(spec["keyword_id"] in added for spec in specs), 180)
-        self.assertEqual(sum(spec["track"] == "current" and spec["keyword_id"] in added for spec in specs), 120)
-        self.assertEqual(sum(spec["track"] == "target" and spec["keyword_id"] in added for spec in specs), 60)
+        self.assertEqual(sum(spec["keyword_id"] in added for spec in specs), 216)
+        self.assertEqual(sum(spec["track"] == "current" and spec["keyword_id"] in added for spec in specs), 144)
+        self.assertEqual(sum(spec["track"] == "target" and spec["keyword_id"] in added for spec in specs), 72)
 
     def test_security_output_stops_collection(self):
         self.assertTrue(security_detected("打开 _security_check 页面"))
@@ -141,6 +149,204 @@ class CollectionConfigTests(unittest.TestCase):
         self.assertTrue(parse_args([]).verbose_upstream)
         self.assertTrue(parse_args(["--verbose-upstream"]).verbose_upstream)
         self.assertFalse(parse_args(["--quiet-upstream"]).verbose_upstream)
+
+    def test_page_wait_contract_defaults_fixed_and_finite_range(self):
+        self.assertEqual((DEFAULT_PAGE_WAIT_MIN, DEFAULT_PAGE_WAIT_MAX, MAX_PAGE_WAIT), (12.0, 22.0, 300.0))
+        args = parse_args([])
+        self.assertEqual((args.page_wait_min, args.page_wait_max), (12.0, 22.0))
+        for minimum, maximum in ((0, 0), (1.25, 3.75), (300, 300)):
+            self.assertEqual(validate_page_wait(minimum, maximum), (float(minimum), float(maximum)))
+            args = parse_args(["--page-wait-min", str(minimum), "--page-wait-max", str(maximum)])
+            self.assertEqual((args.page_wait_min, args.page_wait_max), (minimum, maximum))
+            self.assertIsInstance(args.page_wait_min, float)
+        for minimum, maximum in ((float("nan"), 22), (12, float("nan")), (float("inf"), 22),
+                                 (12, float("inf")), (float("-inf"), 22), (-1, 22), (22, 12),
+                                 (0, 301), (None, 22), ("not-a-number", 22)):
+            with self.subTest(minimum=minimum, maximum=maximum), self.assertRaises(ValueError):
+                validate_page_wait(minimum, maximum)
+
+    def test_invalid_page_wait_fails_before_resolving_or_starting_any_subprocess(self):
+        with patch("collect_architecture.resolve_scraper_root") as resolver, \
+                patch("collect_architecture.subprocess.Popen") as process, \
+                patch("collect_architecture.run_setup_browser") as setup, \
+                redirect_stderr(io.StringIO()):
+            for minimum, maximum in (("nan", "22"), ("12", "inf"), ("-1", "22"), ("22", "12"), ("0", "301")):
+                with self.subTest(minimum=minimum, maximum=maximum), self.assertRaises(SystemExit) as error:
+                    main(["--page-wait-min", minimum, "--page-wait-max", maximum, "--setup-only"])
+                self.assertEqual(error.exception.code, 2)
+            with tempfile.TemporaryDirectory() as directory:
+                root = Path(directory) / "never-created"
+                with self.assertRaises(ValueError):
+                    invoke_spec(self._invoke_spec_fixture(), root=root, manifest={"records": []},
+                                manifest_path=root / "collection_manifest.json", python=Path(sys.executable),
+                                scraper_root=root / "scraper", pages=2, page_wait_min=2, page_wait_max=1)
+                self.assertFalse(root.exists())
+        resolver.assert_not_called()
+        process.assert_not_called()
+        setup.assert_not_called()
+
+    def test_wait_help_and_dry_run_are_offline_and_describe_configured_bounds(self):
+        console = io.StringIO()
+        with patch("collect_architecture.resolve_scraper_root") as resolver, \
+                patch("collect_architecture.subprocess.Popen") as process, \
+                patch("collect_architecture.run_setup_browser") as setup, \
+                redirect_stdout(console):
+            with self.assertRaises(SystemExit) as help_exit:
+                main(["--help"])
+            self.assertEqual(help_exit.exception.code, 0)
+            self.assertEqual(main(["--dry-run", "--limit", "1", "--page-wait-min", "1.25", "--page-wait-max", "3.75"]), 0)
+        self.assertIn("翻页等待: 1.25–3.75 秒", console.getvalue())
+        self.assertIn("--page-wait-min", console.getvalue())
+        resolver.assert_not_called()
+        process.assert_not_called()
+        setup.assert_not_called()
+
+    def test_main_passes_configured_waits_to_each_invocation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            with patch("collect_architecture.resolve_scraper_root", return_value=root / "scraper"), \
+                    patch("collect_architecture.resolve_python", return_value=Path(sys.executable)), \
+                    patch("collect_architecture.invoke_spec", return_value="success") as collect, \
+                    redirect_stdout(io.StringIO()):
+                result = main(["--root", str(root), "--limit", "1", "--page-wait-min", "0.25", "--page-wait-max", "1.5"])
+            self.assertEqual(result, 0)
+            self.assertEqual((collect.call_args.kwargs["page_wait_min"], collect.call_args.kwargs["page_wait_max"]), (0.25, 1.5))
+
+    def test_invoke_wait_adapter_command_checkpoint_and_manifest_keep_original_args(self):
+        cases = (({}, (12.0, 22.0)), ({"page_wait_min": 1.5, "page_wait_max": 2.5}, (1.5, 2.5)),
+                 ({"page_wait_min": 0, "page_wait_max": 0}, (0.0, 0.0)))
+        for options, expected in cases:
+            with self.subTest(options=options), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory) / "中文 输出目录"
+                spec = self._invoke_spec_fixture()
+                checkpoint = root / "checkpoints" / f"{spec['combination']}.partial.json"
+                checkpoint.parent.mkdir(parents=True)
+                checkpoint.write_text('{"jobs": []}', encoding="utf-8")
+                manifest = {"records": []}
+                scraper = Path(directory) / "上游 目录"
+
+                def fake_popen(command, **_kwargs):
+                    Path(command[command.index("--output") + 1]).write_text('{"jobs": [{"id": "1"}]}', encoding="utf-8")
+                    return FakeCollectionProcess("完成: 1 条\n")
+
+                with patch("collect_architecture.subprocess.Popen", side_effect=fake_popen) as process, \
+                        redirect_stdout(io.StringIO()):
+                    status = invoke_spec(spec, root=root, manifest=manifest,
+                                         manifest_path=root / "collection_manifest.json", python=Path(sys.executable),
+                                         scraper_root=scraper, pages=2, cdp_port=9333, **options)
+                self.assertEqual(status, "success")
+                command = process.call_args.args[0]
+                self.assertEqual(command[:10], [str(Path(sys.executable)), "-u", str(PROJECT_ROOT / "collection_runtime.py"),
+                                               "--scraper-root", str(scraper), "--page-wait-min", str(expected[0]),
+                                               "--page-wait-max", str(expected[1]), "--"])
+                self.assertEqual(command[10:], ["--keyword", spec["keyword"], "--city", spec["city"], "--pages", "2",
+                                               "--salary", spec["salary_code"], "--experience", spec["experience_code"],
+                                               "--degree", spec["degree"], "--cdp-port", "9333", "--no-detail", "--output",
+                                               str(root / "raw" / spec["track"] / spec["city_id"] / f"{spec['combination']}.json"),
+                                               "--merge", str(checkpoint)])
+                saved = json.loads((root / "collection_manifest.json").read_text(encoding="utf-8"))["records"][0]
+                self.assertEqual((saved["page_wait_min"], saved["page_wait_max"]), expected)
+
+    def test_gui_security_marks_browser_immediately_then_stops_at_next_combination_boundary(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            marker = root / "chrome.session-paused"
+            calls = []
+
+            class SecurityProcess(FakeCollectionProcess):
+                def __init__(inner_self):
+                    def lines():
+                        yield "请完成安全验证\n"
+                        self.assertTrue(marker.is_file(), "signal siblings while stdout is still being consumed")
+                        yield "已停止当前搜索\n"
+                    inner_self.stdout = lines()
+                    inner_self.returncode = 1
+
+                def wait(inner_self):
+                    self.assertTrue(marker.is_file())
+                    return inner_self.returncode
+
+            def fake_popen(command, **_kwargs):
+                calls.append(command)
+                if len(calls) == 1:
+                    return SecurityProcess()
+                Path(command[command.index("--output") + 1]).write_text('{"jobs": [{"id": "1"}]}', encoding="utf-8")
+                return FakeCollectionProcess("完成: 1 条\n")
+
+            def confirm(_prompt):
+                self.assertTrue(marker.exists())
+                saved = json.loads((root / "collection_manifest.json").read_text(encoding="utf-8"))
+                self.assertEqual(saved["records"][0]["status"], "paused")
+                return ""
+
+            console = io.StringIO()
+            with patch.dict(os.environ, {"BOSS_COLLECTION_DESKTOP_OWNER_TOKEN": "a" * 32,
+                                         "BOSS_COLLECTION_GATE_STOP_FILE": str(marker)}), \
+                    patch("collect_architecture.resolve_scraper_root", return_value=root / "scraper"), \
+                    patch("collect_architecture.resolve_python", return_value=Path(sys.executable)), \
+                    patch("collect_architecture.subprocess.Popen", side_effect=fake_popen), \
+                    patch("collect_architecture.input", side_effect=confirm) as human, \
+                    redirect_stdout(console):
+                result = main(["--root", str(root), "--gui-interactive", "--limit", "2"])
+            self.assertEqual(result, 20)
+            self.assertEqual(len(calls), 2, "only the gated combination can retry after confirmation")
+            human.assert_called_once()
+            self.assertIn("BROWSER_GATE_PAUSED", console.getvalue())
+            self.assertTrue(marker.exists())
+            saved = json.loads((root / "collection_manifest.json").read_text(encoding="utf-8"))
+            self.assertEqual(len(saved["records"]), 1)
+            self.assertEqual(saved["records"][0]["status"], "success")
+
+    def test_existing_gui_gate_marker_exits_before_resolving_or_spawning_without_overwriting(self):
+        with tempfile.TemporaryDirectory() as directory:
+            marker = Path(directory) / "session-paused"
+            marker.write_text("external marker is preserved", encoding="utf-8")
+            console = io.StringIO()
+            with patch.dict(os.environ, {"BOSS_COLLECTION_DESKTOP_OWNER_TOKEN": "b" * 32,
+                                         "BOSS_COLLECTION_GATE_STOP_FILE": str(marker)}), \
+                    patch("collect_architecture.resolve_scraper_root") as resolver, \
+                    patch("collect_architecture.subprocess.Popen") as process, redirect_stdout(console):
+                result = main(["--gui-interactive", "--limit", "1"])
+            self.assertEqual(result, 20)
+            resolver.assert_not_called()
+            process.assert_not_called()
+            self.assertIn("BROWSER_GATE_PAUSED", console.getvalue())
+            self.assertEqual(marker.read_text(encoding="utf-8"), "external marker is preserved")
+
+    def test_gate_marker_isolated_between_browser_sessions_and_ignored_without_gui_owner(self):
+        for gui, token, same_browser in ((False, "c" * 32, True), (True, "invalid", True), (True, "c" * 32, False)):
+            with self.subTest(gui=gui, token=token, same_browser=same_browser), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                old_marker, other_marker = root / "chrome-paused", root / "edge-paused"
+                old_marker.write_text("paused", encoding="utf-8")
+                selected_marker = old_marker if same_browser else other_marker
+                with patch.dict(os.environ, {"BOSS_COLLECTION_DESKTOP_OWNER_TOKEN": token,
+                                             "BOSS_COLLECTION_GATE_STOP_FILE": str(selected_marker)}), \
+                        patch("collect_architecture.resolve_scraper_root", return_value=root / "scraper"), \
+                        patch("collect_architecture.resolve_python", return_value=Path(sys.executable)), \
+                        patch("collect_architecture.invoke_spec", return_value="success") as collect, \
+                        redirect_stdout(io.StringIO()):
+                    result = main(["--root", str(root), "--limit", "1", *(["--gui-interactive"] if gui else [])])
+                self.assertEqual(result, 0)
+                collect.assert_called_once()
+                self.assertEqual(old_marker.read_text(encoding="utf-8"), "paused")
+                self.assertFalse(other_marker.exists())
+
+    def test_security_marker_write_requires_gui_owner_and_preserves_existing_content(self):
+        for gui, token, existing in ((False, "d" * 32, False), (True, "invalid", False), (True, "d" * 32, True)):
+            with self.subTest(gui=gui, token=token, existing=existing), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                marker = root / "browser-paused"
+                if existing:
+                    marker.write_text("preserved", encoding="utf-8")
+                with patch.dict(os.environ, {"BOSS_COLLECTION_DESKTOP_OWNER_TOKEN": token,
+                                             "BOSS_COLLECTION_GATE_STOP_FILE": str(marker)}), \
+                        patch("collect_architecture.GUI_INTERACTIVE_MODE", gui):
+                    status, _record, _console, _process = self._run_mock_collection(root, "请完成安全验证\n", [], exit_code=1)
+                self.assertEqual(status, "paused")
+                self.assertEqual(marker.exists(), existing)
+                if existing:
+                    self.assertEqual(marker.read_text(encoding="utf-8"), "preserved")
 
     def test_collection_logs_redact_credentials_and_cookies(self):
         spec = self._invoke_spec_fixture()
@@ -636,6 +842,21 @@ class CollectionConfigTests(unittest.TestCase):
         self.assertTrue(args.setup_browser)
         self.assertTrue(args.setup_only)
 
+    def test_gui_owner_identity_is_token_bound_and_precedes_config_or_manifest_access(self):
+        token = "a" * 32
+        output = io.StringIO()
+        with patch.dict(os.environ, {"BOSS_COLLECTION_DESKTOP_OWNER_TOKEN": token}), \
+                patch("collect_architecture.load_config", side_effect=ValueError("offline early stop")), \
+                redirect_stdout(output), self.assertRaisesRegex(ValueError, "offline early stop"):
+            main(["--gui-interactive"])
+        self.assertEqual(output.getvalue(), f"DESKTOP_COLLECTOR_OWNER token={token} pid={os.getpid()}\n")
+        for gui_args, value in (([], token), (["--gui-interactive"], "invalid-token")):
+            with self.subTest(gui_args=gui_args, value=value), \
+                    patch.dict(os.environ, {"BOSS_COLLECTION_DESKTOP_OWNER_TOKEN": value}), \
+                    redirect_stdout(io.StringIO()) as output:
+                self.assertEqual(main(["--dry-run", "--limit", "1", *gui_args]), 0)
+            self.assertNotIn("DESKTOP_COLLECTOR_OWNER", output.getvalue())
+
     def test_setup_only_prepares_browser_and_never_collects(self):
         for setup_flag in ([], ["--setup-browser"], ["--setup-chrome"]):
             for setup_exit in (0, 7):
@@ -704,6 +925,122 @@ class CollectionConfigTests(unittest.TestCase):
                 {record["combination"] for record in saved["records"]},
                 {"a", "b"},
             )
+
+    def test_concurrent_cli_shards_share_full_limited_scope_and_resume_only_incomplete(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config_path = root / "plan.json"
+            config_path.write_text(json.dumps(self.config, ensure_ascii=False), encoding="utf-8")
+            specs = build_specs(self.config, limit=3)
+            manifest_path = root / "collection_manifest.json"
+            persist_manifest_state(manifest_path, specs=specs, pages=2, root=root)
+            completed = specs[0]
+            completed_path = root / "raw" / completed["track"] / completed["city_id"] / f"{completed['combination']}.json"
+            completed_path.parent.mkdir(parents=True)
+            completed_path.write_text(json.dumps({"jobs": [{"id": "already-done"}]}), encoding="utf-8")
+            completed_record = {**completed, "status": "success", "job_count": 1, "pages_requested": 10,
+                                "finished_at": "2020-01-01", "json": str(completed_path)}
+            persist_manifest_record(manifest_path, completed_record)
+            completed_before = completed_path.read_bytes()
+            barrier = threading.Barrier(2)
+            launched = []
+            launch_lock = threading.Lock()
+
+            def fake_upstream(command, **_options):
+                output_path = Path(command[command.index("--output") + 1])
+                port = int(command[command.index("--cdp-port") + 1])
+                with launch_lock:
+                    launched.append((output_path.stem, port, threading.get_ident()))
+                # Both CLI instances must reach an incomplete group's upstream
+                # invocation while their peer is still active.
+                barrier.wait(4)
+                output_path.write_text(json.dumps({"jobs": [{"id": output_path.stem}]}), encoding="utf-8")
+                return FakeCollectionProcess("[1/2 页] 本页1条\n完成: fixture\n")
+
+            commands = [["--config", str(config_path), "--root", str(root), "--limit", "3", "--pages", "2",
+                         "--browser", browser, "--cdp-port", str(port), "--shard", str(index), "--total-shards", "2"]
+                        for index, (browser, port) in enumerate((("chrome", 9222), ("edge", 9223)))]
+            results, errors = [], []
+
+            def run(cli_args):
+                try:
+                    results.append(main(cli_args))
+                except Exception as caught:
+                    errors.append(caught)
+
+            with patch("collect_architecture.resolve_scraper_root", return_value=root / "scraper"), \
+                    patch("collect_architecture.resolve_python", return_value=Path(sys.executable)), \
+                    patch("collect_architecture.subprocess.Popen", side_effect=fake_upstream), \
+                    redirect_stdout(io.StringIO()):
+                workers = [threading.Thread(target=run, args=(cli_args,)) for cli_args in commands]
+                for worker in workers:
+                    worker.start()
+                for worker in workers:
+                    worker.join(10)
+                self.assertFalse(any(worker.is_alive() for worker in workers))
+                self.assertEqual(errors, [])
+                self.assertEqual(sorted(results), [0, 0])
+                self.assertEqual(len(launched), 2)
+                self.assertEqual(len({worker for _combination, _port, worker in launched}), 2)
+                self.assertEqual({(combination, port) for combination, port, _worker in launched},
+                                 {(specs[1]["combination"], 9223), (specs[2]["combination"], 9222)})
+                # The second explicit start reuses complete records and raw
+                # files; any upstream invocation would hit the broken barrier.
+                self.assertEqual([main(cli_args) for cli_args in commands], [0, 0])
+                self.assertEqual(len(launched), 2)
+            saved = json.loads(manifest_path.read_text(encoding="utf-8"))
+            self.assertEqual(saved["expected_combinations"], [spec["combination"] for spec in specs])
+            self.assertEqual({record["combination"] for record in saved["records"]}, set(saved["expected_combinations"]))
+            self.assertTrue(all(record["status"] == "success" for record in saved["records"]))
+            self.assertIn(completed_record, saved["records"])
+            self.assertEqual(completed_path.read_bytes(), completed_before)
+
+    def test_real_local_processes_merge_records_without_losing_peer_or_full_scope(self):
+        script = textwrap.dedent("""
+            import sys, time
+            from pathlib import Path
+            from collect_architecture import persist_manifest_record, persist_manifest_state, shard_specs
+            root, shard = Path(sys.argv[1]), int(sys.argv[2])
+            specs = [{"combination": f"offline-{index}", "track": "current"} for index in range(24)]
+            manifest_path = root / "collection_manifest.json"
+            persist_manifest_state(manifest_path, specs=specs, pages=2, root=root)
+            (root / f"ready-{shard}").write_text("ready", encoding="utf-8")
+            deadline = time.monotonic() + 5
+            while not (root / f"ready-{1-shard}").exists():
+                if time.monotonic() > deadline:
+                    raise RuntimeError("peer did not reach the shared manifest")
+                time.sleep(0.005)
+            for spec in shard_specs(specs, shard, 2):
+                persist_manifest_record(manifest_path, {**spec, "status": "success", "shard": shard},
+                                        expected_specs=specs, pages=2, root=root)
+            persist_manifest_state(manifest_path, specs=specs, pages=2, root=root)
+        """)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            processes = []
+            try:
+                for shard in (0, 1):
+                    processes.append(subprocess.Popen([sys.executable, "-u", "-c", script, str(root), str(shard)],
+                                                      cwd=PROJECT_ROOT, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                                      text=True, encoding="utf-8", errors="replace"))
+                self.assertNotEqual(processes[0].pid, processes[1].pid)
+                for process in processes:
+                    output, _error = process.communicate(timeout=12)
+                    self.assertEqual(process.returncode, 0, output)
+            finally:
+                for process in processes:
+                    if process.poll() is None:
+                        process.kill()
+                        process.communicate(timeout=3)
+                    if process.stdout:
+                        process.stdout.close()
+            saved = json.loads((root / "collection_manifest.json").read_text(encoding="utf-8"))
+            expected = [f"offline-{index}" for index in range(24)]
+            self.assertEqual(saved["expected_combinations"], expected)
+            self.assertEqual([spec["combination"] for spec in saved["expected_combination_specs"]], expected)
+            self.assertEqual({record["combination"] for record in saved["records"]}, set(expected))
+            self.assertEqual(len(saved["records"]), 24)
+            self.assertEqual({record["shard"] for record in saved["records"]}, {0, 1})
 
 
 if __name__ == "__main__":

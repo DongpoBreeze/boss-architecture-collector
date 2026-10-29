@@ -27,6 +27,12 @@ from pathlib import Path
 from typing import Any, Iterable
 
 from collection_plan import filter_plan_specs, validate_plan_config
+from collection_runtime import (
+    DEFAULT_PAGE_WAIT_MIN,
+    DEFAULT_PAGE_WAIT_MAX,
+    MAX_PAGE_WAIT,
+    validate_page_wait,
+)
 from project_resources import DEFAULT_CONFIG, PROJECT_ROOT, default_state_root
 
 
@@ -89,8 +95,44 @@ GUI_INTERACTIVE_MODE = False
 
 DEFAULT_CDP_PORT = 9222
 DEFAULT_PROFILE_ROOT = Path.home() / ".boss-zhipin-scraper"
+DESKTOP_OWNER_TOKEN_ENV = "BOSS_COLLECTION_DESKTOP_OWNER_TOKEN"
+DESKTOP_OWNER_PREFIX = "DESKTOP_COLLECTOR_OWNER"
+BROWSER_GATE_STOP_FILE_ENV = "BOSS_COLLECTION_GATE_STOP_FILE"
+BROWSER_GATE_PAUSED_PREFIX = "BROWSER_GATE_PAUSED"
 MANIFEST_LOCK_TIMEOUT = 180
 MANIFEST_LOCK_STALE_AFTER = 6 * 60 * 60
+
+
+def browser_gate_stop_path() -> Path | None:
+    """Honor only the desktop session's explicitly supplied browser marker."""
+
+    token = os.environ.get(DESKTOP_OWNER_TOKEN_ENV, "")
+    value = os.environ.get(BROWSER_GATE_STOP_FILE_ENV, "")
+    if not GUI_INTERACTIVE_MODE or not re.fullmatch(r"[0-9a-f]{32}", token) or not value:
+        return None
+    return Path(value).expanduser().resolve()
+
+
+def mark_browser_gate_paused(path: Path | None) -> None:
+    """Signal sibling slots without changing or deleting an existing marker."""
+
+    if path is None:
+        return
+    try:
+        with path.open("x", encoding="utf-8") as handle:
+            handle.write("paused\n")
+    except FileExistsError:
+        pass
+    except OSError as exc:
+        print(f"同浏览器暂停标记写入失败：{exc}", file=sys.stderr, flush=True)
+
+
+def browser_gate_paused(path: Path | None) -> bool:
+    if path is None or not path.exists():
+        return False
+    print(f"{BROWSER_GATE_PAUSED_PREFIX} 同浏览器已触发人工验证；本槽在组合边界暂停", flush=True)
+    return True
+
 
 def now_iso() -> str:
     """Return a local timezone ISO timestamp suitable for manifests."""
@@ -627,7 +669,10 @@ def invoke_spec(
     shard: int = 0,
     total_shards: int = 1,
     expected_specs: list[dict[str, Any]] | None = None,
+    page_wait_min: float = DEFAULT_PAGE_WAIT_MIN,
+    page_wait_max: float = DEFAULT_PAGE_WAIT_MAX,
 ) -> str:
+    page_wait_min, page_wait_max = validate_page_wait(page_wait_min, page_wait_max)
     from collection_sources import assert_source_specs_compatible
 
     assert_source_specs_compatible(root, expected_specs if expected_specs is not None else [spec])
@@ -672,11 +717,18 @@ def invoke_spec(
                 return str(old["status"])
             print(f"RETRY {combination} ({resume_retry_reason})", flush=True)
 
-    script = scraper_root / "scripts" / "boss_cdp_raw.py"
+    script = Path(__file__).resolve().with_name("collection_runtime.py")
     command = [
         str(python),
         "-u",
         str(script),
+        "--scraper-root",
+        str(scraper_root),
+        "--page-wait-min",
+        str(page_wait_min),
+        "--page-wait-max",
+        str(page_wait_max),
+        "--",
         "--keyword",
         spec["keyword"],
         "--city",
@@ -699,11 +751,16 @@ def invoke_spec(
         command.extend(("--merge", str(checkpoint_path)))
 
     started = now_iso()
-    print(f"RUN {combination} ({started}), pages={pages}", flush=True)
+    print(
+        f"RUN {combination} ({started}), pages={pages}, "
+        f"翻页等待={page_wait_min:g}–{page_wait_max:g}s",
+        flush=True,
+    )
     old_gate_wait_count = old.get("gate_wait_count", 0) if old else 0
     gate_wait_count = old_gate_wait_count if isinstance(old_gate_wait_count, int) else 0
     last_gate_at = old.get("last_gate_at") if old else None
     attempt_logs: list[str] = []
+    gate_stop_path = browser_gate_stop_path()
 
     while True:
         process: subprocess.Popen[str] | None = None
@@ -727,6 +784,8 @@ def invoke_spec(
             # be inspected live; quiet mode keeps only progress and errors visible.
             for line in process.stdout:
                 output_lines.append(line)
+                if security_detected(line):
+                    mark_browser_gate_paused(gate_stop_path)
                 if verbose_upstream or should_display_upstream_line(line):
                     print(redact_log(line), end="", flush=True)
             exit_code = process.wait()
@@ -740,11 +799,17 @@ def invoke_spec(
         except OSError as error:
             output = "".join(output_lines) + f"\n启动采集器失败：{error}\n"
             exit_code = 1
+        finally:
+            close_stdout = getattr(process.stdout, "close", None) if process is not None else None
+            if close_stdout is not None:
+                close_stdout()
 
         attempt_logs.append(redact_log(output))
         log_path.write_text("\n".join(attempt_logs), encoding="utf-8")
 
         security = security_detected(output)
+        if security:
+            mark_browser_gate_paused(gate_stop_path)
         job_count = stamp_payload(output_path, spec) if output_path.is_file() else None
         valid = job_count is not None
         empty_failure = empty_result_failure_reason(output) if job_count == 0 else None
@@ -764,6 +829,8 @@ def invoke_spec(
         record = {
             **spec,
             "pages_requested": pages,
+            "page_wait_min": page_wait_min,
+            "page_wait_max": page_wait_max,
             "pages_completed": pages_completed,
             "page_markers": page_markers,
             "status": status,
@@ -889,6 +956,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--batch", choices=("all", "current", "target"), default="all")
     parser.add_argument("--cities", nargs="+", default=None, help="仅运行所选城市名称或 ID；省略表示全部城市")
     parser.add_argument("--pages", type=int, choices=range(1, 11), default=10)
+    parser.add_argument(
+        "--page-wait-min", type=float, default=DEFAULT_PAGE_WAIT_MIN,
+        help="列表翻页等待最短秒数（默认 12；允许 0–300 的有限数字）",
+    )
+    parser.add_argument(
+        "--page-wait-max", type=float, default=DEFAULT_PAGE_WAIT_MAX,
+        help="列表翻页等待最长秒数（默认 22；与最短值相同时固定等待）",
+    )
     parser.add_argument("--browser", choices=("chrome", "edge"), default="chrome", help="本分片使用的专用浏览器")
     parser.add_argument("--cdp-port", type=int, default=9222, help="上游 CDP 调试端口")
     parser.add_argument("--profile-dir", type=Path, default=None, help="所选浏览器的独立 CDP profile 目录")
@@ -938,20 +1013,31 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="隐藏逐条岗位明细，仅显示进度、等待和错误信息",
     )
     parser.set_defaults(verbose_upstream=True)
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+    try:
+        args.page_wait_min, args.page_wait_max = validate_page_wait(args.page_wait_min, args.page_wait_max)
+    except ValueError as exc:
+        parser.error(str(exc))
+    return args
 
 
 def main(argv: list[str] | None = None) -> int:
     global GUI_INTERACTIVE_MODE
     args = parse_args(argv)
     GUI_INTERACTIVE_MODE = bool(args.gui_interactive)
+    owner_token = os.environ.get(DESKTOP_OWNER_TOKEN_ENV, "")
+    if GUI_INTERACTIVE_MODE and re.fullmatch(r"[0-9a-f]{32}", owner_token):
+        # A Windows venv launcher has its own PID. Report the interpreter
+        # actually holding manifest locks before it can touch any output.
+        print(f"{DESKTOP_OWNER_PREFIX} token={owner_token} pid={os.getpid()}", flush=True)
     config = load_config(args.config.expanduser().resolve())
     all_specs = build_specs(config, args.batch, args.limit, args.cities)
     expected_total = len(build_specs(config, args.batch, cities=args.cities))
     specs = shard_specs(all_specs, args.shard, args.total_shards)
     print(
         f"组合数: {len(specs)} (完整配置 {expected_total}) | 分片 {args.shard + 1}/{args.total_shards} | "
-        f"浏览器: {args.browser} | CDP: {args.cdp_port} | 页数: {args.pages}",
+        f"浏览器: {args.browser} | CDP: {args.cdp_port} | 页数: {args.pages} | "
+        f"翻页等待: {args.page_wait_min:g}–{args.page_wait_max:g} 秒",
         flush=True,
     )
     if args.dry_run:
@@ -959,6 +1045,9 @@ def main(argv: list[str] | None = None) -> int:
             print(f"{index:03d}/{len(specs)} {spec['combination']} | {spec['city']} | {spec['keyword']} | {spec['salary']} | {spec['experience']}")
         return 0
 
+    gate_stop_path = browser_gate_stop_path()
+    if browser_gate_paused(gate_stop_path):
+        return 20
     root = (args.root.expanduser() if args.root else default_root()).resolve()
     from collection_sources import assert_source_specs_compatible
 
@@ -993,6 +1082,8 @@ def main(argv: list[str] | None = None) -> int:
             return 0
 
     for index, spec in enumerate(specs, start=1):
+        if browser_gate_paused(gate_stop_path):
+            return 20
         print(
             f"\n[{index}/{len(specs)}] {spec['combination']} | "
             f"{spec['city']} | {spec['keyword']} | {spec['salary']} | {spec['experience']}",
@@ -1013,6 +1104,8 @@ def main(argv: list[str] | None = None) -> int:
             shard=args.shard,
             total_shards=args.total_shards,
             expected_specs=all_specs,
+            page_wait_min=args.page_wait_min,
+            page_wait_max=args.page_wait_max,
         )
         print(f"进度: {index}/{len(specs)}", flush=True)
         if status in {"paused", "failed"} and not args.continue_on_error:

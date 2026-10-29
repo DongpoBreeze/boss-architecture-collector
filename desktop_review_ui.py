@@ -28,6 +28,7 @@ from urllib.parse import urlsplit
 import desktop_data
 from collection_sources import review_config_for_source
 from desktop_collection import CollectionPage
+from desktop_delivery import DeliveryPage
 from desktop_tasks import (ReviewTask, STAGES, STAGE_LABELS, TaskStateError, job_id,
                            stage_selection_version, _file_version)
 from desktop_preferences import load_preferences, save_preferences
@@ -50,7 +51,7 @@ from screening_policy import (
 
 
 REVIEW_SOURCE_CONFIGS = default_state_root() / "config" / "review-source-catalogs"
-CITY_CHOICES = ("全部城市", "上海", "深圳", "杭州", "广州", "成都")
+CITY_CHOICES = ("全部城市", "上海", "深圳", "杭州", "广州", "成都", "北京")
 TRACK_CHOICES = {"当前＋成长": "all", "当前岗位": "current", "成长目标": "target"}
 SAMPLE_CHOICES = ("全部岗位（不限）", "自定义数量")
 BROWSER_MODE_CHOICES = ("单浏览器（Chrome）", "Chrome + Edge 各半")
@@ -81,6 +82,7 @@ STAGE_DESCRIPTIONS = {
     "report": "生成全部导入岗位的追踪报告；人工确认剔除项明确排除出可投池。完成后可点击“打开报告”查看 Markdown，无需先确认报告完成。",
 }
 PAGE_SIZE = 20
+REVIEW_STAGES = STAGES[:-1]
 MAX_LOG_CHARS = 250_000
 POLL_MS = 75
 ALL_LIST_QUEUES = "全部队列"
@@ -355,12 +357,12 @@ class TaskViewCache:
         self.live_ai: dict | None = None
         self.row_views: dict[str, tuple] = {}
 
-    def prepare(self, task: ReviewTask, manifest: dict) -> None:
-        identity = (str(task.path.absolute()), manifest["task_id"], manifest["scope_signature"])
+    def prepare(self, task: ReviewTask, manifest: dict, *, include_report: bool = True) -> None:
+        identity = (str(task.path.absolute()), manifest["task_id"], manifest["scope_signature"], include_report)
         if identity != self.identity:
             self.clear()
             self.identity = identity
-        references = {(stage, info[field]) for stage, info in manifest["stages"].items()
+        references = {(stage, info[field]) for stage, info in manifest["stages"].items() if include_report or stage in REVIEW_STAGES
                       for field in ("input_file", "result_file", "result_input_file") if info[field] is not None}
         if manifest["import_baseline_file"] is not None:
             references.add(("import", manifest["import_baseline_file"]))
@@ -387,18 +389,18 @@ class _CapturedTaskRows(ReviewTask):
     only the two reads avoids duplicating ReviewTask's selection/merge rules.
     """
 
-    def __init__(self, task: ReviewTask, manifest: dict, cache: TaskViewCache):
+    def __init__(self, task: ReviewTask, manifest: dict, cache: TaskViewCache, *, include_report: bool = True):
         self._capture_cache = cache
         # The ReviewTask constructor may inspect an older AI result while it
         # upgrades an in-memory snapshot, so initialize the read cache first.
-        super().__init__(task.path, manifest)
+        super().__init__(task.path, manifest, read_only=True, review_only=not include_report)
 
     def _upgrade_pending_selection(self, value: dict) -> None:
         # task.refresh already projected and validated this snapshot. Repeating
         # compatibility work here would read the same AI artifact a second time.
         pass
 
-    def _load(self) -> dict:
+    def _load(self, *, review_only: bool = False) -> dict:
         return self._manifest
 
     def _read_jobs(self, stage: str, relative: str | None) -> list[dict]:
@@ -506,12 +508,13 @@ def _row_view(jobs: list[dict], info: dict, stage: str, cache: TaskViewCache) ->
     return result
 
 
-def _capture_task(task: ReviewTask, *, read_log: bool = False, cache: TaskViewCache | None = None) -> dict[str, Any]:
+def _capture_task(task: ReviewTask, *, read_log: bool = False, cache: TaskViewCache | None = None,
+                  include_report: bool = True) -> dict[str, Any]:
     """Worker-only durable view, reusing unchanged immutable rows and search."""
     cache = cache if cache is not None else TaskViewCache()
-    manifest = task.refresh()
-    cache.prepare(task, manifest)
-    reader = _CapturedTaskRows(task, manifest, cache)
+    manifest = task.refresh() if include_report else task.review_snapshot()["manifest"]
+    cache.prepare(task, manifest, include_report=include_report)
+    reader = _CapturedTaskRows(task, manifest, cache, include_report=include_report)
     rows: dict[str, list[dict[str, Any]]] = {}
     search: dict[str, dict[str, str]] = {}
     previews: set[str] = set()
@@ -555,12 +558,44 @@ def _capture_task(task: ReviewTask, *, read_log: bool = False, cache: TaskViewCa
         rows[stage], search[stage] = entry[1], entry[2]
         if entry[3]:
             previews.add(stage)
+    artifacts = {}
+    log = _confined_file(task, "desktop.log") or _confined_file(task, "task.log")
+    if log is not None:
+        artifacts["log"] = log
+    if include_report:
+        _capture_report(reader, manifest, cache, rows, search, previews, artifacts)
+    view = {"manifest": display_manifest, "rows": rows, "previews": previews, "search": search,
+            "row_views": {stage: _row_view(rows[stage], display_manifest["stages"][stage], stage, cache)
+                          for stage in rows},
+            "artifacts": artifacts, "review_rules": reader.get_review_rules(),
+            "default_review_rules": default_review_rules()}
+    if display_manifest is not manifest:
+        view["live_ai_checkpoint_version"] = live_ai_checkpoint_version
+    if read_log:
+        try:
+            log_path = artifacts.get("log")
+            if log_path is None:
+                raise FileNotFoundError()
+            with log_path.open("rb") as stream:
+                stream.seek(0, os.SEEK_END)
+                size = stream.tell()
+                stream.seek(max(0, size - MAX_LOG_CHARS * 4))
+                content = stream.read().decode("utf-8", errors="replace")
+            view["log"] = _safe(content)[-MAX_LOG_CHARS:]
+        except FileNotFoundError:
+            view["log"] = ""
+    return view
+
+
+def _capture_report(reader: ReviewTask, manifest: dict, cache: TaskViewCache, rows: dict, search: dict,
+                    previews: set, artifacts: dict) -> None:
+    """Explicit legacy report capture; the default review workbench never calls it."""
     trace_key = _trace_key(manifest, cache)
     if cache.trace is None or cache.trace[0] != trace_key:
         cache.trace = (trace_key, reader.all_jobs())
     if not manifest["stages"]["report"]["result_ids"] and manifest["stages"]["report"]["status"] == "pending":
         previews.add("report")
-    artifacts = _artifact_paths(reader, manifest)
+    artifacts.update(_artifact_paths(reader, manifest))
     report_path = artifacts.get("json") if _report_ready(manifest) else None
     report_key = (trace_key, _file_version(report_path) if report_path is not None else None)
     if cache.report is None or cache.report[0] != report_key:
@@ -581,27 +616,6 @@ def _capture_task(task: ReviewTask, *, read_log: bool = False, cache: TaskViewCa
                 raise TaskStateError("报告 JSON 与当前任务全量岗位不一致或无法读取，未作为有效结果显示。") from error
         cache.report = (report_key, records, _build_search(records))
     rows["report"], search["report"] = cache.report[1], cache.report[2]
-    view = {"manifest": display_manifest, "rows": rows, "previews": previews, "search": search,
-            "row_views": {stage: _row_view(rows[stage], display_manifest["stages"][stage], stage, cache)
-                          for stage in STAGES},
-            "artifacts": artifacts, "review_rules": reader.get_review_rules(),
-            "default_review_rules": default_review_rules()}
-    if display_manifest is not manifest:
-        view["live_ai_checkpoint_version"] = live_ai_checkpoint_version
-    if read_log:
-        try:
-            log_path = artifacts.get("log")
-            if log_path is None:
-                raise FileNotFoundError()
-            with log_path.open("rb") as stream:
-                stream.seek(0, os.SEEK_END)
-                size = stream.tell()
-                stream.seek(max(0, size - MAX_LOG_CHARS * 4))
-                content = stream.read().decode("utf-8", errors="replace")
-            view["log"] = _safe(content)[-MAX_LOG_CHARS:]
-        except FileNotFoundError:
-            view["log"] = ""
-    return view
 
 
 def _sources_text(job: dict[str, Any]) -> str:
@@ -726,7 +740,7 @@ class ReviewDesktopApp:
         self.ui_thread_id = threading.get_ident()
         self.task: ReviewTask | None = None
         self.manifest: dict[str, Any] = {}
-        self._rows: dict[str, list[dict[str, Any]]] = {stage: [] for stage in STAGES}
+        self._rows: dict[str, list[dict[str, Any]]] = {stage: [] for stage in REVIEW_STAGES}
         self._shortlist_result_file: str | None = None
         self._search_index: dict[str, dict[str, str]] = {}
         self._view_cache = TaskViewCache()
@@ -790,7 +804,7 @@ class ReviewDesktopApp:
         self.colors = palette_for(self.theme.get())
         self.theme_button_text = StringVar(root, "夜间模式")
         self.workspace = StringVar(root, "review")
-        self.workspace_description = StringVar(root, "已有数据的五步审核；采集在独立页面，不会自动串联。")
+        self.workspace_description = StringVar(root, "四步审核并确认最终保留；投递数据在 03 显式导出。")
         self.source_root = StringVar(root, str(getattr(args, "root", None) or p.get("data_root", "")))
         self.task_name = StringVar(root, "架构方向-上海")
         self.task_parent = StringVar(root, str(getattr(args, "task_parent", None) or default_state_root() / "job-result" / "review-tasks"))
@@ -843,7 +857,7 @@ class ReviewDesktopApp:
         self._comboboxes: list[ttk.Combobox] = []
         self._setting_controls: list[tuple[Any, str]] = []
 
-        root.title("BOSS 岗位工作台 · 采集 / 后处理")
+        root.title("BOSS 岗位工作台 · 采集 / 后处理 / 投递导出")
         width = min(1380, max(1024, root.winfo_screenwidth() - 100))
         height = min(900, max(700, root.winfo_screenheight() - 110))
         root.geometry(f"{width}x{height}")
@@ -871,7 +885,12 @@ class ReviewDesktopApp:
 
     @property
     def _execution_blocked(self) -> bool:
-        return self._busy or self._collection_busy or self._closing
+        return self._busy or self._collection_busy or self._delivery_busy or self._closing
+
+    @property
+    def _delivery_busy(self) -> bool:
+        page = getattr(self, "delivery_page", None)
+        return page is not None and page.busy
 
     def _build_ui(self) -> None:
         self.root.columnconfigure(0, weight=1)
@@ -887,6 +906,8 @@ class ReviewDesktopApp:
         self.collector_button.pack(side="left", padx=(0, 8))
         self.review_button = ttk.Button(actions, text="02  后处理审核", style="Theme.TButton", command=lambda: self._show_workspace("review"))
         self.review_button.pack(side="left", padx=(0, 8))
+        self.delivery_button = ttk.Button(actions, text="03  投递数据导出", style="Small.TButton", command=lambda: self._show_workspace("delivery"))
+        self.delivery_button.pack(side="left", padx=(0, 8))
         self.theme_button = ttk.Button(actions, textvariable=self.theme_button_text, style="Theme.TButton", command=self._toggle_theme)
         self.theme_button.pack(side="left")
 
@@ -955,10 +976,10 @@ class ReviewDesktopApp:
         nav = self.stage_navigation = ttk.Frame(self.root, padding=(18, 4, 18, 5))
         nav.grid(row=2, column=0, sticky="ew")
         self.stage_buttons: dict[str, ttk.Button] = {}
-        for index, stage in enumerate(STAGES):
+        for index, stage in enumerate(REVIEW_STAGES):
             nav.columnconfigure(index, weight=1, uniform="stages")
             button = ttk.Button(nav, style="Review.Step.TButton", command=lambda s=stage: self._select_stage(s))
-            button.grid(row=0, column=index, sticky="ew", padx=(0 if index == 0 else 3, 0 if index == 4 else 3))
+            button.grid(row=0, column=index, sticky="ew", padx=(0 if index == 0 else 3, 0 if index == len(REVIEW_STAGES) - 1 else 3))
             self.stage_buttons[stage] = button
         self.notice_label = tk.Label(self.root, textvariable=self.notice, anchor="w", justify="left",
                                      padx=12, pady=5, wraplength=940, font=("Microsoft YaHei UI", 9))
@@ -1199,7 +1220,9 @@ class ReviewDesktopApp:
         ttk.Label(footer, textvariable=self.count_text, style="Hint.TLabel").grid(row=0, column=0, sticky="w")
         self.open_report_button = ttk.Button(footer, text="打开报告", style="Review.Primary.TButton",
                                              command=lambda: self._open_location("markdown"))
-        self.open_report_button.grid(row=0, column=1, sticky="e", padx=(10, 6))
+        self.go_delivery_button = ttk.Button(footer, text="前往 03 投递数据导出", style="Review.Primary.TButton",
+                                             command=lambda: self._show_workspace("delivery"))
+        self.go_delivery_button.grid(row=0, column=1, sticky="e", padx=(10, 6))
         self.confirm_button = ttk.Button(footer, textvariable=self.confirm_text, style="Review.Primary.TButton", command=self._confirm_stage)
         self.confirm_button.grid(row=0, column=2, sticky="e")
 
@@ -1213,9 +1236,7 @@ class ReviewDesktopApp:
         self.log_button = ttk.Button(log_tools, text="日志文件", style="Small.TButton", command=lambda: self._open_location("log"))
         self.log_button.pack(side="right", padx=(4, 0))
         self.markdown_button = ttk.Button(log_tools, text="报告 Markdown", style="Small.TButton", command=lambda: self._open_location("markdown"))
-        self.markdown_button.pack(side="right", padx=4)
         self.json_button = ttk.Button(log_tools, text="报告 JSON", style="Small.TButton", command=lambda: self._open_location("json"))
-        self.json_button.pack(side="right", padx=4)
         log_frame = ttk.Frame(log_panel)
         log_frame.grid(row=1, column=0, sticky="nsew")
         log_frame.columnconfigure(0, weight=1)
@@ -1235,37 +1256,58 @@ class ReviewDesktopApp:
             can_start=self._can_start_collection,
             on_busy_change=self._collection_state_changed,
         )
+        self.delivery_page = DeliveryPage(self.root, can_start=self._can_start_delivery,
+                                          on_busy_change=self._delivery_state_changed, open_path=self._open_path)
 
     def _show_workspace(self, workspace: str) -> None:
-        if self._closing or workspace not in ("collection", "review"):
+        if self._closing or workspace not in ("collection", "review", "delivery"):
             return
         self.workspace.set(workspace)
         self._render(render_rows=False)
+        if workspace == "delivery" and self.delivery_page._preview is None and self.delivery_page._source_path is not None:
+            self.delivery_page.refresh_preview()
 
     def _apply_workspace_visibility(self) -> None:
-        collecting = self.workspace.get() == "collection"
-        if collecting:
+        workspace = self.workspace.get()
+        collecting, delivering = workspace == "collection", workspace == "delivery"
+        if collecting or delivering:
             for widget in (self.setup_frame, self.binding_frame, self.stage_navigation,
                            self.notice_label, self.main_pane):
                 widget.grid_remove()
-            self.collection_page.grid(row=1, column=0, rowspan=4, sticky="nsew", padx=18, pady=(4, 12))
-            self.workspace_description.set("后处理正在运行，采集暂不可启动；可切回查看进度。" if self._busy else
-                                           "只采集原始列表；完成后由你决定是否新建后处理任务。")
+            if collecting:
+                self.delivery_page.grid_remove()
+                self.collection_page.grid(row=1, column=0, rowspan=4, sticky="nsew", padx=18, pady=(4, 12))
+                self.workspace_description.set("其他页面正在处理，采集暂不可启动；可切回查看进度。" if self._busy or self._delivery_busy else
+                                               "只采集原始列表；完成后由你决定是否新建后处理任务。")
+            else:
+                self.collection_page.grid_remove()
+                self.delivery_page.grid(row=1, column=0, rowspan=4, sticky="nsew", padx=18, pady=(4, 12))
+                self.workspace_description.set("导出最终确认保留的岗位；预览、切换与打开任务均不自动发布文件。")
         else:
             self.collection_page.grid_remove()
+            self.delivery_page.grid_remove()
             for widget in (self.stage_navigation, self.notice_label, self.main_pane):
                 widget.grid()
-            self.workspace_description.set("采集正在运行，后处理暂不可启动；可切回采集页查看。" if self._collection_busy else
-                                           "已有数据的五步审核；采集在独立页面，不会自动串联。")
+            self.workspace_description.set("其他页面正在处理，后处理暂不可启动；可切回查看进度。" if self._collection_busy or self._delivery_busy else
+                                           "四步审核并确认最终保留；投递数据在 03 显式导出。")
         self.collector_button.configure(style="Theme.TButton" if collecting else "Small.TButton")
-        self.review_button.configure(style="Small.TButton" if collecting else "Theme.TButton")
+        self.review_button.configure(style="Theme.TButton" if workspace == "review" else "Small.TButton")
+        self.delivery_button.configure(style="Theme.TButton" if delivering else "Small.TButton")
+        self.delivery_page.render_controls()
 
     def _collection_state_changed(self, _busy: bool) -> None:
         if not self._closed and hasattr(self, "collection_page") and hasattr(self, "results_table"):
             self._render(render_rows=False)
 
     def _can_start_collection(self) -> bool:
-        return not self._busy and not self._closing
+        return not self._busy and not self._delivery_busy and not self._closing
+
+    def _can_start_delivery(self) -> bool:
+        return not self._busy and not self._collection_busy and not self._closing
+
+    def _delivery_state_changed(self, _busy: bool) -> None:
+        if not self._closed:
+            self._render(render_rows=False)
 
     def _use_collection_source(self, path: Path) -> None:
         if self._execution_blocked:
@@ -1917,6 +1959,7 @@ class ReviewDesktopApp:
         for combo in self._comboboxes:
             configure_combobox_popdown(combo, p)
         self.collection_page.apply_theme(p)
+        self.delivery_page.apply_theme(p)
         self._paint_notice()
         self._paint_badge()
         if persist:
@@ -2071,6 +2114,8 @@ class ReviewDesktopApp:
         if any(info.get("status") == "running" for info in self.manifest.get("stages", {}).values()):
             return False
         key = stage or self.stage.get()
+        if key not in REVIEW_STAGES:
+            return False
         for upstream in STAGES[:STAGES.index(key)]:
             info = self._stage_info(upstream)
             if info.get("status") != "completed" or not info.get("confirmed"):
@@ -2164,7 +2209,8 @@ class ReviewDesktopApp:
         # guarded separately so the other page can be inspected safely.
         self._enabled(self.collector_button, not self._closing)
         self._enabled(self.review_button, not self._closing)
-        for index, stage in enumerate(STAGES):
+        self._enabled(self.delivery_button, not self._closing)
+        for index, stage in enumerate(REVIEW_STAGES):
             stage_info = self._stage_info(stage)
             stage_status = stage_info.get("status", "pending")
             label = "已确认 · " + str(len(stage_info.get("keep_ids", []))) if stage_info.get("confirmed") and stage_status == "completed" else STATUS_LABELS.get(stage_status, stage_status)
@@ -2225,7 +2271,7 @@ class ReviewDesktopApp:
                 self.count_text.set(f"本步输入 {inputs}  ·  明确保留 {keep}  ·  明确剔除 {excluded}  ·  待核实 {pending}" + ("  ·  旧结果仅供查看" if status == "stale" else ""))
             else:
                 self.count_text.set(f"本步输入 {inputs}  ·  保留 {keep}  ·  剔除 {excluded}" + ("  ·  旧结果仅供查看" if status == "stale" else ""))
-        self.confirm_text.set("确认报告完成" if key == "report" else f"确认 {keep} 个进入下一步")
+        self.confirm_text.set(f"确认最终保留 {keep} 个" if key == "llm" else f"确认 {keep} 个进入下一步")
         self._enabled(self.confirm_button, self._can_confirm())
         editable = self._can_edit()
         for widget in (self.select_page_button, self.exclude_button, self.restore_button, self.recommend_button):
@@ -2233,14 +2279,13 @@ class ReviewDesktopApp:
         self.restore_button.configure(text="保留所选" if key == "llm" else "恢复所选")
         self._enabled(self.detail_toggle_button, editable and self._focus_id is not None)
         self._render_list_queues()
-        report_ready = _report_ready(self.manifest) and not self._busy and not self._closing
-        if key == "report":
-            self.open_report_button.grid()
+        if key == "llm":
+            self.go_delivery_button.grid()
         else:
-            self.open_report_button.grid_remove()
-        self._enabled(self.open_report_button, key == "report" and report_ready and "markdown" in self._artifacts)
-        self._enabled(self.json_button, report_ready and "json" in self._artifacts)
-        self._enabled(self.markdown_button, report_ready and "markdown" in self._artifacts)
+            self.go_delivery_button.grid_remove()
+        self._enabled(self.go_delivery_button, bound and not self._closing)
+        for legacy in (self.open_report_button, self.json_button, self.markdown_button):
+            self._enabled(legacy, False)
         self._enabled(self.log_button, bound and not self._busy)
         if render_rows:
             self._render_rows()
@@ -2526,7 +2571,7 @@ class ReviewDesktopApp:
         return "break"
 
     def _select_stage(self, stage: str) -> None:
-        if stage not in STAGES or self._busy or self._closing:
+        if stage not in REVIEW_STAGES or self._busy or self._closing:
             return
         index = STAGES.index(stage)
         if self.task and index and self._stage_info(stage).get("status") == "pending" and not self._stage_info(STAGES[index - 1]).get("confirmed"):
@@ -2609,7 +2654,7 @@ class ReviewDesktopApp:
             task = ReviewTask.open(path)
             view = self._capture_view(task, read_log=True)
             stages = view["manifest"].get("stages", {})
-            stage = next((key for key in STAGES if not stages.get(key, {}).get("confirmed") or stages.get(key, {}).get("status") != "completed"), "report")
+            stage = next((key for key in REVIEW_STAGES if not stages.get(key, {}).get("confirmed") or stages.get(key, {}).get("status") != "completed"), "llm")
             return {"task": task, "view": view, "stage": stage,
                     "notice": "已打开原任务，未触发任何阶段执行。固定输入、范围和人工选择均沿用此任务。"}
 
@@ -2624,7 +2669,7 @@ class ReviewDesktopApp:
         self._saved_review_rules, self._default_review_rules = "", ""
         self.task, self.manifest = None, {}
         self._view_cache = TaskViewCache()
-        self._rows = {key: [] for key in STAGES}
+        self._rows = {key: [] for key in REVIEW_STAGES}
         self._shortlist_result_file = None
         self._search_index, self._artifacts, self._previews = {}, {}, set()
         self.stage.set("import")
@@ -2635,6 +2680,7 @@ class ReviewDesktopApp:
         self.list_queue_filter.set(ALL_LIST_QUEUES)
         self._page, self._focus_id, self._selected_ids = 0, None, ()
         self._replace_text(self.log_view, "")
+        self.delivery_page.set_current_task(None)
         self._notify("新任务默认处理全部岗位（不限），也可选择自定义数量。旧任务已保留，创建后仍需手动运行。")
         self._render()
 
@@ -2647,6 +2693,8 @@ class ReviewDesktopApp:
         if not self._closing:
             if self.workspace.get() == "collection":
                 self.collection_page.refresh_progress()
+            elif self.workspace.get() == "delivery":
+                self.delivery_page.refresh_preview()
             else:
                 self._refresh_task()
         return "break"
@@ -2789,15 +2837,17 @@ class ReviewDesktopApp:
         assert task is not None
         expected_stage = copy.deepcopy(self._stage_info())
         keep = expected_stage.get("keep_ids", [])
-        if not keep and stage != "report" and not messagebox.askyesno("明确确认空名单", "本步保留 0 个岗位。后续不会发起 JD 或模型请求，仍可生成全部岗位追踪报告。确认继续空名单吗？", parent=self.root):
+        if not keep and not messagebox.askyesno("明确确认空名单", "本步保留 0 个岗位。后续不会发起 JD 或模型请求；投递导出将没有可投岗位。确认继续空名单吗？", parent=self.root):
             return
 
         def confirm() -> dict[str, Any]:
             retained = task.confirm(stage, expected_stage=expected_stage)
             self._write_log(task, f"确认名单：{STAGE_LABELS[stage]}，保留 {len(retained)} 个；未调用下一步执行器。\n")
-            index = STAGES.index(stage)
-            next_stage = STAGES[index + 1] if index < len(STAGES) - 1 else stage
-            notice = f"已确认 {len(retained)} 个，载入「{STAGE_LABELS[next_stage]}」。尚未运行；点击运行本步才执行。" if next_stage != stage else "报告已确认完成，可直接点击“打开报告”查看 Markdown；JSON 位于同一任务目录。"
+            index = REVIEW_STAGES.index(stage)
+            next_stage = REVIEW_STAGES[index + 1] if index < len(REVIEW_STAGES) - 1 else stage
+            notice = (f"已确认最终保留 {len(retained)} 个。点击“前往 03 投递数据导出”预览，再显式导出 JSON。"
+                      if stage == "llm" else
+                      f"已确认 {len(retained)} 个，载入「{STAGE_LABELS[next_stage]}」。尚未运行；点击运行本步才执行。")
             return {"task": task, "view": self._capture_view(task), "stage": next_stage, "notice": notice}
 
         # This path intentionally has no reference to self.executor.
@@ -2826,6 +2876,9 @@ class ReviewDesktopApp:
         self._submit("reset-stage", reset, status=f"正在重置：{STAGE_LABELS[stage]}…")
 
     def _run_stage(self) -> None:
+        if self._delivery_busy:
+            self._notify("投递导出页正在处理，请完成后再执行后处理；可切换页面查看进度。", warning=True)
+            return
         if self._collection_busy:
             self._notify("岗位采集正在运行，请先在采集页暂停或停止，再执行后处理；两者不会同时操作数据源。", warning=True)
             return
@@ -3035,7 +3088,7 @@ class ReviewDesktopApp:
         # Completion, explicit refresh, callbacks and checkpoint polling share
         # one serial cache. No independent cold reader can overtake this one.
         with self._view_lock:
-            view = _capture_task(task, read_log=read_log, cache=self._view_cache)
+            view = _capture_task(task, read_log=read_log, cache=self._view_cache, include_report=False)
             criteria = self._view_filter
             if criteria is not None:
                 stage, query, selection, selected_queue = criteria
@@ -3077,6 +3130,7 @@ class ReviewDesktopApp:
             self._filter_after_id = None
             self._page, self._focus_id, self._selected_ids = 0, None, ()
         self.task, self.manifest = task, view["manifest"]
+        self.delivery_page.set_current_task(task.path, self.manifest.get("revision"))
         self._saved_review_rules = view.get("review_rules", "")
         self._default_review_rules = view.get("default_review_rules", "")
         self._shortlist_result_file = new_shortlist
@@ -3273,10 +3327,15 @@ class ReviewDesktopApp:
 
         def invoke() -> None:
             self._after_ids.discard(identifier)
+            # Remove the Tcl command before invoking a callback that may
+            # destroy/detach the root. Tk.after normally does this afterwards,
+            # when the lifecycle manager has already released root.tk.
+            self.root.deletecommand(command)
             if not self._closed:
                 callback()
 
-        identifier = self.root.after(milliseconds, invoke)
+        command = self.root.register(invoke)
+        identifier = str(self.root.tk.call("after", milliseconds, command))
         self._after_ids.add(identifier)
         return identifier
 
@@ -3295,12 +3354,13 @@ class ReviewDesktopApp:
     def _close(self) -> None:
         if self._closing or self._closed:
             return
-        if (self._busy or self._collection_busy) and not messagebox.askyesno("正在处理任务", "停止当前操作、保存检查点并关闭吗？", parent=self.root):
+        if (self._busy or self._collection_busy or self._delivery_busy) and not messagebox.askyesno("正在处理任务", "等待后台安全结束并关闭？采集与审核将保存检查点，已开始的导出会完成当前操作。", parent=self.root):
             return
         self._closing = True
         if self._control is not None:
             self._control.stop()
         self.collection_page.request_close()
+        self.delivery_page.request_close()
         for identifier in tuple(self._after_ids):
             self._cancel_after(identifier)
         self._poll_after_id, self._live_refresh_after_id, self._filter_after_id = None, None, None
@@ -3312,7 +3372,7 @@ class ReviewDesktopApp:
         active = self.worker is not None and self.worker.is_alive()
         preferences = any(thread.is_alive() for thread in self._preference_workers)
         live_refresh = self._live_refresh_worker is not None and self._live_refresh_worker.is_alive()
-        if active or live_refresh or preferences or not self.collection_page.shutdown_complete:
+        if active or live_refresh or preferences or not self.collection_page.shutdown_complete or not self.delivery_page.shutdown_complete:
             self._after(50, self._finish_close)
             return
         for identifier in tuple(self._after_ids):
