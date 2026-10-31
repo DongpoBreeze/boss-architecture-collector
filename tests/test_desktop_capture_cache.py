@@ -15,6 +15,7 @@ sys.path.insert(0, str(PROJECT_ROOT))
 import desktop_review_ui as ui
 import desktop_tasks
 from desktop_tasks import ReviewTask, STAGES, TaskStateError, job_id
+from test_desktop_review_ui import signed_ai_checkpoint_context
 
 
 def write_json(path, value):
@@ -290,10 +291,13 @@ class TaskViewCacheTests(unittest.TestCase):
         self.task.confirm("fetch-jd")
         self.task.begin("llm")
         self.addCleanup(self.task._release_run)
+        # Live rows require this attempt's prompt/provider binding and both
+        # per-record signatures, just like a real processor checkpoint.
+        sign = signed_ai_checkpoint_context(self.task, self.task.input_jobs("llm"))
         path = self.task.run_directory("llm") / "prepared/llm_reviews.json"
         first = self.capture()
-        write_json(path, {"reviews": [{"job_id": "live-0", "status": "success", "review_format": "simple-v1",
-                                     "判断": "符合", "理由": "第一份落盘判断"}]})
+        write_json(path, {"reviews": [sign({"job_id": "live-0", "status": "success", "review_format": "simple-v1",
+                                          "判断": "符合", "理由": "第一份落盘判断"})]})
         with patch.object(ui, "_analyze_ai_stage", wraps=ui._analyze_ai_stage) as analyzes, \
                 patch.object(ui, "_build_search", wraps=ui._build_search) as builds:
             changed = self.capture()

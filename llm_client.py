@@ -216,6 +216,28 @@ class CodexConfig(Mapping[str, Any]):
             "chat_stream": self.chat_stream,
         }
 
+    def private_payload(self) -> str:
+        """Serialize only for a private child stdin, never an artifact or log."""
+        return json.dumps({**self.redacted(), "api_key": self.api_key}, ensure_ascii=True)
+
+
+def config_from_private_payload(payload: str) -> CodexConfig:
+    """Parse a bounded, complete config snapshot without touching local auth."""
+    try:
+        if len(payload) > 65536:
+            raise ValueError
+        value = json.loads(payload)
+        if not isinstance(value, dict) or set(value) != set(CodexConfig().redacted()) | {"api_key"}:
+            raise ValueError
+        config = CodexConfig(**value)
+        if not all(isinstance(item, str) and item.strip() for item in (config.model, config.base_url, config.reasoning_effort)):
+            raise ValueError
+        if config.requires_auth and (not isinstance(config.api_key, str) or not config.api_key.strip()):
+            raise ValueError
+        return config
+    except (ValueError, TypeError):
+        raise ConfigurationError("AI 配置快照无效") from None
+
 
 def _read_toml(path: Path) -> dict[str, Any]:
     try:
@@ -294,6 +316,9 @@ def _as_nonnegative_int(value: Any, default: int) -> int:
     return number if number >= 0 else default
 
 
+_UNREAD_PROJECT_SETTINGS = object()
+
+
 def load_codex_config(
     config_path: str | os.PathLike[str] | None = None,
     auth_path: str | os.PathLike[str] | None = None,
@@ -310,6 +335,7 @@ def load_codex_config(
     max_retries: int | None = None,
     backoff_factor: float | None = None,
     project_settings_path: str | os.PathLike[str] | None = None,
+    project_settings_snapshot: Any = _UNREAD_PROJECT_SETTINGS,
 ) -> CodexConfig:
     """Load local Codex settings, with explicit arguments taking precedence.
 
@@ -332,7 +358,7 @@ def load_codex_config(
     # Keep the generic client isolated unless a project caller explicitly opts
     # into its own provider settings. This leaves direct Codex-config reads and
     # other clients unchanged.
-    project_settings = (
+    project_settings = project_settings_snapshot if project_settings_snapshot is not _UNREAD_PROJECT_SETTINGS else (
         project_llm_settings.load_settings(project_settings_path)
         if project_settings_path is not None else None
     )
@@ -418,6 +444,29 @@ def load_codex_config(
             (project_settings or {}).get("chat_stream", False)
             if chat_stream is None else chat_stream
         ),
+    )
+
+
+def load_review_config(*, codex_home: str | None = None, base_url: str | None = None,
+                       api_key: str | None = None, model: str | None = None,
+                       reasoning_effort: str | None = None, api_mode: str | None = None,
+                       timeout: int = 120, max_retries: int = 3) -> CodexConfig:
+    """Resolve one immutable effective review config for signatures and I/O."""
+    from screening_policy import AI_DEFAULT_MODEL, AI_DEFAULT_REASONING_EFFORT
+
+    env_home = os.environ.get("CODEX_HOME")
+    home = Path(codex_home).expanduser() if codex_home else Path(env_home).expanduser() if env_home else None
+    settings_path = None if codex_home else project_llm_settings.default_settings_path()
+    settings = project_llm_settings.load_settings(settings_path) if settings_path is not None else None
+    return load_codex_config(
+        config_path=home / "config.toml" if home else None,
+        auth_path=home / "auth.json" if home else None,
+        project_settings_path=settings_path, project_settings_snapshot=settings,
+        base_url=base_url, api_key=api_key,
+        model=model or (settings or {}).get("model") or AI_DEFAULT_MODEL,
+        reasoning_effort=reasoning_effort or (settings or {}).get("reasoning_effort") or AI_DEFAULT_REASONING_EFFORT,
+        api_mode=api_mode or (settings or {}).get("api_mode") or (None if codex_home else API_MODE_RESPONSES),
+        timeout=timeout, max_retries=max_retries,
     )
 
 

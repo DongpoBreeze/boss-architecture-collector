@@ -14,7 +14,6 @@ from pathlib import Path
 import queue
 import re
 import secrets
-import shutil
 import stat
 import subprocess
 import sys
@@ -29,6 +28,7 @@ import collect_architecture as collector
 import collection_plan as plans
 from collection_sources import assert_source_specs_compatible
 from desktop_data import _redact_text
+from desktop_controls import DialogActions, bind_search, flow_row
 from desktop_theme import LIGHT_PALETTE, configure_combobox_popdown
 from desktop_tk_lifecycle import StringVar as _PageStringVar, destroy_tk_widget, install_tk_lifecycle
 from project_resources import PROJECT_ROOT, default_state_root
@@ -209,8 +209,9 @@ def _guard_output_paths(root: Path, specs: list[dict[str, Any]]) -> None:
             raise ValueError("采集配置含不安全的组合或城市路径，未启动采集。")
         folder = root / "raw" / track / city
         directories.update((folder.parent, folder))
-        files.update((folder / f"{combination}.json", folder / f"{combination}.log",
-                      root / "checkpoints" / f"{combination}.partial.json"))
+        files.update((folder / f"{combination}.json", folder / f"{combination}.json.tmp", folder / f"{combination}.log",
+                      root / "checkpoints" / f"{combination}.partial.json",
+                      root / "checkpoints" / f"{combination}.partial.json.tmp"))
     for path in directories | files:
         if _reparse(path):
             raise ValueError("采集输出含符号链接或目录联接；未启动，以保护原有数据。")
@@ -608,11 +609,10 @@ def _clear_owned_lock(root: Path, result: CommandResult, log: Callable[[str], No
 def preserve_interrupted_combination(root: Path, specs: list[dict[str, Any]], pages: int,
                                      result: CommandResult, requested: str, started_at: str,
                                      log: Callable[[str], None]) -> None:
-    """Persist a real interruption and retain the CLI's existing checkpoint.
+    """Persist an interruption/failure and union every valid saved partial.
 
-    Completed records are never demoted. If a raw partial file was published
-    before the owned tree stopped, copy it to the standard merge checkpoint
-    only when that checkpoint does not already exist, matching the CLI.
+    Completed records are never demoted. Resume reads the same checkpoint
+    union as the CLI, including raw published after an earlier interruption.
     """
     _clear_owned_lock(root, result, log)
     if not result.combination or result.combination in result.completed:
@@ -624,10 +624,9 @@ def preserve_interrupted_combination(root: Path, specs: list[dict[str, Any]], pa
     combination = spec["combination"]
     output = root / "raw" / spec["track"] / spec["city_id"] / f"{combination}.json"
     checkpoint = root / "checkpoints" / f"{combination}.partial.json"
-    count = collector.payload_job_count(output)
-    if count is not None and not checkpoint.exists():
-        checkpoint.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(output, checkpoint)
+    count = collector.refresh_collection_checkpoint(output, checkpoint)
+    if count is None:
+        count = collector.payload_job_count(checkpoint)
     manifest_path = root / "collection_manifest.json"
     lock_path = manifest_path.with_name(manifest_path.name + ".lock")
     descriptor: int | None = None
@@ -650,22 +649,28 @@ def preserve_interrupted_combination(root: Path, specs: list[dict[str, Any]], pa
         old = collector.record_for(manifest, combination)
         if old and old.get("status") in ("success", "no_data") and str(old.get("finished_at", "")) >= started_at:
             return
+        paused = requested in ("paused", "stopped") or bool(
+            result.code == 20 and old and old.get("status") == "paused"
+            and str(old.get("finished_at", "")) >= started_at)
+        status = "paused" if paused else "failed"
         collector.prepare_manifest(manifest, specs, pages, root)
         collector.save_record(manifest, {
-            **spec, "pages_requested": pages, "pages_completed": result.pages_completed,
-            "page_markers": result.page_markers, "status": "paused", "exit_code": result.code,
+            **(old or {}), **spec, "pages_requested": pages, "pages_completed": result.pages_completed,
+            "page_markers": result.page_markers, "status": status, "exit_code": result.code,
             "job_count": count, "json": str(output), "log": str(output.with_suffix(".log")),
             "checkpoint": str(checkpoint) if checkpoint.is_file() else None,
             "started_at": started_at, "finished_at": collector.now_iso(),
             "security_or_login_gate": bool(old and old.get("security_or_login_gate")),
             "desktop_interruption": requested, "retryable": True,
+            "failure_reason": ((old or {}).get("failure_reason") or f"采集器异常退出（退出码 {result.code}）")
+                              if status == "failed" else None,
             "gate_wait_count": (old or {}).get("gate_wait_count", 0),
             "last_gate_at": (old or {}).get("last_gate_at"),
         })
         collector.write_json_atomic(manifest_path, manifest)
-        log("当前组合已记为 paused；已完成组合及已有检查点保留，开始 / 续采会重试未完成组合。")
+        log(f"当前组合已记为 {status}；有效 raw 与检查点已合并保留，开始 / 续采会重试未完成组合。")
     except (OSError, UnicodeError, ValueError, TypeError):
-        log("暂停状态暂未写入清单；未删除任何 raw 或检查点，续采会重试未完成组合。")
+        log("未完成状态暂未写入清单；未删除任何 raw 或检查点，续采会重试未完成组合。")
     finally:
         if descriptor is not None:
             os.close(descriptor)
@@ -715,6 +720,7 @@ class CollectionPage(ttk.Frame):
         self._visible_plan_rows: list[dict[str, Any]] = []
         self._plan_row_ids: dict[str, str] = {}
         self._editor: _CollectionPlanEditor | None = None
+        self._close_after_plan_save = False
         self.palette = dict(LIGHT_PALETTE)
         self.collection_root = _PageStringVar(self, initial_root or str(collector.default_root()))
         self.scraper_root = _PageStringVar(self, initial_scraper_root)
@@ -761,7 +767,9 @@ class CollectionPage(ttk.Frame):
     def shutdown_complete(self) -> bool:
         with self._worker_lock:
             active = any(worker.is_alive() for worker in self._workers)
-        complete = not active and all(runner.shutdown_complete for lane in self._lanes.values() for runner in lane.all_runners)
+        complete = (not active and not self._close_after_plan_save
+                    and not (self._editor is not None and self._editor._committing)
+                    and all(runner.shutdown_complete for lane in self._lanes.values() for runner in lane.all_runners))
         if complete and self._closing and threading.get_ident() == self._tk_thread and self._busy:
             self._set_busy(False)
         return complete
@@ -791,31 +799,31 @@ class CollectionPage(ttk.Frame):
         paths.columnconfigure(1, weight=1, uniform="collection_paths")
         paths.columnconfigure(4, weight=1, uniform="collection_paths")
         ttk.Label(paths, text="采集输出根", style="Card.TLabel").grid(row=0, column=0, sticky="w", padx=(0, 8))
-        self.root_entry = ttk.Entry(paths, textvariable=self.collection_root, style="Collection.TEntry")
+        self.root_entry = ttk.Entry(paths, textvariable=self.collection_root, style="Workspace.TEntry")
         self.root_entry.grid(row=0, column=1, sticky="ew", padx=(0, 6), pady=2)
-        self.choose_root_button = ttk.Button(paths, text="选择 / 新建目录", style="Collection.Small.TButton", command=self._choose_root)
+        self.choose_root_button = ttk.Button(paths, text="选择 / 新建目录", style="Workspace.TButton", command=self._choose_root)
         self.choose_root_button.grid(row=0, column=2, padx=(0, 12))
         ttk.Label(paths, text="上游 scraper", style="Card.TLabel").grid(row=0, column=3, sticky="w", padx=(0, 8))
-        self.scraper_entry = ttk.Entry(paths, textvariable=self.scraper_root, style="Collection.TEntry")
+        self.scraper_entry = ttk.Entry(paths, textvariable=self.scraper_root, style="Workspace.TEntry")
         self.scraper_entry.grid(row=0, column=4, sticky="ew", padx=(0, 6), pady=2)
-        self.choose_scraper_button = ttk.Button(paths, text="选择（留空自动找）", style="Collection.Small.TButton", command=self._choose_scraper)
+        self.choose_scraper_button = ttk.Button(paths, text="选择（留空自动找）", style="Workspace.TButton", command=self._choose_scraper)
         self.choose_scraper_button.grid(row=0, column=5)
         filters = ttk.Frame(settings, style="Card.TFrame")
         filters.grid(row=1, column=0, columnspan=3, sticky="ew", pady=(4, 3))
         ttk.Label(filters, text="城市", style="Card.TLabel").pack(side="left")
         self.city_box = ttk.Combobox(filters, textvariable=self.city, values=CITY_CHOICES, state="readonly", width=8,
-                                   style="Collection.TCombobox")
+                                   style="Workspace.TCombobox")
         self.city_box.pack(side="left", padx=(6, 14))
         ttk.Label(filters, text="检索分组", style="Card.TLabel").pack(side="left")
         self.track_box = ttk.Combobox(filters, textvariable=self.track_label, values=tuple(TRACK_LABELS.values()), state="readonly", width=9,
-                                    style="Collection.TCombobox")
+                                    style="Workspace.TCombobox")
         self.track_box.pack(side="left", padx=(6, 14))
         ttk.Label(filters, text="本次最多检索", style="Card.TLabel").pack(side="left")
-        self.limit_entry = ttk.Entry(filters, textvariable=self.limit, width=7, style="Collection.TEntry")
+        self.limit_entry = ttk.Entry(filters, textvariable=self.limit, width=7, style="Workspace.TEntry")
         self.limit_entry.pack(side="left", padx=(6, 4))
         ttk.Label(filters, text="组，空 = 全部", style="Hint.TLabel").pack(side="left", padx=(0, 14))
         ttk.Label(filters, text="每组页数", style="Card.TLabel").pack(side="left")
-        self.pages_spin = ttk.Spinbox(filters, textvariable=self.pages, from_=1, to=10, width=5, style="Collection.TSpinbox")
+        self.pages_spin = ttk.Spinbox(filters, textvariable=self.pages, from_=1, to=10, width=5, style="Workspace.TSpinbox")
         self.pages_spin.pack(side="left", padx=(6, 5))
         ttk.Label(filters, text="1–10 页，仅列表", style="Hint.TLabel").pack(side="left")
         self.scope_help_label = ttk.Label(settings, textvariable=self.scope_help, style="Hint.TLabel", wraplength=900)
@@ -823,22 +831,22 @@ class CollectionPage(ttk.Frame):
         runtime = ttk.Frame(settings, style="Card.TFrame")
         runtime.grid(row=3, column=0, columnspan=3, sticky="ew", pady=(2, 0))
         ttk.Label(runtime, text="翻页等待（秒）最短", style="Card.TLabel").pack(side="left")
-        self.page_wait_min_entry = ttk.Entry(runtime, textvariable=self.page_wait_min, width=6, style="Collection.TEntry")
+        self.page_wait_min_entry = ttk.Entry(runtime, textvariable=self.page_wait_min, width=6, style="Workspace.TEntry")
         self.page_wait_min_entry.pack(side="left", padx=(5, 8))
         ttk.Label(runtime, text="最长", style="Card.TLabel").pack(side="left")
-        self.page_wait_max_entry = ttk.Entry(runtime, textvariable=self.page_wait_max, width=6, style="Collection.TEntry")
+        self.page_wait_max_entry = ttk.Entry(runtime, textvariable=self.page_wait_max, width=6, style="Workspace.TEntry")
         self.page_wait_max_entry.pack(side="left", padx=(5, 15))
         ttk.Label(runtime, text="每浏览器采集并发数", style="Card.TLabel").pack(side="left")
         self.browser_workers_spin = ttk.Spinbox(runtime, textvariable=self.browser_workers, from_=1, to=MAX_BROWSER_WORKERS, width=4,
-                                              style="Collection.TSpinbox")
+                                              style="Workspace.TSpinbox")
         self.browser_workers_spin.pack(side="left", padx=(5, 8))
         self.limit_help_label = ttk.Label(runtime, text="1–8 槽；上限先于分片，完成组跳过", style="Hint.TLabel")
         self.limit_help_label.pack(side="left")
         plan_actions = ttk.Frame(settings, style="Card.TFrame")
         plan_actions.grid(row=4, column=0, columnspan=3, sticky="ew", pady=(4, 2))
-        self.edit_plan_button = ttk.Button(plan_actions, text="编辑检索条件…", style="Collection.Small.TButton", command=self.open_plan_editor)
+        self.edit_plan_button = ttk.Button(plan_actions, text="编辑检索条件…", style="Workspace.TButton", command=self.open_plan_editor)
         self.edit_plan_button.pack(side="left", padx=(0, 6))
-        self.load_plan_button = ttk.Button(plan_actions, text="加载方案…", style="Collection.Small.TButton", command=self.load_plan)
+        self.load_plan_button = ttk.Button(plan_actions, text="加载方案…", style="Workspace.TButton", command=self.load_plan)
         self.load_plan_button.pack(side="left", padx=(0, 8))
         # Long snapshot paths remain available in the operation log; this
         # single-line label must not consume space needed by runtime controls.
@@ -850,25 +858,25 @@ class CollectionPage(ttk.Frame):
         actions.grid(row=2, column=0, sticky="ew", pady=2)
         first = ttk.Frame(actions)
         first.pack(fill="x")
-        self.start_button = ttk.Button(first, text="开始 / 续采", style="Collection.Primary.TButton", command=self.start)
-        self.prepare_browser_button = ttk.Button(first, text="准备浏览器 / 登录", style="Collection.Small.TButton", command=self.prepare_browser)
-        self.pause_button = ttk.Button(first, text="暂停", style="Collection.Small.TButton", command=self.pause)
-        self.stop_button = ttk.Button(first, text="停止", style="Collection.Small.TButton", command=self.stop)
-        self.continue_button = ttk.Button(first, text="Chrome 人工完成，继续", style="Collection.Small.TButton", command=self.continue_after_gate)
-        self.edge_continue_button = ttk.Button(first, text="Edge 人工完成，继续", style="Collection.Small.TButton",
+        self.start_button = ttk.Button(first, text="开始 / 续采", style="Workspace.Primary.TButton", command=self.start)
+        self.prepare_browser_button = ttk.Button(first, text="准备浏览器 / 登录", style="Workspace.TButton", command=self.prepare_browser)
+        self.pause_button = ttk.Button(first, text="暂停", style="Workspace.TButton", command=self.pause)
+        self.stop_button = ttk.Button(first, text="停止", style="Workspace.TButton", command=self.stop)
+        self.continue_button = ttk.Button(first, text="Chrome 人工完成，继续", style="Workspace.TButton", command=self.continue_after_gate)
+        self.edge_continue_button = ttk.Button(first, text="Edge 人工完成，继续", style="Workspace.TButton",
                                               command=lambda: self.continue_after_gate("edge"))
         for widget in (self.start_button, self.prepare_browser_button, self.pause_button, self.stop_button,
                        self.continue_button, self.edge_continue_button):
             widget.pack(side="left", padx=(0, 6))
         second = ttk.Frame(actions)
         second.pack(fill="x", pady=(4, 0))
-        self.refresh_button = ttk.Button(second, text="刷新进度", style="Collection.Small.TButton", command=self.refresh_progress)
-        self.open_root_button = ttk.Button(second, text="打开采集目录", style="Collection.Small.TButton", command=self.open_collection_directory)
-        self.use_source_button = ttk.Button(second, text="用此数据新建后处理任务", style="Collection.Small.TButton", command=self.use_source)
+        self.refresh_button = ttk.Button(second, text="刷新", style="Workspace.TButton", command=self.refresh_progress)
+        self.open_root_button = ttk.Button(second, text="打开采集目录", style="Workspace.TButton", command=self.open_collection_directory)
+        self.use_source_button = ttk.Button(second, text="用此数据新建后处理任务", style="Workspace.TButton", command=self.use_source)
         for widget in (self.refresh_button, self.open_root_button, self.use_source_button):
             widget.pack(side="left", padx=(0, 6))
         self.browser_mode_box = ttk.Combobox(second, textvariable=self.browser_mode, values=tuple(BROWSER_MODES.values()),
-                                            state="readonly", width=16, style="Collection.TCombobox")
+                                            state="readonly", width=16, style="Workspace.TCombobox")
         self.browser_mode_box.pack(side="right")
         ttk.Label(second, text="采集浏览器").pack(side="right", padx=(8, 6))
         progress = ttk.Frame(self.content)
@@ -891,12 +899,13 @@ class CollectionPage(ttk.Frame):
         self.plan_frame.rowconfigure(1, weight=1)
         plan_toolbar = ttk.Frame(self.plan_frame)
         plan_toolbar.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(3, 3))
-        self.select_all_button = ttk.Button(plan_toolbar, text="全选可见范围", style="Collection.Small.TButton", command=lambda: self.select_visible_combinations(True))
+        self.select_all_button = ttk.Button(plan_toolbar, text="全选可见范围", style="Workspace.TButton", command=lambda: self.select_visible_combinations(True))
         self.select_all_button.pack(side="left", padx=(0, 5))
-        self.clear_selection_button = ttk.Button(plan_toolbar, text="清空可见范围", style="Collection.Small.TButton", command=lambda: self.select_visible_combinations(False))
+        self.clear_selection_button = ttk.Button(plan_toolbar, text="清空可见范围", style="Workspace.TButton", command=lambda: self.select_visible_combinations(False))
         self.clear_selection_button.pack(side="left", padx=(0, 12))
-        ttk.Label(plan_toolbar, text="查找关键词 / 城市").pack(side="left")
-        self.plan_search_entry = ttk.Entry(plan_toolbar, textvariable=self.plan_search, width=22, style="Collection.TEntry")
+        ttk.Label(plan_toolbar, text="搜索").pack(side="left")
+        self.plan_search_entry = ttk.Entry(plan_toolbar, textvariable=self.plan_search, width=22, style="Workspace.TEntry")
+        bind_search(self.plan_search_entry, self.plan_search)
         self.plan_search_entry.pack(side="left", padx=6)
         ttk.Label(plan_toolbar, text="勾选后再应用本次上限", style="Muted.TLabel").pack(side="left")
         plan_columns = ("checked", "index", "group", "city", "keyword", "salary", "experience", "degree", "pages", "execution")
@@ -967,6 +976,8 @@ class CollectionPage(ttk.Frame):
                                self.choose_scraper_button, self.limit_entry, self.pages_spin, self.edit_plan_button,
                                self.page_wait_min_entry, self.page_wait_max_entry, self.browser_workers_spin,
                                self.load_plan_button, self.select_all_button, self.clear_selection_button, self.plan_search_entry)
+        for row in (filters, runtime, first):
+            flow_row(row)
         for section in (settings, actions, progress, self.notebook):
             # Their requested heights can shrink without resizing the canvas
             # window itself (e.g. after wrapping a long plan path).
@@ -1013,14 +1024,9 @@ class CollectionPage(ttk.Frame):
             return
         self.palette = {**LIGHT_PALETTE, **dict(palette)}
         p = self.palette
-        # Keep the host's fonts, colours and accessible states; only this
-        # dense form uses smaller vertical padding than the other workspaces.
+        # Shared controls inherit the host's workspace styles and states.
+        # Keep the collection-specific tabs and compact table headings.
         style = ttk.Style(self)
-        style.configure("Collection.TEntry", padding=(7, 4))
-        style.configure("Collection.TCombobox", padding=(6, 4))
-        style.configure("Collection.TSpinbox", padding=(6, 4))
-        style.configure("Collection.Small.TButton", padding=(9, 3))
-        style.configure("Collection.Primary.TButton", padding=(12, 4))
         style.configure("Collection.TNotebook.Tab", padding=(14, 5))
         style.configure("Collection.Treeview.Heading", padding=(9, 4))
         self.canvas.configure(background=p["background"])
@@ -1099,8 +1105,7 @@ class CollectionPage(ttk.Frame):
 
     def _inputs_changed(self, *_args: object) -> None:
         self._preview_id += 1
-        self._snapshot = None
-        self.progress_text.set("输入已变化，正在只读刷新；下方旧记录不代表当前选择。")
+        self._clear_progress("输入已变化，正在只读刷新；当前来源统计未知。")
         self.estimate_text.set("检索计划正在只读刷新；不会启动采集。")
         self._schedule_preview(220)
 
@@ -1129,12 +1134,14 @@ class CollectionPage(ttk.Frame):
             request = self._capture_request()
         except ValueError as error:
             self.estimate_text.set(redact_log(error))
+            if not self._busy:
+                self._clear_progress("只读预览输入无效；当前来源进度与统计未知。")
             return
         generation = self._preview_id
         self._preview_active = True
 
         def inspect() -> None:
-            value: dict[str, Any] = {"generation": generation, "error": None}
+            value: dict[str, Any] = {"generation": generation, "root_text": request.root_text, "error": None}
             try:
                 config = request.config_snapshot if request.config_snapshot is not None else collector.load_config(request.config_path.expanduser().resolve())
                 value.update(build_collection_preview(config, request.selection, request.combination_ids))
@@ -1436,7 +1443,7 @@ class CollectionPage(ttk.Frame):
 
             def monitor() -> None:
                 if root is not None and not setup_only:
-                    self._emit("progress", read_collection_progress(root))
+                    self._emit("progress", {**read_collection_progress(root), "root_text": request.root_text})
 
             def lane_emit(lane: _CollectionLane, kind: str, value: Any, slot_key: str = "1") -> None:
                 label = (f"{lane.label} 登录" if slot_key == "setup" else
@@ -1554,7 +1561,7 @@ class CollectionPage(ttk.Frame):
                     _guard_output_paths(root, specs)
                     if read_collection_progress(root)["manifest_state"] == "invalid":
                         raise ValueError("现有 collection_manifest.json 无效；未改写，请检查或选择新的采集根目录。")
-                    assert_source_specs_compatible(root, specs)
+                    assert_source_specs_compatible(root, specs, config=run_plan)
                 if request.scraper_text:
                     supplied = Path(request.scraper_text).expanduser().resolve()
                     if not (supplied / "scripts" / "boss_cdp_raw.py").is_file():
@@ -1579,7 +1586,9 @@ class CollectionPage(ttk.Frame):
                 else:
                     root.mkdir(parents=True, exist_ok=True)
                     _guard_output_paths(root, specs)
-                    snapshot = plans.save_plan_config(run_plan, root / "collection-plans")
+                    with collector.manifest_lock(root / "collection_manifest.json"):
+                        assert_source_specs_compatible(root, specs, config=run_plan)
+                        snapshot = plans.save_plan_config(run_plan, root / "collection-plans")
                     run_root = root
                     self._emit("active_plan", {"path": snapshot, "config": run_plan, "checked": preview["all_checked"]})
                     try:
@@ -1647,7 +1656,7 @@ class CollectionPage(ttk.Frame):
                                 _clear_owned_lock(root, value["result"], lambda line: emit("log", line))
                         for (browser, slot_key), value in command_results.items():
                             result = value.get("result")
-                            reason = control.requested or ("failed" if value.get("error") else None)
+                            reason = control.requested or ("failed" if value.get("error") or (result and result.code != 0) else None)
                             if result and reason and value["collecting"] and value["runner"].command_complete:
                                 preserve_interrupted_combination(root, specs, request.selection.pages, result,
                                                                  reason, started_at,
@@ -1880,6 +1889,16 @@ class CollectionPage(ttk.Frame):
         if old_y:
             self.progress_table.yview_moveto(old_y[0])
 
+    def _clear_progress(self, message: str) -> None:
+        """Make an unreadable/new source unknown without retaining old totals."""
+        self._snapshot = None
+        self.progress_text.set(message)
+        self.stats_text.set("成功 —　无数据 —　失败 —　暂停 —　运行中 —　原始条目（可重复）—")
+        self.progress_bar.configure(maximum=1, value=0)
+        self.progress_table.delete(*self.progress_table.get_children())
+        if not self._busy:
+            self.position_text.set("当前组合 / 页：未运行")
+
     def _finish_operation_if_safe(self) -> None:
         if self._operation_result is None or (self._operation_thread and self._operation_thread.is_alive()):
             return
@@ -1921,7 +1940,8 @@ class CollectionPage(ttk.Frame):
             if kind == "log":
                 self._append_log(value)
             elif kind == "progress":
-                self._apply_progress(value)
+                if value.get("root_text", self.collection_root.get().strip()) == self.collection_root.get().strip():
+                    self._apply_progress(value)
             elif kind == "lane":
                 self._apply_lane_event(value)
             elif kind == "position":
@@ -1940,11 +1960,12 @@ class CollectionPage(ttk.Frame):
                     self.scraper_root.set(resolved)
             elif kind == "preview":
                 self._preview_active = False
-                if value["generation"] == self._preview_id:
+                if (value["generation"] == self._preview_id
+                        and value.get("root_text", self.collection_root.get().strip()) == self.collection_root.get().strip()):
                     if "progress" in value:
                         self._apply_progress(value["progress"])
                     elif value.get("path_error"):
-                        self.progress_text.set("输出路径只读检查：" + value["path_error"])
+                        self._clear_progress("输出路径只读检查：" + value["path_error"] + " 当前来源进度与统计未知。")
                     if value["error"]:
                         self.estimate_text.set("只读预览：" + value["error"])
                         self._plan_rows = []
@@ -1981,6 +2002,9 @@ class CollectionPage(ttk.Frame):
             elif kind == "plan_editor_saved":
                 if value["editor"] is self._editor:
                     self._editor.receive_saved(value)
+            elif kind == "plan_editor_commit":
+                if value["editor"] is self._editor:
+                    self._editor.begin_commit(value)
             elif kind == "auxiliary":
                 self._aux_pending = False
                 if value["error"]:
@@ -2003,6 +2027,11 @@ class CollectionPage(ttk.Frame):
     def request_close(self) -> None:
         """Nonblocking: signal our worker, cancel only this page's callbacks."""
         if self._closing:
+            return
+        if self._editor is not None and self._editor._committing:
+            self._close_after_plan_save = True
+            self._editor.close()  # Explain why this atomic commit cannot cancel.
+            self.status_text.set("方案正在提交保存；完成本次保存后关闭。")
             return
         self._closing = True
         if self._editor is not None:
@@ -2041,6 +2070,8 @@ class CollectionPage(ttk.Frame):
         # Editor shutdown may notify the page. Mark closing before any child
         # widgets disappear so that notification cannot redraw dead controls.
         self.request_close()
+        if self._close_after_plan_save:
+            return
         destroy_tk_widget(self)
 
 
@@ -2054,6 +2085,7 @@ class _CollectionPlanEditor(tk.Toplevel):
         self.applied = False
         self._closed = False
         self._saving = False
+        self._committing = False
         self._generation = 0
         self._cancel = threading.Event()
         self._after_ids: set[str] = set()
@@ -2139,10 +2171,9 @@ class _CollectionPlanEditor(tk.Toplevel):
             row=1, column=0, columnspan=2, sticky="ew", pady=(3, 0))
         ttk.Label(footer, text=f"新方案另存目录：{PLAN_DIRECTORY}", style="Muted.TLabel", wraplength=860).grid(
             row=2, column=0, columnspan=2, sticky="ew", pady=(3, 7))
-        self.save_button = ttk.Button(footer, text="另存并应用新方案", style="Primary.TButton", command=self.save)
-        self.save_button.grid(row=3, column=0, sticky="e", padx=(0, 8))
-        self.cancel_button = ttk.Button(footer, text="取消", command=self.close)
-        self.cancel_button.grid(row=3, column=1, sticky="e")
+        actions = DialogActions(footer, save=self.save, cancel=self.close, save_text="另存并应用新方案")
+        actions.grid(row=3, column=0, columnspan=2, sticky="ew")
+        self.save_button, self.cancel_button = actions.buttons["save"], actions.buttons["cancel"]
         for variable in (*self.city_vars.values(), *self.salary_vars.values(),
                          *(variable for group in self.experience_vars.values() for variable in group.values())):
             self._traces.append((variable, variable.trace_add("write", self._changed)))
@@ -2261,6 +2292,7 @@ class _CollectionPlanEditor(tk.Toplevel):
             else:
                 widget.state(["disabled"] if self._saving else ["!disabled"])
         self.save_button.state(["disabled"] if self._saving else ["!disabled"])
+        self.cancel_button.state(["disabled"] if self._committing else ["!disabled"])
 
     def save(self) -> None:
         if self._closed or self._saving:
@@ -2270,34 +2302,60 @@ class _CollectionPlanEditor(tk.Toplevel):
         self._generation += 1
         self._cancel_count_callback()
         self._render_saving()
-        self.status_text.set("正在校验并另存唯一的新方案；不会覆盖原文件，也不会启动采集。")
+        self.status_text.set("正在校验草稿；此时可取消。校验通过后进入不可取消的保存提交。")
+        generation = self._generation
 
         def work() -> None:
-            value: dict[str, Any] = {"editor": self, "error": None}
+            value: dict[str, Any] = {"editor": self, "generation": generation, "error": None}
             try:
                 candidate = _validated_page_config(plans.update_plan_config(base, **inputs))
                 if self._cancel.is_set():
                     return
-                value["path"] = plans.save_plan_config(candidate, PLAN_DIRECTORY)
                 value["config"] = candidate
             except Exception as error:
                 value["error"] = redact_log(error)
-            self.page._emit("plan_editor_saved", value)
+            self.page._emit("plan_editor_commit" if value["error"] is None else "plan_editor_saved", value)
         self.page._spawn("collection-plan-save", work)
+
+    def begin_commit(self, value: dict[str, Any]) -> None:
+        """Tk accepts the commit before any file is published by the worker."""
+        if (self._closed or self._committing or not self._saving or self._cancel.is_set()
+                or value["generation"] != self._generation):
+            return
+        self._committing = True
+        self._render_saving()
+        self.status_text.set("正在提交保存新方案；提交完成前不能取消或关闭，完成后会应用方案。")
+
+        def work() -> None:
+            saved = {**value}
+            try:
+                saved["path"] = plans.save_plan_config(saved["config"], PLAN_DIRECTORY)
+            except Exception as error:
+                saved["error"] = redact_log(error)
+            self.page._emit("plan_editor_saved", saved)
+        self.page._spawn("collection-plan-commit", work)
 
     def receive_saved(self, value: dict[str, Any]) -> None:
         if self._closed:
             return
+        self._committing = False
         if value["error"]:
             self._saving = False
             self._render_saving()
             self.status_text.set("未另存或应用：" + value["error"])
             self._changed()
+            self._finish_deferred_page_close()
             return
         self.page._apply_loaded_plan(value["path"], value["config"])
         self.page.status_text.set("已另存并应用新方案；请查看检索组合预览，明确点击“开始 / 续采”才会采集。")
         self.applied = True
         self.close()
+        self._finish_deferred_page_close()
+
+    def _finish_deferred_page_close(self) -> None:
+        if self.page._close_after_plan_save:
+            self.page._close_after_plan_save = False
+            self.page.request_close()
 
     def _dispose(self) -> None:
         self._closed = True
@@ -2319,6 +2377,9 @@ class _CollectionPlanEditor(tk.Toplevel):
     def close(self) -> None:
         if self._closed:
             return
+        if self._committing:
+            self.status_text.set("正在提交保存新方案；提交完成前不能取消或关闭，完成后会应用方案。")
+            return
         self._dispose()
         self.page._editor_closed(self)
         self.destroy()
@@ -2331,4 +2392,7 @@ class _CollectionPlanEditor(tk.Toplevel):
                 variable.release()
 
     def destroy(self) -> None:
+        if self._committing:
+            self.close()
+            return
         destroy_tk_widget(self)

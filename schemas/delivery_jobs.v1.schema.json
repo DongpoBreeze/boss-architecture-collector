@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://boss-architecture-collector.local/schemas/delivery_jobs.v1.schema.json",
   "title": "Independent BOSS delivery jobs v1",
-  "description": "Only the current confirmed final keep set from import, shortlist, fetch-jd and llm. job_key is stable for the same task record across exports; job_id is the task-local source identity and is never a BOSS target id. Duplicate BOSS targets are blocked in full; no raw source paths, provider data or report fields are allowed.",
+  "description": "Only the current confirmed final keep set from import, shortlist, fetch-jd and llm. Existing AI review fields are copied as records with validation=not_checked; their contents, status, format, identity and signatures do not decide export eligibility. Null, blank and empty optional values may be omitted; empty jobs and blocked_jobs lists may be absent. job_key is stable for the same task record across exports; job_id is the task-local source identity and is never a BOSS target id. Duplicate BOSS targets are blocked in full; no raw source paths, provider data or report fields are allowed.",
   "type": "object",
   "additionalProperties": false,
   "required": [
@@ -10,9 +10,7 @@
     "export_id",
     "generated_at",
     "source_task",
-    "summary",
-    "jobs",
-    "blocked_jobs"
+    "summary"
   ],
   "properties": {
     "schema_version": {
@@ -33,7 +31,6 @@
       "required": [
         "task_id",
         "name",
-        "city",
         "track",
         "created_at",
         "review_revision",
@@ -143,24 +140,8 @@
       "required": [
         "job_key",
         "job_id",
-        "boss_job_id",
-        "job_url",
-        "title",
-        "company",
-        "city",
-        "location",
-        "district",
-        "business_district",
-        "address",
-        "salary",
-        "experience",
-        "education",
-        "skills",
-        "job_labels",
-        "jd",
         "ai_review",
-        "selection",
-        "navigation"
+        "selection"
       ],
       "properties": {
         "job_key": {
@@ -192,6 +173,41 @@
           ]
         },
         "company": {
+          "description": "Company name from explicit company fields or the known legacy API brandName mapping; never an unverified recruiter name.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "encrypt_brand_id": {
+          "description": "Original encrypted company ID; may contain trailing ~ padding and is never a job target ID.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9_~-]{0,127}$"
+        },
+        "company_link": {
+          "description": "Original BOSS company detail URL without query strings, fragments or credentials.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "pattern": "^https?://(?:[a-z0-9-]+\\.)*zhipin\\.com(?::(?:80|443))?/gongsi/[A-Za-z0-9][A-Za-z0-9_~-]{0,127}\\.html$"
+        },
+        "company_industry": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "company_scale": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "company_stage": {
           "type": [
             "string",
             "null"
@@ -234,6 +250,7 @@
           ]
         },
         "experience": {
+          "description": "Original job experience requirement from an explicit experience field or an unambiguous list label; never a search filter or an inference from the JD.",
           "type": [
             "string",
             "null"
@@ -277,10 +294,7 @@
           "type": "object",
           "additionalProperties": false,
           "required": [
-            "format",
             "status",
-            "judgment",
-            "reason",
             "validation"
           ],
           "properties": {
@@ -288,31 +302,17 @@
               "type": [
                 "string",
                 "null"
-              ],
-              "enum": [
-                "simple-v1",
-                null
               ]
             },
             "status": {
+              "description": "The recorded textual status; missing denotes no review and invalid denotes an unreadable status. Export does not certify success.",
               "type": "string",
-              "enum": [
-                "success",
-                "failed",
-                "missing",
-                "invalid"
-              ]
+              "minLength": 1
             },
             "judgment": {
               "type": [
                 "string",
                 "null"
-              ],
-              "enum": [
-                "符合",
-                "不符合",
-                "信息不足",
-                null
               ]
             },
             "reason": {
@@ -322,8 +322,10 @@
               ]
             },
             "validation": {
+              "description": "New exports use not_checked. Earlier validation values remain readable for existing v1 exports.",
               "type": "string",
               "enum": [
+                "not_checked",
                 "input_match",
                 "missing_review",
                 "review_failed",
@@ -346,8 +348,7 @@
             "stage",
             "confirmed",
             "keep",
-            "source",
-            "manual_keep"
+            "source"
           ],
           "properties": {
             "stage": {
@@ -384,14 +385,6 @@
         "navigation": {
           "type": "object",
           "additionalProperties": false,
-          "required": [
-            "original_job_url",
-            "lid",
-            "ka",
-            "from",
-            "security_id",
-            "encrypt_boss_id"
-          ],
           "properties": {
             "original_job_url": {
               "type": [
@@ -431,6 +424,7 @@
       },
       "anyOf": [
         {
+          "required": ["boss_job_id"],
           "properties": {
             "boss_job_id": {
               "type": "string",
@@ -439,6 +433,7 @@
           }
         },
         {
+          "required": ["job_url"],
           "properties": {
             "job_url": {
               "type": "string",
@@ -454,24 +449,8 @@
       "required": [
         "job_key",
         "job_id",
-        "boss_job_id",
-        "job_url",
-        "title",
-        "company",
-        "city",
-        "location",
-        "district",
-        "business_district",
-        "address",
-        "salary",
-        "experience",
-        "education",
-        "skills",
-        "job_labels",
-        "jd",
         "ai_review",
         "selection",
-        "navigation",
         "blocked_reasons"
       ],
       "properties": {
@@ -504,6 +483,41 @@
           ]
         },
         "company": {
+          "description": "Company name from explicit company fields or the known legacy API brandName mapping; never an unverified recruiter name.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "encrypt_brand_id": {
+          "description": "Original encrypted company ID; may contain trailing ~ padding and is never a job target ID.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9_~-]{0,127}$"
+        },
+        "company_link": {
+          "description": "Original BOSS company detail URL without query strings, fragments or credentials.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "pattern": "^https?://(?:[a-z0-9-]+\\.)*zhipin\\.com(?::(?:80|443))?/gongsi/[A-Za-z0-9][A-Za-z0-9_~-]{0,127}\\.html$"
+        },
+        "company_industry": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "company_scale": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "company_stage": {
           "type": [
             "string",
             "null"
@@ -546,6 +560,7 @@
           ]
         },
         "experience": {
+          "description": "Original job experience requirement from an explicit experience field or an unambiguous list label; never a search filter or an inference from the JD.",
           "type": [
             "string",
             "null"
@@ -589,10 +604,7 @@
           "type": "object",
           "additionalProperties": false,
           "required": [
-            "format",
             "status",
-            "judgment",
-            "reason",
             "validation"
           ],
           "properties": {
@@ -600,31 +612,17 @@
               "type": [
                 "string",
                 "null"
-              ],
-              "enum": [
-                "simple-v1",
-                null
               ]
             },
             "status": {
+              "description": "The recorded textual status; missing denotes no review and invalid denotes an unreadable status. Export does not certify success.",
               "type": "string",
-              "enum": [
-                "success",
-                "failed",
-                "missing",
-                "invalid"
-              ]
+              "minLength": 1
             },
             "judgment": {
               "type": [
                 "string",
                 "null"
-              ],
-              "enum": [
-                "符合",
-                "不符合",
-                "信息不足",
-                null
               ]
             },
             "reason": {
@@ -634,8 +632,10 @@
               ]
             },
             "validation": {
+              "description": "New exports use not_checked. Earlier validation values remain readable for existing v1 exports.",
               "type": "string",
               "enum": [
+                "not_checked",
                 "input_match",
                 "missing_review",
                 "review_failed",
@@ -658,8 +658,7 @@
             "stage",
             "confirmed",
             "keep",
-            "source",
-            "manual_keep"
+            "source"
           ],
           "properties": {
             "stage": {
@@ -696,14 +695,6 @@
         "navigation": {
           "type": "object",
           "additionalProperties": false,
-          "required": [
-            "original_job_url",
-            "lid",
-            "ka",
-            "from",
-            "security_id",
-            "encrypt_boss_id"
-          ],
           "properties": {
             "original_job_url": {
               "type": [

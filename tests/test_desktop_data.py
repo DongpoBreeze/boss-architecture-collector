@@ -3,16 +3,19 @@ import copy
 import csv
 import io
 import json
+import os
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
 
 import desktop_data as data  # noqa: E402
+import checkpoint_io  # noqa: E402
 
 
 class DataTestCase(unittest.TestCase):
@@ -55,6 +58,31 @@ class DataTestCase(unittest.TestCase):
 
 
 class RunResultsTests(DataTestCase):
+    @unittest.skipUnless(os.name == "nt", "Windows shared checkpoint reads")
+    def test_result_browser_reader_does_not_block_checkpoint_replacement(self):
+        target = self.write_json("run/prepared/jd_shortlists/detail_batches/details_0001.json",
+                                 [{"job_id": "saved", "jd": "旧的完整正文"}])
+        replacement = self.write_json("replacement.json", [{"job_id": "saved", "jd": "新的完整正文"}])
+        open_read = checkpoint_io.open_shared_read
+
+        def open_and_publish(path):
+            handle = open_read(path)
+            try:
+                checkpoint_io.replace_with_retry(replacement, path)
+            except BaseException:
+                handle.close()
+                raise
+            return handle
+
+        warnings = []
+        with patch.object(checkpoint_io, "open_shared_read", side_effect=open_and_publish), \
+             patch.object(checkpoint_io.time, "sleep", side_effect=AssertionError("result browser blocked publication")):
+            saved = data._read_json(target, warnings)
+        self.assertEqual(saved.state, "valid")
+        self.assertEqual(saved.value[0]["jd"], "旧的完整正文")
+        self.assertEqual(checkpoint_io.read_json(target)[0]["jd"], "新的完整正文")
+        self.assertEqual(warnings, [])
+
     def test_full_fifty_index_is_authoritative_not_thirty_five_pool(self):
         jobs = self.make_fifty()
         self.manifest({"status": "partial", "classification_counts": {"重点投递": 999}})
@@ -242,6 +270,190 @@ class RunResultsTests(DataTestCase):
         result = data.load_run_results(self.root / "run")
         self.assertIsNone(result["summary"]["total"])
         self.assertIn("JSON 无效", "；".join(result["warnings"]))
+
+
+class CompanyNameTests(DataTestCase):
+    @staticmethod
+    def legacy(**changes):
+        return {"salary_source": "api", "boss_name": "历史 API 公司",
+                "company_scale": "100-499人", "company_stage": "", "company_industry": "软件",
+                "encrypt_brand_id": "", "company_link": "", **changes}
+
+    def test_explicit_names_objects_and_aliases_have_priority(self):
+        cases = [
+            ({"company": " 正式公司 ", "company_name": "其他名称"}, ("正式公司", "company")),
+            ({"company": {"name": "", "full_name": "完整公司名称"}}, ("完整公司名称", "company.full_name")),
+            ({"company": {"name": None, "full_name": 42}, "companyName": "驼峰公司"}, ("驼峰公司", "companyName")),
+            ({"brandName": "品牌公司"}, ("品牌公司", "brandName")),
+            ({"companyFullName": "完整名称"}, ("完整名称", "companyFullName")),
+            ({"company_short_name": "公司简称"}, ("公司简称", "company_short_name")),
+            ({"companyInfo": {"fullName": "公司对象"}}, ("公司对象", "companyInfo.fullName")),
+            ({"brand_info": {"short_name": "品牌简称"}}, ("品牌简称", "brand_info.short_name")),
+        ]
+        for explicit, expected in cases:
+            with self.subTest(explicit=explicit):
+                row = self.legacy(**explicit)
+                before = copy.deepcopy(row)
+                self.assertEqual(data.company_name_source(row), expected)
+                self.assertEqual(row, before)
+
+    def test_only_string_names_are_accepted(self):
+        for invalid in (None, 42, True, [], {}, {"name": None, "full_name": 42, "company_name": []}):
+            with self.subTest(invalid=invalid):
+                self.assertEqual(data.company_name_source({"company": invalid, "boss_name": "招聘者"}), ("", None))
+        for invalid_source in ([], {}, 42, None):
+            with self.subTest(source=invalid_source):
+                self.assertEqual(data.company_name_source({"company": "明确公司", "company_name_source": invalid_source}),
+                                 ("明确公司", "company"))
+
+    def test_legacy_api_shape_allows_empty_brand_id_link_and_funding(self):
+        for salary_source in ("api", "api_empty"):
+            with self.subTest(source=salary_source):
+                self.assertEqual(data.company_name_source(self.legacy(salary_source=salary_source)),
+                                 ("历史 API 公司", "legacy_api_boss_name"))
+
+    def test_legacy_api_shape_requires_every_string_metadata_field(self):
+        for key in ("company_scale", "company_stage", "company_industry", "encrypt_brand_id", "company_link"):
+            row = self.legacy()
+            del row[key]
+            self.assertEqual(data.company_name_source(row), ("", None), key)
+            for invalid in (None, 42, True, [], {}):
+                with self.subTest(key=key, invalid=invalid):
+                    self.assertEqual(data.company_name_source(self.legacy(**{key: invalid})), ("", None))
+
+    def test_dom_unknown_sources_and_invalid_recruiter_values_never_supply_company(self):
+        for source in ("dom_untrusted", "dom", "API", "api ", "", None, [], {}):
+            with self.subTest(source=source):
+                self.assertEqual(data.company_name_source(self.legacy(salary_source=source)), ("", None))
+        for boss_name in (None, 42, True, [], {}, " \t "):
+            with self.subTest(boss_name=boss_name):
+                self.assertEqual(data.company_name_source(self.legacy(boss_name=boss_name)), ("", None))
+
+    def test_normalized_provenance_is_stable_and_explicit_alias_overrides_inference(self):
+        inferred = self.legacy(company="恢复公司", company_name_source="legacy_api_boss_name")
+        self.assertEqual(data.company_name_source(inferred), ("恢复公司", "legacy_api_boss_name"))
+        self.assertEqual(data.company_name_source({**inferred, "brandName": "明确品牌"}), ("明确品牌", "brandName"))
+        normalized = {"company": "公司对象", "company_name_source": "companyInfo.fullName"}
+        self.assertEqual(data.company_name_source(normalized), ("公司对象", "companyInfo.fullName"))
+        self.assertEqual(data.company_name_source(self.legacy(company="", company_name_source="unavailable")), ("", None))
+
+    def test_readonly_browser_search_details_and_csv_use_recovered_name(self):
+        self.manifest()
+        row = self.legacy(job_id="old", title="企业架构师")
+        source = self.index([row])
+        before = source.read_bytes()
+        jobs = data.load_run_results(self.root / "run")["jobs"]
+        self.assertEqual(jobs, [row])
+        self.assertEqual(data.filter_jobs(jobs, search="历史 API 公司"), jobs)
+        self.assertIn("公司：历史 API 公司", data.format_job_detail(jobs[0]))
+        path = data.export_jobs(self.root / "legacy.csv", jobs)
+        exported = list(csv.DictReader(io.StringIO(path.read_text(encoding="utf-8-sig"))))
+        self.assertEqual(exported[0]["company"], "历史 API 公司")
+        self.assertEqual(source.read_bytes(), before)
+        self.assertEqual(jobs, [row])
+
+
+class ExperienceSourceTests(DataTestCase):
+    def test_explicit_aliases_take_priority_and_preserve_trimmed_wording(self):
+        cases = [
+            ({"experience": " 1 - 3 年 ", "job_experience": "5-10年", "tags": "10年以上 | 本科"},
+             ("1 - 3 年", "experience")),
+            ({"experience": "", "job_experience": " 经验不限 ", "jobExperience": "3-5年"},
+             ("经验不限", "job_experience")),
+            ({"experience": None, "job_experience": {}, "jobExperience": " 在校/应届 "},
+             ("在校/应届", "jobExperience")),
+            ({"experience": " 不限 ", "tags": "1-3年 | 本科"}, ("不限", "experience")),
+        ]
+        for row, expected in cases:
+            with self.subTest(row=row):
+                before = copy.deepcopy(row)
+                self.assertEqual(data.experience_source(row), expected)
+                self.assertEqual(row, before)
+
+    def test_common_complete_labels_are_recovered_without_reformatting(self):
+        labels = ("1-3年", "3-5年", "5-10年", "10年以上", "10年+", "1年以内", "经验不限",
+                  "在校/应届", "在校生/应届生/无经验", "无经验", "应届生", "在校生", "1～3年",
+                  "3至5年", "5—10年", "10 年 ＋", "1 年以下", "在校 ／ 应届生", "1 - 3 年")
+        for field in ("tags", "tags_list", "experience_tags", "job_labels"):
+            for label in labels:
+                with self.subTest(field=field, label=label):
+                    self.assertEqual(data.experience_source({field: f" 本科 | {label} | 五险一金 "}), (label, field))
+                    self.assertEqual(data.experience_source({field: ["本科", f" {label} ", "五险一金"]}), (label, field))
+
+    def test_explicit_separators_and_duplicate_same_labels_are_safe(self):
+        for separator in (" | ", "｜", ",", "，", ";", "；", "、", "\n", "\r\n"):
+            with self.subTest(separator=separator):
+                self.assertEqual(data.experience_source({"tags": f"本科{separator}1-3年{separator}五险一金"}),
+                                 ("1-3年", "tags"))
+        self.assertEqual(data.experience_source({"tags": " 1-3年 | 1-3年 | 本科 ", "job_labels": ["1-3年", "本科"]}),
+                         ("1-3年", "tags"))
+
+    def test_multiple_distinct_tag_values_stay_unknown_even_across_fields(self):
+        for row in ({"tags": "1-3年 | 3-5年 | 本科"},
+                    {"job_labels": ["经验不限", "1-3年", "本科"]},
+                    {"tags": "在校/应届 | 本科", "experience_tags": "1年以内"},
+                    {"tags": "1 - 3 年", "tags_list": ["1-3年"]}):
+            with self.subTest(row=row):
+                self.assertEqual(data.experience_source(row), ("", None))
+                self.assertEqual(data.experience_source({**row, "jobExperience": "3-5年"}), ("3-5年", "jobExperience"))
+
+    def test_education_descriptions_skills_jd_filters_and_numeric_codes_are_not_experience(self):
+        labels = ("不限", "本科", "学历不限", "本科 | 不限", "技能不限", "要求1-3年相关经验", "工作经验1-3年",
+                  "具备3-5年经验优先", "公司成立10年以上", "3-5年发展规划", "在校/应届优先", "Python 3-5年",
+                  "1-3年 本科", "105", "经验：1-3年")
+        for label in labels:
+            with self.subTest(label=label):
+                self.assertEqual(data.experience_source({"tags": label, "job_labels": [label]}), ("", None))
+        row = {"title": "1-3年", "jd": "任职要求：具备3-5年工作经验。", "description": "5-10年",
+               "skills": ["1-3年"], "skill_tags": ["3-5年"], "experience_filter": "经验不限", "experience_id": "105",
+               "filters": {"experience": "1-3年"},
+               "observed_in": [{"experience_filter": "1-3年", "experience_id": "1_3"}]}
+        self.assertEqual(data.experience_source(row), ("", None))
+        for invalid in (None, 105, "105", " 105 ", "０１０５", True, [], {}, ["1-3年"]):
+            for field in ("experience", "job_experience", "jobExperience"):
+                with self.subTest(field=field, invalid=invalid):
+                    self.assertEqual(data.experience_source({field: invalid}), ("", None))
+        for invalid in (None, 105, True, {}, {"name": "1-3年"}, [["1-3年"]]):
+            self.assertEqual(data.experience_source({"tags": invalid}), ("", None))
+
+    def test_provenance_retains_quality_and_blocks_later_mixed_tag_inference(self):
+        normalized = {"experience": "1-3年", "experience_source": "tags", "job_labels": ["3-5年"]}
+        self.assertEqual(data.experience_source(normalized), ("1-3年", "tags"))
+        self.assertEqual(data.experience_source({**normalized, "jobExperience": "10年以上"}), ("10年以上", "jobExperience"))
+        self.assertEqual(data.experience_source({"experience": "1-3年", "experience_source": "jobExperience"}),
+                         ("1-3年", "jobExperience"))
+        for marker in ("unavailable", None, [], {}):
+            row = {"experience": "", "experience_source": marker, "tags": "1-3年 | 本科"}
+            self.assertEqual(data.experience_source(row), ("", None))
+            self.assertEqual(data.experience_source({**row, "jobExperience": "不限"}), ("不限", "jobExperience"))
+
+    def test_result_reader_and_detail_remain_readonly_and_show_alias_with_education(self):
+        self.manifest()
+        rows = [{"job_id": "explicit", "jobExperience": "3-5年", "tags": "本科 | 五险一金"},
+                {"job_id": "legacy", "tags": "经验不限 | 本科"}]
+        path = self.index(rows)
+        before = path.read_bytes()
+        jobs = data.load_run_results(self.root / "run")["jobs"]
+        self.assertEqual(jobs, rows)
+        self.assertIn("经验/学历：3-5年；本科 | 五险一金", data.format_job_detail(jobs[0]))
+        self.assertIn("经验/学历：经验不限", data.format_job_detail(jobs[1]))
+        self.assertEqual([data.experience_source(job)[0] for job in jobs], ["3-5年", "经验不限"])
+        self.assertEqual(jobs, rows)
+        self.assertEqual(path.read_bytes(), before)
+
+    def test_csv_projects_shared_experience_while_json_keeps_original_rows(self):
+        rows = [{"job_id": "legacy", "tags": "1-3年 | 本科"},
+                {"job_id": "alias", "jobExperience": " 经验不限 "},
+                {"job_id": "unknown", "tags": "本科 | 不限"},
+                {"job_id": "code", "experience": "105"}]
+        before = copy.deepcopy(rows)
+        path = data.export_jobs(self.root / "experience.csv", rows)
+        reader = csv.DictReader(io.StringIO(path.read_text(encoding="utf-8-sig")))
+        self.assertIn("experience", reader.fieldnames)
+        self.assertEqual([row["experience"] for row in reader], ["1-3年", "经验不限", "", ""])
+        json_path = data.export_jobs(self.root / "experience.json", rows)
+        self.assertEqual(json.loads(json_path.read_text(encoding="utf-8"))["jobs"], rows)
+        self.assertEqual(rows, before)
 
 
 class HistoryTests(DataTestCase):

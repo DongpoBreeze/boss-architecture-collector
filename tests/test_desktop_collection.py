@@ -367,17 +367,17 @@ class CollectionHelpersTests(unittest.TestCase):
         self.assertEqual(output.read_bytes(), before)
         self.assertEqual(collector.record_for(manifest, completed["combination"]), done_record)
 
-    def test_stop_does_not_overwrite_a_preexisting_checkpoint_or_demote_done_combination(self):
+    def test_stop_unions_a_preexisting_checkpoint_without_demoting_done_combination(self):
         spec = self.specs[0]
         self.manifest([], [spec["combination"]])
         output = self.root / "raw" / spec["track"] / spec["city_id"] / f"{spec['combination']}.json"
         checkpoint = self.root / "checkpoints" / f"{spec['combination']}.partial.json"
         write_json(output, {"jobs": [{"id": "new"}]})
         write_json(checkpoint, {"jobs": [{"id": "old-checkpoint"}]})
-        before = checkpoint.read_bytes()
         result = ui.CommandResult(-15, 111, spec["combination"])
         ui.preserve_interrupted_combination(self.root, self.specs, 10, result, "stopped", "2026-10-21", lambda _: None)
-        self.assertEqual(checkpoint.read_bytes(), before)
+        self.assertEqual(collector.read_json(checkpoint)["jobs"], [{"id": "new"}, {"id": "old-checkpoint"}])
+        self.assertEqual(collector.read_json(output)["jobs"], collector.read_json(checkpoint)["jobs"])
         path = self.root / "collection_manifest.json"
         before_manifest = path.read_bytes()
         result.completed.add(spec["combination"])
@@ -1492,7 +1492,6 @@ class CollectionTkTests(unittest.TestCase):
             raw_before[raw] = raw.read_bytes()
         existing = self.output / "checkpoints" / f"{active[1]['combination']}.partial.json"
         write_json(existing, {"jobs": [{"id": "older-checkpoint"}]})
-        existing_before = existing.read_bytes()
         chrome, edge = [FakeProcess(f"RUN {spec['combination']} (now), pages=10\n[{index + 2}/10 页] 本页1条\n")
                         for index, spec in enumerate(active)]
         self.attach_browsers({"chrome": chrome, "edge": edge})
@@ -1509,12 +1508,15 @@ class CollectionTkTests(unittest.TestCase):
             record = collector.record_for(manifest, spec["combination"])
             self.assertEqual((record["status"], record["pages_completed"], record["desktop_interruption"]), ("paused", index + 2, "paused"))
             self.assertTrue(Path(record["checkpoint"]).is_file())
-        self.assertEqual(existing.read_bytes(), existing_before)
+        self.assertEqual(collector.read_json(existing)["jobs"], [{"id": "partial-1"}, {"id": "older-checkpoint"}])
         self.assertEqual(collector.record_for(manifest, done["combination"]), done)
         self.assertEqual(manifest["expected_combinations"], [spec["combination"] for spec in self.specs])
         self.assertEqual(page._snapshot["counts"]["paused"], 2)
-        for path, before in raw_before.items():
-            self.assertEqual(path.read_bytes(), before)
+        for index, (path, before) in enumerate(raw_before.items()):
+            if index == 0:
+                self.assertEqual(path.read_bytes(), before)
+            else:
+                self.assertEqual(collector.read_json(path)["jobs"], collector.read_json(existing)["jobs"])
         self.assertTrue(all(process.terminated for process in (chrome, edge)))
         self.assertFalse(lock_path.exists())
 

@@ -9,16 +9,19 @@
 | 桌面入口 | `desktop_app.py`、`run_desktop.*` | 默认同窗三个模块，后处理只展示四步；旧工作台通过 `--legacy-workbench` 启用 |
 | 独立采集页面 | `desktop_collection.py` | 编辑与预览方案、Chrome / Edge 并发分片、进程所有权、人工验证与汇总进度；不自动执行后处理 |
 | 采集与方案 | `collect_architecture.py`、`collection_plan.py`、`collection_sources.py` | 组合展开、原始采集续跑、不可变方案及历史来源映射 |
-| 列表等待适配 | `collection_runtime.py` | 在运行时为已识别的上游翻页等待应用本次范围，不修改上游源文件或其他等待 |
+| 列表采集适配 | `collection_runtime.py` | 在内存中适配上游翻页等待、独立公司名称及招聘经验字段，不修改上游源文件或其他等待 |
 | 手动审核界面 | `desktop_review_ui.py` | 运行与确认分开，后台执行，界面从持久化结果展示统计 |
 | 审核存储与执行 | `desktop_tasks.py`、`review_pipeline.py` | 固定源、四步审核、版本化检查点和进程所有权；清单保留旧五键兼容 |
 | 投递预览与导出 | `desktop_delivery.py`、`delivery_export.py`、`schemas/delivery_jobs.v1.schema.json` | 只读已确认最终名单，白名单快照、目标阻断、schema 校验与原子发布 |
 | 处理与规则 | `process_architecture.py`、`screening_policy.py` | 去重、初筛、证据、薪资和经验硬规则、最终分层与报告 |
 | 模型缓存 | `review_cache.py` | CLI / 桌面共用签名，区分当前有效记录与历史结果；报告只做离线输入校验 |
 | 任务复核规则 | `review_rules.py` | 分离可编辑语义规则与固定输出协议，为任务请求、缓存和报告提供一致提示词 |
+| 非 AI 阶段规则 | `stage_rules.py` | 导入、初筛、JD 的字段描述、默认值及严格校验；任务本地参数不增加模型调用 |
 | 外部执行适配 | `browser_setup.py`、`jd_parallel.py`、`llm_client.py` | 专用浏览器启动、有限并发、检查点、请求失败和人工验证；不投递、不绕过验证 |
+| 检查点文件访问 | `checkpoint_io.py` | Windows 共享只读句柄与原生原子替换、有界可取消退避；实时读取不阻断快照发布 |
 | 只读展示与兼容 | `desktop_data.py`、`desktop_theme.py`、`desktop_preferences.py`、`desktop_ui.py`、`desktop_routing.py` | 共享数据、主题与白名单偏好；旧工作台保留偏好接口兼容 |
 | Tk 生命周期 | `desktop_tk_lifecycle.py` | 在创建窗口的线程释放变量、图标及已销毁控件的 Tcl 引用，避免后台垃圾回收跨线程释放解释器 |
+| 共同 UI 控件 | `desktop_controls.py` | 三页共享动作栏、搜索快捷键、审核 / 导出分页、只读详情及按 DPI 换行的操作行 |
 | 资源与发布 | `project_resources.py`、`boss_architecture_resources/`、`pyproject.toml` | 源码资源与已安装只读资源定位、构建精确白名单、默认可写状态目录 |
 | 离线历史回测 | `rescreen_saved_run.py` | 复用已保存岗位/JD/模型记录，不请求服务，不覆盖原运行 |
 
@@ -45,6 +48,8 @@ python -B delivery_export.py --help
 - 离线测试通过不代表真实 BOSS 登录、网站并发稳定性、模型授权或桌面截图视觉效果已经验收。
 - JD 自动准备与审核界面“准备浏览器”共用 `browser_setup.py`，直接启动本机 Chrome / Edge 并打开 BOSS 窗口，不将本项目的 `--profile-dir` / `--setup-browser` 参数传给上游。准备按钮只确认窗口启动命令与 CDP 连接，不表示 BOSS 已登录；自动补抓仅用上游支持的 `--check --cdp-port` 检查登录，失败后显示窗口并暂停，保留 JD 检查点，不循环探测验证页。
 
+六步审查的全部待修与两项增强已关闭，行为和边界见[审查与修复清单](functional-audit.md)。新增定向入口为 `test_collection_audit_fixes.py`、`test_review_backend_audit.py` 和 `test_desktop_audit_fixes.py`；分别覆盖采集恢复 / Windows 身份、审核配置快照 / JD 状态、实时签名 / 公共界面，必须使用临时数据。并行开发时保留其他功能的工作区改动，集成只对新增风险补测。
+
 ## 可以清理与必须保留的内容
 
 - 可重新生成：`__pycache__/`、`.pytest_cache/`、构建目录和覆盖率输出。这些由 `.gitignore` 排除。
@@ -65,11 +70,23 @@ python -B delivery_export.py --help
 
 默认流程为同窗 `01 岗位采集 → 02 后处理审核（四步） → 03 投递数据导出`。审核以 `llm` 确认收束，默认桌面不调用 `report`。`desktop_tasks.STAGES` 和旧五键 manifest 保持兼容；显式 `process_architecture --stage report`、旧工作台及历史文件不迁移、不删除。
 
-`delivery_export.preview_task(task, cache=ExportCache())` 只捕获当前前四步全部完成且确认的任务，返回 `snapshot_token`、`source_task`、`summary`、`jobs` 与 `blocked_jobs`；summary 的键为 `selected_count / ready_count / blocked_count`。只导出 AI 阶段最终 `keep_ids`，有效人工选择优先；无效目标身份、链接冲突或无效复核记录放入阻断数组。缓存复用未变化的阶段数据，但仍核对当前 manifest、阶段身份和确认快照，不复活兼容 report 的旧增强字段。
+`delivery_export.preview_task(task, cache=ExportCache())` 只捕获当前前四步全部完成且确认的任务，返回 `snapshot_token`、`source_task`、`summary`、`jobs` 与 `blocked_jobs`；summary 的键为 `selected_count / ready_count / blocked_count`。只导出 AI 阶段最终 `keep_ids`，有效人工选择优先；AI 记录只提取和脱敏已有字段，不再验证判断、身份、JD、提示词或签名，统一标为 `validation="not_checked"`，不据此阻断导出。无效目标身份、链接冲突或重复 BOSS 目标仍放入阻断数组。缓存复用未变化的阶段数据，但仍核对当前 manifest、阶段身份和确认快照，不复活兼容 report 的旧增强字段。
 
 `job_id` 是任务内身份；只有 `boss_job_id / encrypt_job_id / encryptJobId` 或有效 BOSS 详情 URL 可证明目标岗位，`encrypt_boss_id / encryptBossId` 仅为招聘者导航值。`job_key` 对同一任务记录的重复导出稳定；可选地区字段缺失不阻断导出。导航字段按显式白名单保留原值，来源链接保留允许的 `lid / ka / from / securityId` 参数，不带未知查询和登录凭据。阻断记录使用 `blocked_reasons: list[str]`。UI 在后台构建搜索索引，分页、筛选和主题切换复用解析结果。
 
-`schemas/delivery_jobs.v1.schema.json` 是稳定 `schema_version="1.0"` 的唯一静态格式源，运行时通过 `resource_path` 读取，使用标准库校验，不新增 JSON Schema 运行依赖。字段白名单明确拒绝本机路径、原始响应和凭据，可选值为 null。唯一目录写入、校验和选择快照复核全部成功后才原子发布 `delivery_jobs.json`，既有导出不可覆盖。默认父目录 `<任务>/delivery-exports`；该目录名在任意深度都被 Git 忽略，发行包继续使用精确白名单排除生成数据。
+导入去重内部保留 `delivery_identity_candidates` 的所有来源定位候选，桥接及重复合并保持候选集合；导出验证定位冲突但不公开该内部字段。AI 复核执行阶段仍沿用其输入和缓存校验，最终导出只遵从已确认的保留决定并保存原有 AI 信息。导出发布事实先于随后的预览刷新保存；刷新失败、来源变化或名单修改时保留成功路径并明确显示为历史，不能把旧来源文件当作当前任务新结果。旧检查点已丢失的候选需重新导入恢复，不自动迁移历史结果。
+
+公司名称统一输出为 `company`。01 的运行时适配从 API 的明确公司字段（如 `brandName`）或 DOM 的公司节点提取名称，招聘者字段不充当公司；合并同岗位时可补齐缺少的公司名。02 新导入在各条来源行进入合并前归一化，避免拼接 DOM / API 字段后生成错误来源证据。`desktop_data.company_name_source` 为下游共享读取入口：显式公司字段优先，仅已知 API 记录形态允许把旧 `boss_name` 解释为公司名。03 只在导出投影中读取这一兼容名称，不改旧任务检查点、确认、人工取舍或模型缓存；有值时 `jobs.company` / `blocked_jobs.company` 进入动态字段目录。
+
+招聘经验统一输出为 `experience`。01 从明确 API 字段或 DOM 列表经验标签采集，同岗合并可补缺；02 逐条来源归一化再去重，保留显式字段优先级及经验来源。`desktop_data.experience_source` 供下游统一读取：显式 `experience` / `job_experience` / `jobExperience` 优先，其次读取完整且无冲突的经验标签。旧标签中的孤立“不限”、学历、技能、检索筛选和 JD 不提供经验依据。03 只读投影至已有 `jobs.experience` / `blocked_jobs.experience` 白名单，不公开内部来源字段，不改变 AI 输入、缓存或确认状态。
+
+`schemas/delivery_jobs.v1.schema.json` 是 `schema_version="1.0"` 的唯一静态格式源，运行时通过 `resource_path` 读取，使用标准库校验，不新增 JSON Schema 运行依赖。输出允许可清理的空值字段缺失，兼容历史稠密完整文件；关键身份、取舍、计数约束仍有效。字段白名单明确拒绝本机路径、原始响应和凭据。唯一目录写入、校验和选择快照复核全部成功后才原子发布 JSON，既有导出不可覆盖。默认父目录 `<任务>/delivery-exports`；该目录名在任意深度都被 Git 忽略，发行包继续使用精确白名单排除生成数据。
+
+`export_field_paths(cache=...)` 保留为静态 Schema 白名单与兼容接口，解析对象引用和对象数组。`available_export_fields(preview, cache=...)` 根据当前预览列出实际非空叶子，按静态白名单排序：对象数组取所有记录的有值字段并集，标量数组作为一个字段，null、空白、空容器不算存在，0 / False 有效；三个生成的根级导出元数据字段始终可用。缺失字段与空岗位组不进入 UI 目录，也不接受未知源字段。
+
+`export_task(..., selected_fields=None)` 导出当前全部有值支持字段；显式非空字段序列先校验白名单，再与动态目录取交集，拒绝未知 / 父级字段和空选择。完整文档先经过严格的规范结构与业务校验，两种输出再递归省略空值、空父容器和空岗位占位，保留非空记录顺序；直接 API 请求的内容全部无值时仍以 `EmptyExportError` 防止创建空文件，桌面目录本身不提供无值字段。写盘内容须与清理后的所选投影完全一致，两种模式共用最终快照复核和原子发布。CLI `--fields` 使用相同接口。
+
+`delivery_export.FIELD_LABELS` 是字段中文名的唯一映射，UI 和文件名共用。`export_filename(..., preview=...)` 按 Schema 顺序取前三个已选且有值叶子字段名，拼成安全的中文 basename；未传预览的旧调用保留静态命名兼容。纯函数 `field_filename(...)` 接受已验证、有序的有效字段供 Tk 无 I/O 展示预计文件名。新文件仍放在唯一的时间戳 / UUID 目录，`is_export_filename(...)` 为打开操作验证新命名及历史 `delivery_jobs.json`。GUI 在后台按快照生成动态目录、精简岗位详情与搜索索引，未变化快照复用结果；复选框只修改主线程草稿。刷新 / 切换任务仅保留仍可用的选择，全部消失时自动采用当前目录；目录变化关闭过期草稿。“导出完整 JSON”不修改所选子集，字段目录与详情精简不改写规范预览或真实任务数据。
 
 导出验收使用临时具名任务及合成岗位，覆盖有效保留 / 人工覆盖 / 阻断、未确认与 stale、来源冲突、内容改写后的缓存失效、发布前并发变化、无敏感字段、schema 与安装态入口。GUI 预览和写盘在后台，Tk 更新在主线程；宿主互斥、关闭清理、当前页 F5 和跨任务刷新沿用原约束。导出不读取模型配置、不重新报告分类、不请求网站或模型；输出只表示审核快照。
 
@@ -108,6 +125,10 @@ wheel 不带构建钩子、源码启动器、岗位数据、导出快照、个�
 `tests/test_packaging.py` 在临时源码副本中实际构建 wheel / sdist、从 sdist 再构建、在独立 venv 安装，并从源码目录外检查四个入口、模块、资源和合成审核任务导出。测试注入伪私有文件验证排除边界，禁止网络连接，核对 Schema 的安装读取、缺失和篡改、源码无效时构建失败，以及新导出的不可覆盖和默认路径。离线测试需要已安装的 `setuptools>=70.1`、pip 与 ensurepip，不会联网安装构建工具。本机验证使用 Windows Python 3.11；Python 3.10 条件依赖有元数据测试，未因此声明其他解释器已实测。
 
 ### 刷新、日志与偏好
+
+初筛在 `runtime/shortlist/prepared/live_shortlist.json` 原子发布已处理前缀，绑定当前 `attempt / input_revision / input_signature`。首次最多 25 项后发布，其后按 0.5 秒节流（从写入结束计时），完成、暂停或失败前发布最新前缀；没有确认或提前写成完整结果。未处理岗位保留为待处理，人工历史决定优先，旧输入或旧 attempt 快照不可参与显示。进度统计仅在对应快照成功发布后通知，避免显示未落盘结果；每 25 项重写整个任务的旧方式不再使用。大名单回归同时检验发布次数、前缀一致性和暂停 / 写入失败，不用机器速度作为断言。
+
+初筛在暂停、停止或失败且尚无有效本轮快照时，仍投影当前输入为待处理，不回显旧轮建议；部分名单始终只读，历史人工选择优先。JD 运行中按当前输入合并已落盘正文，不读取其他任务或扩展输入范围。行组、方向队列交集与搜索在后台准备，Tk 只渲染当前页；通知合并保留捕获序号最大的一份视图，旧刷新不能覆盖较新的最终结果或人工决定。`tests/test_desktop_review_stage_ui.py` 用 6,200 条合成岗位验证实时计数、无变化解析复用、心跳、暂停与最终名单一致，并覆盖无效快照、规则编辑器与小窗口布局。
 
 `TaskViewCache` 仅保留当前任务和仍被引用的阶段文件版本；缓存文件内容及派生搜索索引，不缓存或绕过路径、ID 与人工确认校验。每次仍读取有效 manifest，并检查文件身份、大小和变更时间；Windows 使用系统变更时间检测同大小且恢复 mtime 的外部改写。人工选择变更重建报告审计，未变化的正文可复用。关闭 / 切换任务清理引用，不积累历史 revision。
 

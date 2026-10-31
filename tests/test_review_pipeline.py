@@ -1,6 +1,7 @@
 """Offline integration checks for the fixed-task, manually reviewed pipeline."""
 
 import copy
+import errno
 import io
 import json
 import os
@@ -20,6 +21,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
 
 import project_llm_settings
+import checkpoint_io
 import review_pipeline as pipeline
 import desktop_tasks as task_store
 from desktop_tasks import ReviewTask, STAGES, TaskStateError, job_id
@@ -37,6 +39,16 @@ class PipelineCase(unittest.TestCase):
         self.temporary = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary.cleanup)
         self.folder = Path(self.temporary.name)
+        # Every provider read is confined to this synthetic Codex home, even
+        # when a test replaces only the provider-signature helper.
+        fake_home = self.folder / "synthetic-codex"
+        fake_home.mkdir()
+        (fake_home / "config.toml").write_text(
+            'model_provider = "synthetic"\n[model_providers.synthetic]\n'
+            'base_url = "https://fixture-only.test/v1"\nrequires_openai_auth = false\n', encoding="utf-8")
+        codex_environment = patch.dict(os.environ, {"CODEX_HOME": str(fake_home)})
+        codex_environment.start()
+        self.addCleanup(codex_environment.stop)
         project_settings = self.folder / "missing-project-llm.json"
         self.project_settings_patcher = patch(
             "project_llm_settings.default_settings_path", return_value=project_settings
@@ -217,12 +229,17 @@ class LocalStepsTests(PipelineCase):
         self.assertEqual(self.task.stage_info("import")["status"], "completed")
 
     def test_bad_worker_limits_do_not_mutate_task(self):
+        before = (self.task.path / "task_manifest.json").read_bytes()
         for workers in (0, 33, True):
             with self.subTest(workers=workers), self.assertRaises(ValueError):
-                self.run_step("import", workers=workers)
+                self.run_step("llm", workers=workers)
         for jd_workers in (0, 33, True):
             with self.subTest(jd_workers=jd_workers), self.assertRaises(ValueError):
-                self.run_step("import", jd_workers=jd_workers)
+                self.run_step("fetch-jd", jd_workers=jd_workers)
+        for batch_size in (0, 101, True):
+            with self.subTest(batch_size=batch_size), self.assertRaises(ValueError):
+                self.run_step("fetch-jd", batch_size=batch_size)
+        self.assertEqual((self.task.path / "task_manifest.json").read_bytes(), before)
         self.assertEqual(self.task.stage_info("import")["status"], "pending")
 
     def test_bad_callback_cannot_change_a_committed_stage_to_failed(self):
@@ -456,6 +473,99 @@ class ShortlistQueueTests(PipelineCase):
 
 
 class JDTests(PipelineCase):
+    @unittest.skipUnless(os.name == "nt", "Windows live checkpoint sharing")
+    def test_live_jd_monitor_readers_allow_replace_while_each_checkpoint_handle_is_open(self):
+        runtime = self.task.run_directory("fetch-jd")
+        folder = runtime / "prepared/jd_shortlists"
+        paths = [folder / "details.json", *(folder / "detail_batches" / name for name in
+                 ("details_0001.json", "details_0001.chrome.json", "details_0001.edge.json")),
+                 folder / "details_manifest.json"]
+        old = [{"job_id": "a", "jd": JD, "status": "success"}]
+        for path in paths:
+            self.write(path, {"records": [], "generation": 0} if path.name == "details_manifest.json" else old)
+        native_open = checkpoint_io.open_shared_read
+        observed = []
+
+        def open_and_publish(path):
+            handle = native_open(path)
+            try:
+                observed.append(Path(path))
+                payload = ({"records": [], "generation": 1} if Path(path).name == "details_manifest.json" else
+                           [{"job_id": "a", "jd": JD + "更新", "status": "success"}])
+                pipeline.processor.write_json(Path(path), payload)
+            except BaseException:
+                handle.close()
+                raise
+            return handle
+
+        with patch.object(checkpoint_io, "open_shared_read", side_effect=open_and_publish), \
+             patch.object(checkpoint_io.time, "sleep", side_effect=AssertionError("monitor reader blocked publication")):
+            details, manifest = pipeline._detail_checkpoint(self.task, runtime, [self.original[0]])
+        self.assertCountEqual(observed, paths)
+        self.assertEqual(details["a"]["jd"], JD)
+        self.assertEqual(manifest["generation"], 0)
+        self.assertEqual(pipeline.processor.read_json(paths[-1])["generation"], 1)
+
+    def test_legacy_jd_rules_without_extra_wait_fields_forward_zero_defaults(self):
+        with patch.object(self.task, "get_stage_rules", return_value={"scroll_count": 3, "detail_speed_profile": "fast"}):
+            command = pipeline._process_command(self.task, self.task.run_directory("fetch-jd"),
+                                                "fetch-jd", 10, 30, self.scraper)
+        self.assertEqual(command[command.index("--jd-page-wait-min") + 1], "0")
+        self.assertEqual(command[command.index("--jd-page-wait-max") + 1], "0")
+
+    def test_jd_stage_wait_range_reaches_processor_adapter_manifest_and_stats(self):
+        self.task.set_stage_rules("fetch-jd", {"page_wait_min": 3, "page_wait_max": 30})
+        self.import_and_confirm()
+        self.shortlist_and_confirm()
+        commands = []
+
+        def collect(command, **_kwargs):
+            commands.append(command)
+            rows = self.read(Path(command[command.index("--input") + 1]))["jobs"]
+            self.write(Path(command[command.index("--detail-output") + 1]),
+                       [{"job_id": job_id(row), "jd": JD, "status": "success"} for row in rows])
+            return subprocess.CompletedProcess(command, 0, "离线明细已保存", "")
+
+        def child(task, stage, command, control, emit, monitor):
+            self.assertEqual(stage, "fetch-jd")
+            self.assertEqual(command[command.index("--jd-page-wait-min") + 1], "3")
+            self.assertEqual(command[command.index("--jd-page-wait-max") + 1], "30")
+            with redirect_stdout(io.StringIO()):
+                code = pipeline.processor.main(command[3:])
+            monitor()
+            return code
+
+        with patch.object(pipeline.processor, "ensure_detail_cdp_ready", return_value=(True, None)), \
+             patch.object(pipeline.processor, "run_detail_subprocess", side_effect=collect), \
+             patch.object(pipeline.processor, "run_llm", side_effect=AssertionError("JD must not call a model")), \
+             patch.object(pipeline, "_run_child", side_effect=child):
+            result = self.run_step("fetch-jd", scraper_root=self.scraper)
+        stats = result["stages"]["fetch-jd"]["stats"]
+        manifest = self.read(self.task.run_directory("fetch-jd") / "prepared/jd_shortlists/details_manifest.json")
+        self.assertEqual((stats["page_wait_min"], stats["page_wait_max"]), (3, 30))
+        self.assertEqual((stats["stage_rules"]["page_wait_min"], stats["stage_rules"]["page_wait_max"]), (3, 30))
+        self.assertEqual((manifest["page_wait_min"], manifest["page_wait_max"]), (3, 30))
+        self.assertEqual(len(commands), 1)
+        self.assertEqual(commands[0][commands[0].index("--page-wait-min") + 1], "3")
+        self.assertEqual(commands[0][commands[0].index("--page-wait-max") + 1], "30")
+        self.assertEqual(result["stages"]["fetch-jd"]["status"], "completed")
+        self.assertEqual(stats["jd_success_count"], 3)
+        self.assertTrue(any(kind == "log" and "额外等待 3–30 秒" in value for kind, value in self.events))
+
+    def test_empty_jd_stage_persists_wait_range_without_starting_child(self):
+        self.task.set_stage_rules("fetch-jd", {"page_wait_min": 30, "page_wait_max": 30})
+        self.import_and_confirm(exclude=("a", "b", "c", "d"))
+        self.shortlist_and_confirm()
+        with patch.object(pipeline, "_run_child") as child:
+            result = self.run_step("fetch-jd")
+        child.assert_not_called()
+        stats = result["stages"]["fetch-jd"]["stats"]
+        manifest = self.read(self.task.run_directory("fetch-jd") / "prepared/jd_shortlists/details_manifest.json")
+        self.assertEqual((stats["page_wait_min"], stats["page_wait_max"]), (30, 30))
+        self.assertEqual((manifest["page_wait_min"], manifest["page_wait_max"]), (30, 30))
+        self.assertEqual(stats["jd_success_count"], 0)
+        self.assertEqual(manifest["records"], [])
+
     def test_jd_input_includes_manually_restored_list_reject_and_no_other_ids(self):
         self.import_and_confirm(exclude=("d",))
         self.shortlist_and_confirm(restore=("c",))
@@ -1073,9 +1183,11 @@ class ReviewTests(PipelineCase):
                            if key in {"model", "reasoning_effort", "api_mode"}}
              )) as loader:
             actual = pipeline._provider_hash()
-        loader.assert_called_once_with(model="gpt-5.6-luna", reasoning_effort="max",
-                                       api_mode="responses",
-                                       project_settings_path=project_settings_path)
+        loader.assert_called_once()
+        self.assertEqual({key: loader.call_args.kwargs[key] for key in
+                          ("model", "reasoning_effort", "api_mode", "project_settings_path", "project_settings_snapshot")},
+                         {"model": "gpt-5.6-luna", "reasoning_effort": "max", "api_mode": "responses",
+                          "project_settings_path": project_settings_path, "project_settings_snapshot": None})
         self.assertEqual(actual, provider_signature(replace(local, model="gpt-5.6-luna", reasoning_effort="max")))
         self.assertNotEqual(actual, provider_signature(local))
 
@@ -1105,16 +1217,19 @@ class ReviewTests(PipelineCase):
             )
             changed = pipeline._provider_hash()
 
-        self.assertEqual(loader.call_args_list[0].kwargs, {
+        keys = ("model", "reasoning_effort", "api_mode", "project_settings_path")
+        self.assertEqual({key: loader.call_args_list[0].kwargs[key] for key in keys}, {
             "model": "custom-model", "reasoning_effort": "high",
             "api_mode": "responses",
             "project_settings_path": project_settings_path,
         })
-        self.assertEqual(loader.call_args_list[1].kwargs, {
+        self.assertEqual({key: loader.call_args_list[1].kwargs[key] for key in keys}, {
             "model": "another-custom-model", "reasoning_effort": "max",
             "api_mode": "responses",
             "project_settings_path": project_settings_path,
         })
+        self.assertEqual(loader.call_args_list[0].kwargs["project_settings_snapshot"]["model"], "custom-model")
+        self.assertEqual(loader.call_args_list[1].kwargs["project_settings_snapshot"]["model"], "another-custom-model")
         self.assertEqual(actual, provider_signature(replace(local, model="custom-model", reasoning_effort="high")))
         self.assertNotEqual(actual, changed, "model/effort edits must invalidate the old provider signature")
         self.assertEqual(command[command.index("--model") + 1], "custom-model")
@@ -1793,6 +1908,172 @@ class ChildAndSafetyTests(PipelineCase):
         self.assertEqual(result["stages"]["import"]["status"], "failed")
         all_text = json.dumps(result, ensure_ascii=False) + self.task.path.joinpath("task.log").read_text(encoding="utf-8")
         self.assertNotIn("private-failure-value", all_text)
+
+
+class PathGuardTests(PipelineCase):
+    @unittest.skipUnless(os.name == "nt", "Windows extended namespaces")
+    def test_mixed_dos_prefixes_in_inputs_and_resolutions_are_equivalent(self):
+        base = self.task.path
+        target = base / "runtime" / "llm" / "prepared" / "llm_reviews.jsonl"
+        for base_input in (base, Path("\\\\?\\" + str(base))):
+            for path_input in (target, Path("\\\\?\\" + str(target))):
+                for base_result in (base, Path("\\\\?\\" + str(base))):
+                    for path_result in (target, Path("\\\\?\\" + str(target))):
+                        with self.subTest(base_input=base_input, path_input=path_input,
+                                          base_result=base_result, path_result=path_result):
+                            def resolve(path, *, strict=False):
+                                self.assertTrue(strict)
+                                return base_result if path.name == base.name else path_result
+                            with patch.object(Path, "resolve", autospec=True, side_effect=resolve):
+                                self.assertEqual(pipeline._safe_path(Mock(path=base_input), path_input), path_input)
+
+    @unittest.skipUnless(os.name == "nt", "Windows UNC namespaces")
+    def test_mixed_unc_prefixes_are_equivalent_without_accessing_a_server(self):
+        base = Path(r"\\fixture-server\share\任务")
+        target = base / "runtime" / "llm" / "llm_reviews.jsonl"
+        extended_base = Path(r"\\?\UNC\fixture-server\share\任务")
+        extended_target = extended_base / "runtime" / "llm" / "llm_reviews.jsonl"
+        for base_input in (base, extended_base):
+            for path_input in (target, extended_target):
+                for base_result in (base, extended_base):
+                    for path_result in (target, extended_target):
+                        with self.subTest(base_input=base_input, path_input=path_input,
+                                          base_result=base_result, path_result=path_result):
+                            def resolve(path, *, strict=False):
+                                self.assertTrue(strict)
+                                return base_result if path.name == base.name else path_result
+                            with patch.object(Path, "resolve", autospec=True, side_effect=resolve), \
+                                 patch.object(pipeline, "_reparse", return_value=False):
+                                self.assertEqual(pipeline._safe_path(Mock(path=base_input), path_input), path_input)
+
+    def test_real_parent_escape_and_nominal_external_paths_are_rejected(self):
+        for path in (self.source / "raw/overwrite.json", self.task.path / ".." / "outside.json"):
+            with self.subTest(path=path), patch.object(Path, "resolve", side_effect=AssertionError("must reject lexically")):
+                with self.assertRaisesRegex(pipeline.PipelineError, "路径越界"):
+                    pipeline._safe_path(self.task, path)
+
+    @unittest.skipUnless(os.name == "nt", "Windows device namespaces")
+    def test_device_paths_are_rejected_without_resolving_or_opening_them(self):
+        for path in (Path(r"\\.\C:\task\result.json"),
+                     Path(r"\\?\GLOBALROOT\Device\HarddiskVolume1\task\result.json"),
+                     self.task.path / "NUL"):
+            with self.subTest(path=path), patch.object(Path, "resolve", side_effect=AssertionError("must reject device first")):
+                with self.assertRaisesRegex(pipeline.PipelineError, "无法安全解析或检查"):
+                    pipeline._safe_path(self.task, path)
+
+    @unittest.skipUnless(os.name == "nt", "Windows UNC namespaces")
+    def test_other_unc_server_share_or_task_is_still_outside(self):
+        base = Path(r"\\fixture-server\share\任务")
+        target = base / "runtime" / "llm_reviews.jsonl"
+        for outside in (Path(r"\\fixture-server\other-share\任务\llm_reviews.jsonl"),
+                        Path(r"\\other-server\share\任务\llm_reviews.jsonl"),
+                        Path(r"\\?\UNC\fixture-server\share\其他任务\llm_reviews.jsonl")):
+            with self.subTest(outside=outside):
+                def resolve(path, *, strict=False):
+                    return base if path == base else outside
+                with patch.object(Path, "resolve", autospec=True, side_effect=resolve), \
+                     patch.object(pipeline, "_reparse", return_value=False):
+                    with self.assertRaisesRegex(pipeline.PipelineError, "路径越界"):
+                        pipeline._safe_path(Mock(path=base), target)
+
+    def test_resolved_external_paths_are_not_admitted(self):
+        base = self.task.path
+        target = base / "runtime/llm/prepared/llm_reviews.jsonl"
+        outside = [base.parent / "outside/llm_reviews.jsonl"]
+        if os.name == "nt":
+            outside += [Path("Z:/outside/llm_reviews.jsonl"), Path(r"\\other-server\share\llm_reviews.jsonl")]
+            outside += [Path("\\\\?\\" + str(outside[0])), Path(r"\\?\UNC\other-server\share\llm_reviews.jsonl")]
+        for result in outside:
+            with self.subTest(result=result):
+                def resolve(path, *, strict=False):
+                    return base if path == base else result
+                with patch.object(Path, "resolve", autospec=True, side_effect=resolve):
+                    with self.assertRaisesRegex(pipeline.PipelineError, "路径越界"):
+                        pipeline._safe_path(self.task, target)
+
+    def test_task_directory_intermediate_and_leaf_reparse_checks_are_preserved(self):
+        target = self.task.path / "runtime/llm/prepared/llm_reviews.jsonl"
+        for linked in (self.task.path, target.parent, target):
+            with self.subTest(linked=linked), patch.object(pipeline, "_reparse", side_effect=lambda path: path == linked):
+                with self.assertRaisesRegex(pipeline.PipelineError, "符号链接或目录联接"):
+                    pipeline._safe_path(self.task, target)
+
+    def test_leaf_reparse_attribute_is_rejected_even_when_the_target_is_inside(self):
+        target = self.task.path / "result.json"
+        target.write_text("{}", encoding="utf-8")
+        native_lstat = Path.lstat
+
+        def lstat(path, *args, **kwargs):
+            if path == target:
+                return Mock(st_mode=pipeline.stat.S_IFREG | 0o600, st_file_attributes=0x400)
+            return native_lstat(path, *args, **kwargs)
+
+        with patch.object(Path, "lstat", autospec=True, side_effect=lstat):
+            with self.assertRaisesRegex(pipeline.PipelineError, "符号链接或目录联接"):
+                pipeline._safe_path(self.task, target)
+
+    def test_unresolvable_paths_stop_before_reading_and_do_not_claim_boundary_escape(self):
+        target = self.task.path / "runtime/llm/prepared/llm_reviews.jsonl"
+        for error in (OSError(errno.EIO, "private failure body"), ValueError("invalid path"), RuntimeError("symlink loop")):
+            with self.subTest(error=type(error).__name__), \
+                 patch.object(Path, "resolve", side_effect=error), patch.object(pipeline.processor, "read_json") as read:
+                with self.assertRaisesRegex(pipeline.PipelineError, "无法安全解析或检查") as raised:
+                    pipeline._read_json(self.task, target)
+                self.assertNotIn("路径越界", str(raised.exception))
+                self.assertNotIn("private", str(raised.exception))
+                read.assert_not_called()
+
+    def test_reparse_inspection_access_error_is_not_misreported_as_escape(self):
+        target = self.task.path / "result.json"
+        with patch.object(pipeline, "_reparse", side_effect=PermissionError(errno.EACCES, "private failure body")):
+            with self.assertRaisesRegex(pipeline.PipelineError, "无法安全解析或检查"):
+                pipeline._safe_path(self.task, target)
+
+    def test_path_guard_remains_safe_during_temporary_checkpoint_atomic_replacement(self):
+        target = self.task.run_directory("llm") / "prepared" / "llm_reviews.jsonl"
+        target.parent.mkdir()
+        pipeline.processor.write_jsonl(target, [{"generation": 0, "jd": "完整正文" * 100}])
+        start, stop = threading.Event(), threading.Event()
+        failures, published = [], []
+
+        def publish():
+            try:
+                if not start.wait(5):
+                    raise AssertionError("reader never started")
+                for generation in range(1, 151):
+                    if stop.is_set():
+                        break
+                    pipeline.processor.write_jsonl(target, [{"generation": generation, "jd": "完整正文" * 100}])
+                    published.append(generation)
+            except BaseException as exc:
+                failures.append(exc)
+
+        writer = threading.Thread(target=publish, daemon=True)
+        writer.start()
+        checks, checks_while_writing, snapshots_seen = 0, 0, 0
+        try:
+            start.set()
+            deadline = time.monotonic() + 15
+            while checks < 500 or writer.is_alive():
+                self.assertLess(time.monotonic(), deadline, "synthetic replacement stress timed out")
+                self.assertEqual(pipeline._safe_path(self.task, target), target)
+                # Live readers already tolerate an instant with no published
+                # filename; only a complete readable snapshot is consumed.
+                snapshot = pipeline._read_json(self.task, target)
+                if snapshot is not None:
+                    self.assertEqual(snapshot["jd"], "完整正文" * 100)
+                    snapshots_seen += 1
+                checks += 1
+                checks_while_writing += int(writer.is_alive())
+        finally:
+            stop.set()
+            writer.join(timeout=5)
+        self.assertFalse(writer.is_alive())
+        self.assertEqual(failures, [])
+        self.assertEqual(published, list(range(1, 151)))
+        self.assertGreater(checks_while_writing, 0)
+        self.assertGreater(snapshots_seen, 0)
+        self.assertEqual(checkpoint_io.read_json(target)["generation"], 150)
 
 
 class StageRedoPipelineTests(PipelineCase):

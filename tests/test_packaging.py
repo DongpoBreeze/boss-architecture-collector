@@ -391,7 +391,7 @@ class PackagingArtifactTests(unittest.TestCase):
         self.assertNotEqual(profiles[0], profiles[1])
         self.assertEqual(list(self.outside.iterdir()), [])
 
-    def test_installed_runtime_changes_only_pagination_waits_in_synthetic_upstream(self):
+    def test_installed_runtime_collects_company_and_experience_without_rewriting_upstream(self):
         with tempfile.TemporaryDirectory(dir=self.root, prefix="installed-list-runtime-") as temporary:
             base = Path(temporary)
             scraper = base / "中文 upstream"
@@ -410,6 +410,12 @@ class PackagingArtifactTests(unittest.TestCase):
                 time = SimpleNamespace(sleep=waits.append)
                 random = SimpleNamespace(uniform=lambda lower, upper: (lower + upper) / 2)
 
+                def map_api_job(raw):
+                    return {
+                        "job_id": raw["encryptJobId"], "title": raw["jobName"],
+                        "salary_source": "api", "boss_name": raw["brandName"],
+                    }
+
                 def scrape_list(max_pages):
                     for pg in range(1, max_pages + 1):
                         time.sleep(3)
@@ -424,7 +430,10 @@ class PackagingArtifactTests(unittest.TestCase):
                     parser.add_argument("--merge", required=True)
                     arguments = parser.parse_args()
                     scrape_list(3)
-                    Path(arguments.output).write_text(json.dumps({"waits": waits, "merge": arguments.merge}), encoding="utf-8")
+                    job = map_api_job({"encryptJobId": "InstalledCompanyJob", "jobName": "合成方案工程师",
+                                       "brandName": "合成采集公司", "bossName": "招聘者李女士", "jobExperience": "1-3年"})
+                    Path(arguments.output).write_text(json.dumps({"waits": waits, "merge": arguments.merge,
+                                                                "jobs": [job]}), encoding="utf-8")
             ''')
             script.write_text(source, encoding="utf-8")
             output = base / "result.json"
@@ -456,6 +465,9 @@ class PackagingArtifactTests(unittest.TestCase):
                     self.assertEqual(result.stdout.count("翻页等待"), 2)
                     self.assertEqual(json.loads(output.read_text(encoding="utf-8")), {
                         "waits": [3, 2.0, 3, 2.0, 3], "merge": prior,
+                        "jobs": [{"job_id": "InstalledCompanyJob", "title": "合成方案工程师",
+                                  "salary_source": "api", "boss_name": "合成采集公司", "company": "合成采集公司",
+                                  "experience": "1-3年"}],
                     })
             self.assertEqual(script.read_text(encoding="utf-8"), source)
             self.assertEqual(list(script.parent.iterdir()), [script])
@@ -485,6 +497,10 @@ class PackagingArtifactTests(unittest.TestCase):
                     'job_link': f'https://www.zhipin.com/job_detail/{key}.html',
                     'title': 'Offline packaging fixture', 'company': 'Synthetic company',
                     'location': 'Shanghai', 'salary': '20-30K',
+                    'experience': '1-3年', 'tags': '3-5年 | 本科',
+                    'encrypt_brand_id': 'CompanyFixture~~',
+                    'company_link': 'https://www.zhipin.com/gongsi/CompanyFixture~~.html',
+                    'company_industry': '计算机软件', 'company_scale': '100-499人', 'company_stage': 'B轮',
                     'api_key': 'temporary-fixture-private-data',
                     'raw_model_response': 'temporary-fixture-private-data',
                     'source_file': str(root / 'private-source.json'),
@@ -534,14 +550,19 @@ class PackagingArtifactTests(unittest.TestCase):
             self.assertEqual(json.loads(schema.read_text(encoding="utf-8"))["properties"]["schema_version"]["const"], "1.0")
             manifest_before = (task / "task_manifest.json").read_bytes()
             self._console("boss-architecture-export", "--task", str(task))
-            default_exports = list((task / "delivery-exports").glob("*/delivery_jobs.json"))
+            default_exports = list((task / "delivery-exports").glob("*/格式版本_导出ID_导出时间.json"))
             self.assertEqual(len(default_exports), 1)
             original = default_exports[0].read_bytes()
             output_parent = fixture / "custom-exports"
             for _ in range(2):
                 self._console("boss-architecture-export", "--task", str(task), "--output-dir", str(output_parent))
-            custom_exports = list(output_parent.glob("*/delivery_jobs.json"))
+            custom_exports = list(output_parent.glob("*/格式版本_导出ID_导出时间.json"))
             self.assertEqual(len(custom_exports), 2)
+            company_fields = {
+                "encrypt_brand_id": "CompanyFixture~~",
+                "company_link": "https://www.zhipin.com/gongsi/CompanyFixture~~.html",
+                "company_industry": "计算机软件", "company_scale": "100-499人", "company_stage": "B轮",
+            }
             export_ids = set()
             for path in (*default_exports, *custom_exports):
                 payload = path.read_text(encoding="utf-8")
@@ -549,11 +570,70 @@ class PackagingArtifactTests(unittest.TestCase):
                 self.assertEqual(data["schema_version"], "1.0")
                 self.assertEqual(data["summary"], {"selected_count": 1, "ready_count": 1, "blocked_count": 0})
                 self.assertEqual(len(data["jobs"]), 1)
-                self.assertEqual(data["blocked_jobs"], [])
+                self.assertNotIn("blocked_jobs", data)
                 self.assertNotIn("temporary-fixture-private-data", payload)
                 self.assertNotIn(str(fixture), payload)
+                self.assertNotIn("city", data["jobs"][0])
+                self.assertNotIn("manual_keep", data["jobs"][0]["selection"])
+                self.assertEqual({name: data["jobs"][0].get(name) for name in company_fields}, company_fields)
+                self.assertEqual(data["jobs"][0]["experience"], "1-3年")
                 export_ids.add(data["export_id"])
             self.assertEqual(len(export_ids), 3)
+            selected_parent = fixture / "selected-exports"
+            self._console("boss-architecture-export", "--task", str(task), "--output-dir", str(selected_parent),
+                          "--fields", "jobs.salary", "jobs.city", "jobs.company", "jobs.title")
+            selected_exports = list(selected_parent.glob("*/岗位名称_公司_薪资.json"))
+            self.assertEqual(len(selected_exports), 1)
+            self.assertEqual(json.loads(selected_exports[0].read_text(encoding="utf-8")), {"jobs": [{
+                "title": "Offline packaging fixture", "company": "Synthetic company", "salary": "20-30K",
+            }]})
+            company_parent = fixture / "company-fields-exports"
+            self._console("boss-architecture-export", "--task", str(task), "--output-dir", str(company_parent),
+                          "--fields", *("jobs." + name for name in company_fields))
+            company_exports = list(company_parent.glob("*/*.json"))
+            self.assertEqual(len(company_exports), 1)
+            self.assertEqual(json.loads(company_exports[0].read_text(encoding="utf-8")), {"jobs": [company_fields]})
+            experience_parent = fixture / "experience-fields-exports"
+            self._console("boss-architecture-export", "--task", str(task), "--output-dir", str(experience_parent),
+                          "--fields", "jobs.experience")
+            experience_exports = list(experience_parent.glob("*/经验要求.json"))
+            self.assertEqual(len(experience_exports), 1)
+            self.assertEqual(json.loads(experience_exports[0].read_text(encoding="utf-8")),
+                             {"jobs": [{"experience": "1-3年"}]})
+            # Installed exports follow the confirmed keep set even when its
+            # recorded AI result is failed, unsigned, or belongs to an old id.
+            # This edits only the synthetic result, never its final selection.
+            code = textwrap.dedent("""
+                import json, sys
+                from pathlib import Path
+                task = Path(sys.argv[1])
+                manifest = json.loads((task / 'task_manifest.json').read_text(encoding='utf-8'))
+                result = task / manifest['stages']['llm']['result_file']
+                data = json.loads(result.read_text(encoding='utf-8'))
+                data['jobs'][0]['llm_review'] = {
+                    'job_id': 'old-fixture-record', 'status': 'failed',
+                    'review_format': 'legacy-fixture', '理由': 'Preserved fixture reason.',
+                    'cache_input_signature': 'outdated-fixture-signature',
+                }
+                data['jobs'][0].update(company=None, boss_name='Synthetic legacy API company', salary_source='api')
+                data['jobs'][0].update(experience=None, tags='在校/应届 | 本科')
+                result.write_text(json.dumps(data, ensure_ascii=False), encoding='utf-8')
+                """)
+            self._run([str(self.python), "-I", "-c", code, str(task)], self.outside)
+            unchecked_parent = fixture / "unchecked-ai-exports"
+            self._console("boss-architecture-export", "--task", str(task), "--output-dir", str(unchecked_parent))
+            unchecked_exports = list(unchecked_parent.glob("*/格式版本_导出ID_导出时间.json"))
+            self.assertEqual(len(unchecked_exports), 1)
+            unchecked = json.loads(unchecked_exports[0].read_text(encoding="utf-8"))
+            self.assertEqual(unchecked["summary"], {"selected_count": 1, "ready_count": 1, "blocked_count": 0})
+            self.assertNotIn("blocked_jobs", unchecked)
+            self.assertEqual(unchecked["jobs"][0]["ai_review"], {
+                "format": "legacy-fixture", "status": "failed", "reason": "Preserved fixture reason.",
+                "validation": "not_checked",
+            })
+            self.assertEqual(unchecked["jobs"][0]["selection"]["source"], "ai")
+            self.assertEqual(unchecked["jobs"][0]["company"], "Synthetic legacy API company")
+            self.assertEqual(unchecked["jobs"][0]["experience"], "在校/应届")
             self.assertEqual(default_exports[0].read_bytes(), original)
             self.assertEqual((task / "task_manifest.json").read_bytes(), manifest_before)
             self.assertFalse((task / "runtime/report").exists())
