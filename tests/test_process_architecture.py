@@ -1,3 +1,4 @@
+import errno
 import io
 import json
 import os
@@ -18,6 +19,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
 
 import project_llm_settings
+import checkpoint_io
 from process_architecture import (  # noqa: E402
     CLASSIFICATIONS,
     DIMENSIONS,
@@ -80,7 +82,7 @@ def write_raw_file(root: Path, name: str, jobs: list[dict], track: str = "curren
 
 class AtomicCheckpointWriteTests(unittest.TestCase):
     def test_transient_replace_permission_and_windows_sharing_errors_recover(self):
-        original_replace = os.replace
+        original_replace = checkpoint_io._replace_once
         for writer in (write_json, write_jsonl):
             for winerror in (None, 5, 32, 33):
                 with self.subTest(writer=writer.__name__, winerror=winerror), tempfile.TemporaryDirectory() as directory:
@@ -96,7 +98,7 @@ class AtomicCheckpointWriteTests(unittest.TestCase):
                             raise error
                         original_replace(source, destination)
 
-                    with patch("process_architecture.os.replace", side_effect=replace), \
+                    with patch("checkpoint_io._replace_once", side_effect=replace), \
                             patch("process_architecture.time.sleep") as sleep:
                         writer(target, [{"job_id": "saved"}])
                     self.assertEqual(len(attempts), 2)
@@ -113,13 +115,14 @@ class AtomicCheckpointWriteTests(unittest.TestCase):
                 unrelated = Path(directory) / "checkpoint.json.tmp"
                 unrelated.write_bytes(b"another writer's temp")
                 error = PermissionError("persistent lock")
-                with patch("process_architecture.os.replace", side_effect=error) as replace, \
+                with patch("checkpoint_io._replace_once", side_effect=error) as replace, \
                         patch("process_architecture.time.sleep") as sleep:
                     with self.assertRaises(PermissionError) as raised:
                         writer(target, [{"job_id": "new"}])
                 self.assertIs(raised.exception, error)
-                self.assertEqual(replace.call_count, 5)
-                self.assertEqual([call.args[0] for call in sleep.call_args_list], [.01, .02, .03, .04])
+                from checkpoint_io import REPLACE_RETRY_DELAYS
+                self.assertEqual(replace.call_count, len(REPLACE_RETRY_DELAYS) + 1)
+                self.assertEqual([call.args[0] for call in sleep.call_args_list], list(REPLACE_RETRY_DELAYS))
                 self.assertEqual(target.read_bytes(), b"previous complete checkpoint\n")
                 self.assertEqual(unrelated.read_bytes(), b"another writer's temp")
                 self.assertEqual(list(Path(directory).glob(".*.tmp")), [])
@@ -129,14 +132,14 @@ class AtomicCheckpointWriteTests(unittest.TestCase):
             with self.subTest(writer=writer.__name__), tempfile.TemporaryDirectory() as directory:
                 target = Path(directory) / "checkpoint.json"
                 target.write_bytes(b"previous checkpoint")
-                with patch("process_architecture.os.replace", side_effect=OSError(28, "disk full")) as replace, \
+                with patch("checkpoint_io._replace_once", side_effect=OSError(28, "disk full")) as replace, \
                         patch("process_architecture.time.sleep") as sleep:
                     with self.assertRaises(OSError):
                         writer(target, [{"job_id": "new"}])
                 replace.assert_called_once()
                 sleep.assert_not_called()
                 with patch("process_architecture.tempfile.NamedTemporaryFile", side_effect=PermissionError("create denied")) as create, \
-                        patch("process_architecture.os.replace") as replace, \
+                        patch("checkpoint_io._replace_once") as replace, \
                         patch("process_architecture.time.sleep") as sleep:
                     with self.assertRaises(PermissionError):
                         writer(target, [{"job_id": "new"}])
@@ -154,7 +157,7 @@ class AtomicCheckpointWriteTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             target = Path(directory) / "checkpoint.jsonl"
             target.write_bytes(b"previous complete rows\n")
-            with patch("process_architecture.os.replace") as replace, patch("process_architecture.time.sleep") as sleep:
+            with patch("checkpoint_io._replace_once") as replace, patch("process_architecture.time.sleep") as sleep:
                 with self.assertRaises(PermissionError):
                     write_jsonl(target, rows())
             replace.assert_not_called()
@@ -162,8 +165,25 @@ class AtomicCheckpointWriteTests(unittest.TestCase):
             self.assertEqual(target.read_bytes(), b"previous complete rows\n")
             self.assertEqual(list(Path(directory).glob("*.tmp")), [])
 
+    def test_sync_failure_never_replaces_existing_json_or_jsonl_checkpoint(self):
+        for writer, suffix in ((write_json, ".json"), (write_jsonl, ".jsonl")):
+            with self.subTest(writer=writer.__name__), tempfile.TemporaryDirectory() as directory:
+                target = Path(directory) / f"checkpoint{suffix}"
+                writer(target, [{"job_id": "saved"}])
+                previous = target.read_bytes()
+                error = OSError(errno.ENOSPC, "checkpoint sync failed")
+                with patch("process_architecture.os.fsync", side_effect=error) as sync, \
+                        patch("checkpoint_io._replace_once") as replace, self.assertRaises(OSError) as raised:
+                    writer(target, [{"job_id": "new"}])
+                self.assertIs(raised.exception, error)
+                self.assertEqual(raised.exception.errno, errno.ENOSPC)
+                sync.assert_called_once()
+                replace.assert_not_called()
+                self.assertEqual(target.read_bytes(), previous)
+                self.assertEqual(list(Path(directory).glob(".*.tmp")), [])
+
     def test_concurrent_writers_use_distinct_temporaries(self):
-        original_replace = os.replace
+        original_replace = checkpoint_io._replace_once
         for writer in (write_json, write_jsonl):
             with self.subTest(writer=writer.__name__), tempfile.TemporaryDirectory() as directory:
                 target = Path(directory) / "checkpoint.json"
@@ -186,7 +206,7 @@ class AtomicCheckpointWriteTests(unittest.TestCase):
                     except BaseException as exc:
                         errors.append(exc)
 
-                with patch("process_architecture.os.replace", side_effect=replace):
+                with patch("checkpoint_io._replace_once", side_effect=replace):
                     threads = [threading.Thread(target=save, args=(key,)) for key in ("a", "b")]
                     for thread in threads:
                         thread.start()
@@ -210,6 +230,171 @@ class AtomicCheckpointWriteTests(unittest.TestCase):
                 write_json(target, {"new": True})
             sleep.assert_called_once_with(.01)
             self.assertEqual(json.loads(target.read_text(encoding="utf-8")), {"new": True})
+
+
+class CompanyNameMergeTests(unittest.TestCase):
+    @staticmethod
+    def legacy(**changes):
+        return {"job_id": "same", "salary_source": "api", "boss_name": "历史公司",
+                "company_scale": "100-499人", "company_stage": "", "company_industry": "软件",
+                "encrypt_brand_id": "", "company_link": "", **changes}
+
+    def test_source_rows_are_normalized_without_mutating_inputs_or_model_payload(self):
+        rows = [{"job_id": "explicit", "company": {"name": "明确公司"}, "jd": "岗位职责：负责方案设计。"},
+                self.legacy(job_id="old"),
+                {"job_id": "dom", "salary_source": "dom_untrusted", "boss_name": "招聘王先生"},
+                {"job_id": "bad", "company": {"name": None}, "company_name": 42}]
+        before = json.loads(json.dumps(rows, ensure_ascii=False))
+        merged, stats = merge_rows(rows)
+        self.assertEqual([(row["company"], row["company_name_source"]) for row in merged],
+                         [("明确公司", "company.name"), ("历史公司", "legacy_api_boss_name"),
+                          ("", "unavailable"), ("", "unavailable")])
+        self.assertEqual(rows, before)
+        self.assertEqual(stats["unique_job_count"], 4)
+        self.assertEqual(model_input(rows[0]), model_input(merged[0]))
+
+    def test_explicit_name_overrides_legacy_in_either_source_order_and_after_remerge(self):
+        legacy = self.legacy()
+        explicit = {"job_id": "same", "companyInfo": {"fullName": "明确公司"}}
+        for rows in ([legacy, explicit], [explicit, legacy]):
+            with self.subTest(rows=rows):
+                merged, _ = merge_rows(rows)
+                self.assertEqual(merged[0]["company"], "明确公司")
+                self.assertEqual(merged[0]["company_name_source"], "companyInfo.fullName")
+                rerun, _ = merge_rows(merged)
+                self.assertEqual(rerun, merged)
+        prior, _ = merge_rows([legacy])
+        supplemented, _ = merge_rows([*prior, explicit])
+        self.assertEqual(supplemented[0]["company"], "明确公司")
+
+    def test_same_quality_names_keep_existing_precedence(self):
+        merged, _ = merge_rows([{"job_id": "same", "company": "首次明确公司"},
+                                {"job_id": "same", "company_name": "后来明确公司"}])
+        self.assertEqual(merged[0]["company"], "首次明确公司")
+        merged, _ = merge_rows([self.legacy(), self.legacy(boss_name="后来历史公司")])
+        self.assertEqual(merged[0]["company"], "历史公司")
+
+    def test_mixed_incomplete_api_rows_cannot_synthesize_recruiter_company(self):
+        recruiter = {"job_id": "same", "salary_source": "dom_untrusted", "boss_name": "招聘王先生"}
+        api_metadata = self.legacy(salary_source="api_empty", boss_name="")
+        incomplete = self.legacy()
+        del incomplete["company_link"]
+        missing_metadata = {"job_id": "same", "company_link": ""}
+        for rows in ([recruiter, api_metadata], [api_metadata, recruiter], [incomplete, missing_metadata]):
+            with self.subTest(rows=rows):
+                merged, _ = merge_rows(rows)
+                self.assertEqual(merged[0]["company"], "")
+                self.assertEqual(merged[0]["company_name_source"], "unavailable")
+                rerun, _ = merge_rows(merged)
+                self.assertEqual(rerun, merged)
+                self.assertEqual(rerun[0]["company"], "")
+
+    def test_late_identity_bridge_preserves_explicit_priority_and_no_synthetic_name(self):
+        link = "https://www.zhipin.com/job_detail/CompanyBridge.html"
+        for third in ({"encrypt_job_id": "enc", "companyName": "明确公司"},
+                      {"encrypt_job_id": "enc", "salary_source": "api", "company_scale": "", "company_stage": "",
+                       "company_industry": "", "encrypt_brand_id": "", "company_link": ""}):
+            rows = [{"job_id": "first", "job_link": link, "salary_source": "dom_untrusted", "boss_name": "招聘者"},
+                    third, {"job_id": "first", "encrypt_job_id": "enc", "job_link": link}]
+            merged, stats = merge_rows(rows)
+            self.assertEqual(stats["unique_job_count"], 1)
+            self.assertEqual(merged[0]["company"], "明确公司" if "companyName" in third else "")
+            self.assertEqual(merge_rows(merged)[0], merged)
+        merged, _ = merge_rows([self.legacy(job_id="first", job_link=link),
+                                {"encrypt_job_id": "enc", "brandName": "后到明确公司"},
+                                {"job_id": "first", "encrypt_job_id": "enc", "job_link": link}])
+        self.assertEqual(merged[0]["company"], "后到明确公司")
+
+    def test_collect_balanced_dedup_preserves_new_explicit_and_legacy_names(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            write_raw_file(root, "current__shanghai__kw__salary-a__exp.json", [
+                {"job_id": "new", "company": "新采集公司"}, self.legacy(job_id="old"),
+            ])
+            path = next((root / "raw").rglob("*.json"))
+            before = path.read_bytes()
+            jobs, _ = collect_rows(root, collection_config(), city="上海", sample_strategy="balanced-dedup")
+            self.assertEqual({job["job_id"]: job["company"] for job in jobs},
+                             {"new": "新采集公司", "old": "历史公司"})
+            self.assertEqual(path.read_bytes(), before)
+
+
+class ExperienceMergeTests(unittest.TestCase):
+    def test_source_copies_normalize_explicit_aliases_and_legacy_without_changing_model_input(self):
+        rows = [{"job_id": "explicit", "jobExperience": "3-5年", "tags": "1-3年 | 本科"},
+                {"job_id": "legacy", "tags": "在校/应届 | 本科"},
+                {"job_id": "unknown", "tags": "本科 | 不限", "observed_in": [{"experience_filter": "1-3年"}]},
+                {"job_id": "code", "experience": "105"},
+                {"job_id": "invalid", "experience": ["1-3年"]}]
+        before = json.loads(json.dumps(rows, ensure_ascii=False))
+        merged, _ = merge_rows(rows)
+        self.assertEqual([(row["experience"], row["experience_source"]) for row in merged],
+                         [("3-5年", "jobExperience"), ("在校/应届", "tags"),
+                          ("", "unavailable"), ("", "unavailable"), ("", "unavailable")])
+        self.assertEqual(rows, before)
+        self.assertEqual([model_input(row) for row in rows], [model_input(row) for row in merged])
+
+    def test_explicit_requirement_beats_legacy_in_either_order_and_across_repeated_merges(self):
+        legacy = {"job_id": "same", "tags": "1-3年 | 本科"}
+        explicit = {"job_id": "same", "job_experience": "3-5年"}
+        for rows in ([legacy, explicit], [explicit, legacy]):
+            with self.subTest(rows=rows):
+                merged, _ = merge_rows(rows)
+                self.assertEqual((merged[0]["experience"], merged[0]["experience_source"]), ("3-5年", "job_experience"))
+                self.assertEqual(merge_rows(merged)[0], merged)
+        normalized, _ = merge_rows([legacy])
+        result, _ = merge_rows([*normalized, explicit])
+        self.assertEqual(result[0]["experience"], "3-5年")
+        self.assertEqual(merge_rows(result)[0], result)
+
+    def test_same_quality_keeps_first_and_unknown_can_be_supplemented(self):
+        for rows, expected in (([{"job_id": "same", "experience": "1-3年"}, {"job_id": "same", "jobExperience": "5-10年"}], "1-3年"),
+                               ([{"job_id": "same", "tags": "经验不限 | 本科"}, {"job_id": "same", "tags": "1-3年 | 本科"}], "经验不限"),
+                               ([{"job_id": "same", "tags": "本科 | 不限"}, {"job_id": "same", "tags": "1年以内 | 本科"}], "1年以内")):
+            with self.subTest(rows=rows):
+                merged, _ = merge_rows(rows)
+                self.assertEqual(merged[0]["experience"], expected)
+                self.assertEqual(merge_rows(merged)[0], merged)
+
+    def test_conflicting_source_tags_and_mixed_metadata_never_enable_recovery_on_rerun(self):
+        rows = [{"job_id": "same", "tags": "3-5年", "job_labels": ["1-3年"]},
+                {"job_id": "same", "job_labels": ["本科"], "experience_filter": "经验不限",
+                 "jd": "任职要求：1-3年工作经验。"}]
+        merged, _ = merge_rows(rows)
+        self.assertEqual((merged[0]["experience"], merged[0]["experience_source"]), ("", "unavailable"))
+        # Simulate a later display-field combination that leaves only one tag.
+        merged[0]["job_labels"] = ["本科"]
+        rerun, _ = merge_rows(merged)
+        self.assertEqual((rerun[0]["experience"], rerun[0]["experience_source"]), ("", "unavailable"))
+        self.assertEqual(merge_rows(rerun)[0], rerun)
+
+    def test_late_identity_bridge_preserves_explicit_priority_and_first_legacy(self):
+        link = "https://www.zhipin.com/job_detail/ExperienceBridge.html"
+        rows = [{"job_id": "first", "job_link": link, "tags": "1-3年 | 本科"},
+                {"encrypt_job_id": "enc", "jobExperience": "5-10年"},
+                {"job_id": "first", "encrypt_job_id": "enc", "job_link": link}]
+        merged, stats = merge_rows(rows)
+        self.assertEqual(stats["unique_job_count"], 1)
+        self.assertEqual((merged[0]["experience"], merged[0]["experience_source"]), ("5-10年", "jobExperience"))
+        self.assertEqual(merge_rows(merged)[0], merged)
+        rows[1] = {"encrypt_job_id": "enc", "tags": "3-5年 | 本科"}
+        merged, _ = merge_rows(rows)
+        self.assertEqual((merged[0]["experience"], merged[0]["experience_source"]), ("1-3年", "tags"))
+
+    def test_balanced_collection_uses_job_evidence_and_leaves_raw_bytes_unchanged(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            rows = [{"job_id": "new", "experience": "3-5年"},
+                    {"job_id": "old", "tags": "经验不限 | 本科"},
+                    {"job_id": "unknown", "tags": "本科 | 不限"}]
+            write_raw_file(root, "current__shanghai__kw__salary-a__exp.json", rows)
+            path = next((root / "raw").rglob("*.json"))
+            before = path.read_bytes()
+            jobs, _ = collect_rows(root, collection_config(), city="上海", sample_strategy="balanced-dedup")
+            self.assertEqual({row["job_id"]: row["experience"] for row in jobs},
+                             {"new": "3-5年", "old": "经验不限", "unknown": ""})
+            self.assertEqual(path.read_bytes(), before)
+            self.assertEqual(merge_rows(jobs)[0], jobs)
 
 
 class ProcessArchitectureTests(unittest.TestCase):
@@ -1844,6 +2029,32 @@ class ProcessArchitectureTests(unittest.TestCase):
                       "--model", "explicit-model", "--reasoning-effort", "low"])
                 self.assertEqual(llm.call_args.args[-2:], ("explicit-model", "low"))
 
+    def test_cli_forwards_jd_extra_wait_defaults_and_boundaries(self):
+        with tempfile.TemporaryDirectory() as directory:
+            for minimum, maximum in ((0, 0), (0, 30), (30, 30)):
+                with self.subTest(minimum=minimum, maximum=maximum), \
+                     patch("process_architecture.fetch_jd", return_value={}) as fetch, redirect_stdout(io.StringIO()):
+                    args = ["--root", directory, "--stage", "fetch-jd", "--scraper-root", directory]
+                    if maximum:
+                        args.extend(("--jd-page-wait-min", str(minimum), "--jd-page-wait-max", str(maximum)))
+                    self.assertEqual(main(args), 0)
+                    self.assertEqual(fetch.call_args.kwargs["jd_page_wait_min"], minimum)
+                    self.assertEqual(fetch.call_args.kwargs["jd_page_wait_max"], maximum)
+
+    def test_jd_extra_wait_rejects_invalid_ranges_before_output_or_network(self):
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "must-stay-absent"
+            for minimum, maximum in ((-1, 0), (0, 31), (4, 3), (True, 3), (0, False), (0, 1.5)):
+                with self.subTest(api=True, minimum=minimum, maximum=maximum), self.assertRaises(ValueError):
+                    fetch_jd(output, output, jd_page_wait_min=minimum, jd_page_wait_max=maximum)
+            for minimum, maximum in (("-1", "0"), ("0", "31"), ("4", "3"), ("True", "3"), ("0", "1.5")):
+                with self.subTest(api=False, minimum=minimum, maximum=maximum), patch("sys.stderr", io.StringIO()), \
+                     self.assertRaises(SystemExit) as error:
+                    main(["--root", str(output), "--stage", "merge",
+                          "--jd-page-wait-min", minimum, "--jd-page-wait-max", maximum])
+                self.assertEqual(error.exception.code, 2)
+            self.assertFalse(output.exists())
+
     def test_cli_chat_protocol_override_is_forwarded_only_to_llm(self):
         with tempfile.TemporaryDirectory() as directory:
             with patch("process_architecture.run_llm", return_value={}) as llm, redirect_stdout(io.StringIO()):
@@ -1908,6 +2119,44 @@ class ProcessArchitectureTests(unittest.TestCase):
             self.assertNotIn("--max-details", command)
             self.assertEqual(result["manifest"]["jd_workers"], 6)
             self.assertEqual(result["manifest"]["scroll_count"], 3)
+            self.assertEqual(result["manifest"]["page_wait_min"], 0)
+            self.assertEqual(result["manifest"]["page_wait_max"], 0)
+            self.assertEqual(command[command.index("--page-wait-min") + 1], "0")
+            self.assertEqual(command[command.index("--page-wait-max") + 1], "0")
+
+    @patch("process_architecture.ensure_detail_cdp_ready", return_value=(True, None))
+    def test_fetch_jd_keeps_extra_wait_range_consistent_in_command_manifest_and_log(self, _ensure_cdp):
+        with tempfile.TemporaryDirectory() as directory:
+            output, scraper = self._prepare_fetch_jd_fixture(directory)
+            logs = io.StringIO()
+            with patch("process_architecture.run_detail_subprocess",
+                       return_value=subprocess.CompletedProcess([], 0, "", "")) as run, redirect_stdout(logs):
+                result = fetch_jd(output, scraper, python_path=sys.executable, wait_on_gate=False,
+                                  jd_page_wait_min=3, jd_page_wait_max=30)
+            command = run.call_args.args[0]
+            self.assertEqual(command[command.index("--page-wait-min") + 1], "3")
+            self.assertEqual(command[command.index("--page-wait-max") + 1], "30")
+            manifest = result["manifest"]
+            self.assertEqual((manifest["page_wait_min"], manifest["page_wait_max"]), (3, 30))
+            self.assertEqual((manifest["records"][0]["page_wait_min"], manifest["records"][0]["page_wait_max"]), (3, 30))
+            self.assertEqual(manifest["records"][0]["fetched_count"], 0)
+            self.assertIn("每页额外等待 3–30 秒", logs.getvalue())
+            saved = json.loads((output / "prepared/jd_shortlists/details_manifest.json").read_text(encoding="utf-8"))
+            self.assertEqual(saved, manifest)
+
+    def test_fetch_jd_complete_checkpoint_does_not_start_adapter_when_wait_is_thirty(self):
+        with tempfile.TemporaryDirectory() as directory:
+            output, scraper = self._prepare_fetch_jd_fixture(directory)
+            details = output / "prepared/jd_shortlists/details.json"
+            details.write_text(json.dumps([{"job_id": "job-1", "jd": "已有完整正文", "status": "success"}]), encoding="utf-8")
+            with patch("process_architecture.run_detail_subprocess") as run, \
+                 patch("process_architecture.ensure_detail_cdp_ready") as cdp, redirect_stdout(io.StringIO()):
+                result = fetch_jd(output, scraper, python_path=sys.executable,
+                                  jd_page_wait_min=30, jd_page_wait_max=30)
+            run.assert_not_called()
+            cdp.assert_not_called()
+            self.assertEqual((result["manifest"]["page_wait_min"], result["manifest"]["page_wait_max"]), (30, 30))
+            self.assertEqual(result["manifest"]["records"][0]["fetched_count"], 1)
 
     @patch("process_architecture.ensure_detail_cdp_ready", return_value=(True, None))
     def test_fetch_jd_gate_enter_retries_current_batch_then_continues(self, _ensure_cdp):
@@ -3021,7 +3270,7 @@ class LLMCacheTests(unittest.TestCase):
         failure_started = threading.Event()
         request_lock = threading.Lock()
         calls = []
-        original_replace = os.replace
+        original_replace = checkpoint_io._replace_once
         error = PermissionError(f"private detail {self.config.api_key} {self.config.base_url}")
         error.winerror = 5
 
@@ -3044,7 +3293,7 @@ class LLMCacheTests(unittest.TestCase):
 
         self.client.review_job.side_effect = request
         diagnostics = io.StringIO()
-        with patch("process_architecture.os.replace", side_effect=replace), \
+        with patch("checkpoint_io._replace_once", side_effect=replace), \
                 patch("process_architecture.time.sleep"), redirect_stderr(diagnostics):
             with self.assertRaises(PermissionError) as raised:
                 run_llm(self.output, workers=3)

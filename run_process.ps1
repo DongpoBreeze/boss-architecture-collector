@@ -22,6 +22,10 @@ param(
     [int]$MaxRetries = 3,
     [ValidateSet("safe", "fast")]
     [string]$DetailSpeedProfile = "fast",
+    [ValidateRange(0, 30)]
+    [int]$JdPageWaitMin = 0,
+    [ValidateRange(0, 30)]
+    [int]$JdPageWaitMax = 0,
     [string]$CodexHome = "",
     [string]$BaseUrl = "",
     [string]$ApiKey = "",
@@ -33,6 +37,9 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+if ($JdPageWaitMin -gt $JdPageWaitMax) {
+    throw "JdPageWaitMin must be less than or equal to JdPageWaitMax."
+}
 $projectRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
 $script = Join-Path $projectRoot "process_architecture.py"
 
@@ -60,6 +67,7 @@ $arguments = @()
 $arguments += $pythonArgs
 $arguments += $script
 $arguments += @("--root", $Root, "--stage", $Stage, "--workers", [string]$Workers, "--conversation-size", [string]$ConversationSize, "--jd-workers", [string]$JdWorkers, "--batch-size", [string]$BatchSize, "--detail-speed-profile", $DetailSpeedProfile, "--timeout", [string]$Timeout, "--max-retries", [string]$MaxRetries)
+$arguments += @("--jd-page-wait-min", [string]$JdPageWaitMin, "--jd-page-wait-max", [string]$JdPageWaitMax)
 if ($NoWaitOnGate) { $arguments += "--no-wait-on-gate" }
 if ($City) { $arguments += @("--city", $City) }
 if ($SampleSize -gt 0) { $arguments += @("--sample-size", [string]$SampleSize) }
@@ -72,6 +80,6 @@ if ($Model) { $arguments += @("--model", $Model) }
 if ($ReasoningEffort) { $arguments += @("--reasoning-effort", $ReasoningEffort) }
 
 Write-Host "Project: $projectRoot"
-Write-Host "Stage: $Stage | Root: $Root | City: $City | Sample: $SampleSize | AI workers: $Workers | AI jobs/session: $ConversationSize | JD pages: $JdWorkers | Scrolls/page: 3 | JD speed: $DetailSpeedProfile"
+Write-Host "Stage: $Stage | Root: $Root | City: $City | Sample: $SampleSize | AI workers: $Workers | AI jobs/session: $ConversationSize | JD pages: $JdWorkers | Scrolls/page: 3 | JD speed: $DetailSpeedProfile | JD extra wait/page: $JdPageWaitMin-$JdPageWaitMax seconds"
 & $pythonCommand @arguments
 exit $LASTEXITCODE

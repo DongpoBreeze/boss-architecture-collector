@@ -24,6 +24,7 @@ from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Any, Callable
 
+import checkpoint_io
 import desktop_data
 import process_architecture as processor
 from desktop_tasks import ReviewTask, STAGES, STAGE_LABELS, TaskStateError, job_id
@@ -32,16 +33,19 @@ from review_cache import (REVIEW_CACHE_VERSION, matching_reviews, provider_signa
 from project_resources import DEFAULT_CONFIG, PROJECT_ROOT
 import project_llm_settings
 import review_rules
-from llm_client import SIMPLE_REVIEW_FORMAT, JsonSchemaValidationError, simple_review_payload
+import stage_rules
+from llm_client import CodexConfig, SIMPLE_REVIEW_FORMAT, JsonSchemaValidationError, simple_review_payload
 from screening_policy import (
     AI_DEFAULT_MODEL, AI_DEFAULT_REASONING_EFFORT, AI_DEFAULT_WORKERS,
     AI_STAGE_PROJECTION, AI_STAGE_RESULT_FIELDS,
-    JD_DEFAULT_WORKERS, JD_SCROLL_COUNT, LIST_QUEUE_LABELS, MAX_WORKERS,
+    JD_DEFAULT_WORKERS, LIST_QUEUE_LABELS, MAX_WORKERS,
 )
 
 
 MAX_LOG_LINE = 1_000_000
 CHILD_DRAIN_TIMEOUT = 2.0
+SHORTLIST_LIVE_INTERVAL = .5
+SHORTLIST_FIRST_BATCH = 25
 EventCallback = Callable[[str, Any], None]
 
 
@@ -106,17 +110,23 @@ def _safe_path(task: ReviewTask, path: Path) -> Path:
     base = task.path.absolute()
     path = path.absolute()
     try:
-        relative = path.relative_to(base)
-        path.resolve().relative_to(base.resolve())
-    except (ValueError, OSError, RuntimeError):
+        relative, _resolved = checkpoint_io.confined_path(path, base)
+    except checkpoint_io.PathBoundaryError:
         raise PipelineError("任务输出路径越界，已停止以保护原始数据。") from None
-    current = base
-    if _reparse(current):
-        raise PipelineError("任务目录不能是符号链接或目录联接。")
-    for part in relative.parts:
-        current = current / part
+    except checkpoint_io.PathCheckError:
+        raise PipelineError("任务输出路径无法安全解析或检查，未读取或改写；请稍后重试。") from None
+    try:
+        current = base
         if _reparse(current):
-            raise PipelineError("任务检查点含符号链接或目录联接，未读取或改写。")
+            raise PipelineError("任务目录不能是符号链接或目录联接。")
+        for part in relative.parts:
+            current = current / part
+            if _reparse(current):
+                raise PipelineError("任务检查点含符号链接或目录联接，未读取或改写。")
+    except PipelineError:
+        raise
+    except (OSError, ValueError, RuntimeError):
+        raise PipelineError("任务输出路径无法安全解析或检查，未读取或改写；请稍后重试。") from None
     return path
 
 
@@ -134,7 +144,7 @@ def _read_json(task: ReviewTask, path: Path, default: Any = None) -> Any:
     if not path.exists():
         return copy.deepcopy(default)
     try:
-        return json.loads(path.read_text(encoding="utf-8-sig"))
+        return processor.read_json(path)
     except (OSError, UnicodeError, ValueError):
         # A live atomic writer may not yet have published a valid checkpoint.
         return copy.deepcopy(default)
@@ -424,6 +434,14 @@ def _check_child_lease(task: ReviewTask, stage: str) -> None:
             raise PipelineError("本任务的旧子进程仍在运行；请等待其结束后再续跑，未重复启动。")
 
 
+class _ReviewCommand(list[str]):
+    """An argv with an in-memory-only configuration for the owned child."""
+
+    def __init__(self, values: list[str], config: CodexConfig):
+        super().__init__(values)
+        self.review_config = config
+
+
 def _run_child(task: ReviewTask | None, stage: str, command: list[str], control: StageControl,
                emit: _Emitter, monitor: Callable[[], None] | None = None) -> int:
     runtime = task.run_directory(stage) if task else None
@@ -433,8 +451,9 @@ def _run_child(task: ReviewTask | None, stage: str, command: list[str], control:
     control.check()
     environment = processor.subprocess_env_with_local_bypass()
     environment.update(PYTHONIOENCODING="utf-8", PYTHONUTF8="1")
+    config = getattr(command, "review_config", None)
     child = subprocess.Popen(command, cwd=PROJECT_ROOT, env=environment,
-                             stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                             stdin=subprocess.PIPE if config is not None else subprocess.DEVNULL, stdout=subprocess.PIPE,
                              stderr=subprocess.STDOUT, text=True, encoding="utf-8",
                              errors="replace", bufsize=1, **_child_options())
     with control._lock:
@@ -495,6 +514,10 @@ def _run_child(task: ReviewTask | None, stage: str, command: list[str], control:
         if tree:
             control.check()
             tree.resume()
+        if config is not None:
+            assert child.stdin is not None
+            child.stdin.write(config.private_payload())
+            child.stdin.close()
         while not eof or child.poll() is None:
             if control.requested:
                 _stop_owned_child(child, tree)
@@ -581,6 +604,10 @@ def prepare_browser(scraper_root: Path, on_event: EventCallback | None = None,
                     chrome_profile: Path | str | None = None,
                     edge_profile: Path | str | None = None) -> bool | dict[str, str]:
     """Only invoked by an explicit Prepare browser/Login action."""
+    configs = processor.validate_browser_configs(browser_mode, {
+        "chrome": {"port": chrome_port, "profile_dir": chrome_profile_dir or chrome_profile},
+        "edge": {"port": edge_port, "profile_dir": edge_profile_dir or edge_profile},
+    })
     scraper_root = Path(scraper_root).expanduser().resolve()
     entry = scraper_root / "scripts" / "boss_cdp_raw.py"
     if not entry.is_file():
@@ -592,13 +619,9 @@ def prepare_browser(scraper_root: Path, on_event: EventCallback | None = None,
     edge_profile_dir = edge_profile_dir or edge_profile
     emit = _Emitter(None, "browser", on_event)
     parent_control = control or StageControl()
-    configs = {
-        "chrome": (chrome_port, chrome_profile_dir),
-        "edge": (edge_port, edge_profile_dir),
-    }
 
     def prepare_one(name: str) -> tuple[str, int]:
-        port, profile = configs[name]
+        port, profile = configs[name].port, configs[name].profile_dir
         label = "Chrome" if name == "chrome" else "Edge"
         emit.log(f"正在准备独立 {label}（CDP {port}）；请在该窗口人工登录，浏览器登录态彼此隔离。")
         command = [str(python), "-u", str(PROJECT_ROOT / "browser_setup.py"),
@@ -668,34 +691,93 @@ def _run_import(task: ReviewTask, runtime: Path, control: StageControl, emit: _E
                                             sample_strategy="balanced-dedup", tracks=manifest.get("track", "all"))
     control.check()
     normalized = []
+    rules = task.get_stage_rules("import")
     for job in jobs:
-        item = copy.deepcopy(job)
-        item["job_id"] = job_id(item)
-        item["recommended_keep"] = True
+        control.check()
+        item = stage_rules.apply_import_rules({**job, "job_id": job_id(job)}, rules)
+        item["recommended_keep"] = item["import_rule_keep"]
         normalized.append(_with_flags(item))
     _index(task, runtime, normalized)
     _write_json(task, task.path / "raw_sample.json", {"metadata": metadata, "jobs": normalized})
     stats = {**metadata, "raw_record_count": metadata.get("raw_record_count", 0),
              "deduplicated_job_count": metadata.get("unique_job_count", len(normalized)),
              "selected_job_count": len(normalized), "sampled_job_count": len(normalized),
+             "recommended_count": sum(item.get("import_rule_keep") is True for item in normalized),
              "source_combinations": sorted({processor.text(src.get("combination"))
                 for job in normalized for src in job.get("observed_in", []) if isinstance(src, dict)}),
              "json_path": str(runtime / "prepared" / "merged_jobs_index.json")}
+    invalid = metadata.get("invalid_files") or []
+    stats.update(invalid_file_count=len(invalid), import_warning_count=len(invalid))
+    if invalid:
+        emit.log(f"导入警告：{len(invalid)} 个源文件无效，已保留正常文件的可审核结果。无效文件：" + "、".join(invalid))
     emit.log(f"导入完成：范围内原始 {stats['raw_record_count']} 条，去重总量 {stats['deduplicated_job_count']} 岗，本任务 {len(normalized)} 岗。")
     return normalized, stats
 
 
+def shortlist_live_signature(info: dict) -> str:
+    """Bind a partial preview to this exact attempt and confirmed input."""
+    identity = {"attempt": info.get("attempt"), "input_revision": info.get("input_revision"),
+                "input_ids": info.get("input_ids", [])}
+    return hashlib.sha256(json.dumps(identity, ensure_ascii=False, sort_keys=True,
+                                    separators=(",", ":")).encode("utf-8")).hexdigest()
+
+
 def _run_shortlist(task: ReviewTask, runtime: Path, control: StageControl, emit: _Emitter) -> tuple[list[dict], dict]:
     inputs = task.input_jobs("shortlist")
+    info = task.manifest["stages"]["shortlist"]
+    rules = task.get_stage_rules("shortlist")
+    use_default_rules = rules == stage_rules.default_stage_rules("shortlist")
     results = []
-    for number, job in enumerate(inputs, 1):
-        control.check()
-        item = _with_flags({**job, **processor.score_job(job)})
-        item["recommended_keep"] = bool(item["list_pass"])
-        results.append(item)
-        if number % 25 == 0:
-            emit.progress(number, len(inputs), {"processed_count": number})
-    queue_counts = Counter(job["list_queue"] for job in results)
+    queue_counts = Counter()
+    recommended_count = 0
+    last_published_count = -1
+    last_published_at = None
+    signature = shortlist_live_signature(info)
+
+    def publish(*, force: bool = False) -> None:
+        nonlocal last_published_count, last_published_at
+        count = len(results)
+        if count == last_published_count:
+            return
+        if not force:
+            if last_published_at is None and count < min(SHORTLIST_FIRST_BATCH, len(inputs)):
+                return
+            if last_published_at is not None and time.monotonic() - last_published_at < SHORTLIST_LIVE_INTERVAL:
+                return
+        stats = {"processed_count": count, "total_jobs": len(inputs),
+                 "recommended_count": recommended_count, "screening_version": processor.SCREENING_VERSION,
+                 "list_queue_counts": {key: queue_counts.get(key, 0) for key in LIST_QUEUE_LABELS}}
+        _write_json(task, runtime / "prepared" / "live_shortlist.json", {
+            "schema_version": "1.0", "stage": "shortlist", "attempt": info["attempt"],
+            "input_revision": info["input_revision"], "input_signature": signature,
+            "processed_count": count, "total": len(inputs), "jobs": results, "stats": stats,
+        })
+        emit.progress(count, len(inputs), stats)
+        last_published_count = count
+        # Checkpoint/manifest publication itself can be expensive. Start the
+        # next interval afterwards so one slow write cannot trigger a rewrite
+        # after every subsequent job in a large shortlist.
+        last_published_at = time.monotonic()
+
+    try:
+        for job in inputs:
+            control.check()
+            scored = processor.score_job(job) if use_default_rules else processor.score_job(job, rules=rules)
+            item = _with_flags({**job, **scored})
+            item["recommended_keep"] = bool(item["list_pass"])
+            results.append(item)
+            queue_counts[item["list_queue"]] += 1
+            recommended_count += item["recommended_keep"]
+            publish()
+    except Exception:
+        # Keep the last completed prefix readable on pause/failure. This is a
+        # preview only: finish/confirmation still require the complete input.
+        try:
+            publish(force=True)
+        except Exception:
+            pass
+        raise
+    publish(force=True)
     counts = {key: queue_counts.get(key, 0) for key in LIST_QUEUE_LABELS}
     queue_metadata = {"screening_version": processor.SCREENING_VERSION, "list_queue_counts": counts}
     _index(task, runtime, results, metadata=queue_metadata)
@@ -707,10 +789,11 @@ def _run_shortlist(task: ReviewTask, runtime: Path, control: StageControl, emit:
         _write_json(task, runtime / "prepared" / "jd_shortlists" / filename,
                     {**queue_metadata, "list_queue": key, "total": len(queued), "jobs": queued})
     stats = {"total_jobs": len(results), "processed_count": len(results),
-             "recommended_count": sum(j.get("recommended_keep") is True for j in results),
+             "recommended_count": recommended_count,
+             "stage_rules": rules,
              **queue_metadata}
     emit.log(f"列表宽筛完成：{len(results)} 岗；明确相关 {counts['relevant']}、待核实 {counts['verify']}、剔除 {counts['excluded']}。"
-             f"默认建议保留前两类 {stats['recommended_count']} 岗；可显式仅保留明确相关或加入待核实，人工确认之前不会补抓 JD。")
+             f"当前规则建议保留 {stats['recommended_count']} 岗；可显式仅保留明确相关或加入待核实，人工确认之前不会补抓 JD。")
     return results, stats
 
 
@@ -864,11 +947,66 @@ def _jd_stats(inputs: list[dict], details: dict[str, dict], manifest: dict) -> d
             "jd_pending_count": len(inputs) - success - partial - failed - paused + paused_partial + paused_complete}
 
 
+def _jd_browser_results(inputs: list[dict], details: dict[str, dict], manifest: dict,
+                        batch_size: int, browser_mode: str) -> dict[str, str]:
+    """Aggregate every current batch against its planned browser membership."""
+    names = ("chrome", "edge") if browser_mode == "dual" else ("chrome",)
+    states: dict[str, list[str]] = {name: [] for name in names}
+    input_ids = [job_id(job) for job in inputs]
+    input_keys = set(input_ids)
+    covered: set[str] = set()
+    records = [row for row in manifest.get("records", []) if isinstance(row, dict)]
+
+    def body_state(owned: set[str]) -> str:
+        complete = {key for key in owned if _detail_completeness(details.get(key)) == "complete"}
+        return "completed" if complete == owned else "partial" if owned.intersection(details) else "pending"
+
+    for record in records:
+        record_keys = set(map(str, record.get("job_ids") or record.get("missing_job_ids") or []))
+        expected = record_keys.intersection(input_keys)
+        if not expected:
+            continue
+        # Current manifests keep the exact per-side plan. Older ones have the
+        # full batch membership, whose order follows this stage's input list.
+        ids = [key for key in input_ids if key in expected]
+        split = (len(ids) + 1) // 2 if browser_mode == "dual" else len(ids)
+        groups = {"chrome": set(ids[:split]), "edge": set(ids[split:])}
+        for name in names:
+            sides = record.get("browser_results")
+            side = sides.get(name) if isinstance(sides, dict) else None
+            side_plan = side.get("expected_job_ids") if isinstance(side, dict) else None
+            owned = set(map(str, side_plan)).intersection(input_keys) if isinstance(side_plan, list) else groups[name]
+            if not owned:
+                continue
+            covered.update(owned)
+            status = side.get("status") if isinstance(side, dict) else side
+            if status is None:
+                affected = set(map(str, record.get("missing_job_ids") or record.get("job_ids") or []))
+                overall = record.get("status")
+                if overall in {"paused", "failed"} and owned.intersection(affected):
+                    status = overall
+            states[name].append(status if status in {"paused", "failed", "stopped"} else body_state(owned))
+    # Include unscheduled/missing batches as well; existing rows alone cannot
+    # prove that either browser has completed its planned half of the input.
+    for start in range(0, len(input_ids), batch_size):
+        ids = input_ids[start:start + batch_size]
+        split = (len(ids) + 1) // 2 if browser_mode == "dual" else len(ids)
+        groups = {"chrome": set(ids[:split]), "edge": set(ids[split:])}
+        for name in names:
+            owned = groups[name] - covered
+            if owned:
+                states[name].append(body_state(owned))
+    priority = ("paused", "failed", "stopped", "partial", "pending")
+    return {name: next((status for status in priority if status in statuses), "completed")
+            for name, statuses in states.items()}
+
+
 def _process_command(task: ReviewTask, runtime: Path, stage: str, workers: int, batch_size: int,
                      scraper_root: Path | None, jd_workers: int = JD_DEFAULT_WORKERS,
                      browser_mode: str = "single", chrome_port: int = 9222,
                      edge_port: int = 9223, chrome_profile_dir: Path | str | None = None,
-                     edge_profile_dir: Path | str | None = None) -> list[str]:
+                     edge_profile_dir: Path | str | None = None,
+                     review_config: CodexConfig | None = None) -> list[str]:
     manifest = task.manifest
     command = [sys.executable, "-u", str(PROJECT_ROOT / "process_architecture.py"),
                "--root", manifest["source_root"], "--config", str(manifest.get("config_path") or DEFAULT_CONFIG),
@@ -878,16 +1016,25 @@ def _process_command(task: ReviewTask, runtime: Path, stage: str, workers: int, 
                "--edge-port", str(edge_port),
                "--no-wait-on-gate"]
     if stage == "llm":
-        model, reasoning_effort = _project_model_options()
+        model, reasoning_effort = ((review_config.model, review_config.reasoning_effort)
+                                   if review_config is not None else _project_model_options())
         command.extend(("--model", model, "--reasoning-effort", reasoning_effort,
-                        "--api-mode", _project_api_mode()))
+                        "--api-mode", review_config.api_mode if review_config is not None else _project_api_mode()))
+        if review_config is not None:
+            command.append("--config-stdin")
+    elif stage == "fetch-jd":
+        rules = stage_rules.validate_stage_rules("fetch-jd", task.get_stage_rules("fetch-jd"))
+        command.extend(("--jd-scroll-count", str(rules["scroll_count"]),
+                        "--detail-speed-profile", rules["detail_speed_profile"],
+                        "--jd-page-wait-min", str(rules["page_wait_min"]),
+                        "--jd-page-wait-max", str(rules["page_wait_max"])))
     if scraper_root:
         command.extend(("--scraper-root", str(scraper_root)))
     if chrome_profile_dir:
         command.extend(("--chrome-profile-dir", str(chrome_profile_dir)))
     if edge_profile_dir:
         command.extend(("--edge-profile-dir", str(edge_profile_dir)))
-    return command
+    return _ReviewCommand(command, review_config) if review_config is not None else command
 
 
 def _run_jd(task: ReviewTask, runtime: Path, scraper_root: Path | None, workers: int,
@@ -896,14 +1043,28 @@ def _run_jd(task: ReviewTask, runtime: Path, scraper_root: Path | None, workers:
             chrome_port: int = 9222, edge_port: int = 9223,
             chrome_profile_dir: Path | str | None = None,
             edge_profile_dir: Path | str | None = None) -> tuple[list[dict], dict, str, list[str]]:
+    processor.validate_browser_configs(browser_mode, {
+        "chrome": {"port": chrome_port, "profile_dir": chrome_profile_dir},
+        "edge": {"port": edge_port, "profile_dir": edge_profile_dir},
+    })
     inputs = task.input_jobs("fetch-jd")
+    rules = stage_rules.validate_stage_rules("fetch-jd", task.get_stage_rules("fetch-jd"))
+    scroll_count = rules["scroll_count"]
+    page_wait_min, page_wait_max = rules["page_wait_min"], rules["page_wait_max"]
     _index(task, runtime, inputs)
     folder = runtime / "prepared" / "jd_shortlists"
     _write_json(task, folder / "jd_input.json", {"total": len(inputs), "jobs": inputs})
     if not inputs:
         _write_json(task, folder / "details.json", [])
-        _write_json(task, folder / "details_manifest.json", {"total_jobs": 0, "records": [], "status": "completed"})
-        return [], {**_jd_stats([], {}, {}), "jd_workers": jd_workers, "scroll_count": JD_SCROLL_COUNT,
+        _write_json(task, folder / "details_manifest.json", {
+            "total_jobs": 0, "records": [], "status": "completed",
+            "jd_workers": jd_workers, "scroll_count": scroll_count,
+            "detail_speed_profile": rules["detail_speed_profile"],
+            "page_wait_min": page_wait_min, "page_wait_max": page_wait_max,
+            "browser_mode": browser_mode,
+        })
+        return [], {**_jd_stats([], {}, {}), "jd_workers": jd_workers, "scroll_count": scroll_count,
+                    "page_wait_min": page_wait_min, "page_wait_max": page_wait_max, "stage_rules": rules,
                     "browser_mode": browser_mode,
                     "browser_results": {"chrome": "completed"} if browser_mode == "single" else
                     {"chrome": "completed", "edge": "completed"}}, "completed", []
@@ -913,37 +1074,23 @@ def _run_jd(task: ReviewTask, runtime: Path, scraper_root: Path | None, workers:
     def monitor() -> None:
         details, manifest = _detail_checkpoint(task, runtime, inputs)
         stats = _jd_stats(inputs, details, manifest)
-        stats.update(jd_workers=jd_workers, scroll_count=JD_SCROLL_COUNT, browser_mode=browser_mode)
+        stats.update(jd_workers=jd_workers, scroll_count=scroll_count, browser_mode=browser_mode,
+                     page_wait_min=page_wait_min, page_wait_max=page_wait_max,
+                     browser_results=_jd_browser_results(inputs, details, manifest, batch_size, browser_mode))
         emit.progress(stats["jd_success_count"] + stats["jd_partial_count"], len(inputs), stats)
 
-    emit.log(f"JD 仅补抓正文：页面并发 {jd_workers}，每页滚动 {JD_SCROLL_COUNT} 次，浏览器模式 {browser_mode}；本步不进行关键词或职责筛选。")
+    emit.log(f"JD 仅补抓正文：页面并发 {jd_workers}，每页滚动 {scroll_count} 次，速度档位 {rules['detail_speed_profile']}，每页额外等待 {page_wait_min}–{page_wait_max} 秒，浏览器模式 {browser_mode}；本步不进行关键词或职责筛选。")
     code = _run_child(task, "fetch-jd", _process_command(
         task, runtime, "fetch-jd", workers, batch_size, scraper_root, jd_workers,
         browser_mode, chrome_port, edge_port, chrome_profile_dir, edge_profile_dir,
     ), control, emit, monitor)
     details, manifest = _detail_checkpoint(task, runtime, inputs)
     stats = _jd_stats(inputs, details, manifest)
-    # Prefer the latest per-batch checkpoint: readiness only says that a CDP
-    # endpoint was available before work started and must not hide a later
-    # login/security pause reported by a browser side.
-    browser_results = None
-    for entry in reversed(manifest.get("records", []) if isinstance(manifest, dict) else []):
-        if isinstance(entry, dict) and isinstance(entry.get("browser_results"), dict):
-            browser_results = entry["browser_results"]
-            break
-    if not isinstance(browser_results, dict):
-        browser_results = manifest.get("browser_readiness") if isinstance(manifest, dict) else None
-        if isinstance(browser_results, dict):
-            browser_results = {
-                name: ("completed" if value.get("ready") is True else "failed")
-                if isinstance(value, dict) else str(value)
-                for name, value in browser_results.items()
-            }
-    if not isinstance(browser_results, dict):
-        browser_results = {"chrome": "completed"} if browser_mode == "single" else {
-            "chrome": "completed", "edge": "completed",
-        }
-    stats.update(jd_workers=jd_workers, scroll_count=JD_SCROLL_COUNT,
+    # Readiness and a later successful batch cannot hide a failed/paused side
+    # in another relevant batch, or jobs absent from the checkpoint entirely.
+    browser_results = _jd_browser_results(inputs, details, manifest, batch_size, browser_mode)
+    stats.update(jd_workers=jd_workers, scroll_count=scroll_count, stage_rules=rules,
+                 page_wait_min=page_wait_min, page_wait_max=page_wait_max,
                  browser_mode=browser_mode, browser_results=browser_results)
     # A previous, wider selection may have left unrelated paused batches.
     # Only a gate affecting this step's confirmed jobs can pause this step.
@@ -1007,14 +1154,14 @@ def _project_api_mode() -> str:
     return settings.get("api_mode", "responses")
 
 
-def _provider_hash() -> str | None:
+def _review_config_snapshot() -> CodexConfig:
+    from llm_client import load_review_config
+    return load_review_config()
+
+
+def _provider_hash(config: CodexConfig | None = None) -> str | None:
     try:
-        from llm_client import load_codex_config
-        model, reasoning_effort = _project_model_options()
-        config = load_codex_config(model=model, reasoning_effort=reasoning_effort,
-                                   api_mode=_project_api_mode(),
-                                   project_settings_path=project_llm_settings.default_settings_path())
-        return provider_signature(config)
+        return provider_signature(config if config is not None else _review_config_snapshot())
     except Exception:
         return None
 
@@ -1064,7 +1211,7 @@ def _task_report_prompt(task: ReviewTask) -> str | None:
 def _run_reviews(task: ReviewTask, runtime: Path, workers: int, batch_size: int,
                  control: StageControl, emit: _Emitter) -> tuple[list[dict], dict, str, list[str]]:
     inputs = task.input_jobs("llm")
-    eligible = [j for j in inputs if j.get("jd_completeness") == "complete" and processor.text(j.get("jd")).strip()]
+    eligible = [j for j in inputs if _detail_completeness(j) == "complete" and processor.text(j.get("jd")).strip()]
     _index(task, runtime, inputs)
     folder = runtime / "prepared" / "jd_shortlists"
     _write_json(task, folder / "jd_input.json", {"total": len(eligible), "jobs": eligible})
@@ -1072,7 +1219,12 @@ def _run_reviews(task: ReviewTask, runtime: Path, workers: int, batch_size: int,
     review_path, manifest_path = runtime / "prepared" / "llm_reviews.json", runtime / "prepared" / "llm_manifest.json"
     jsonl_path = runtime / "prepared" / "llm_reviews.jsonl"
     context_path = runtime / "review_cache_context.json"
-    provider = _provider_hash() if eligible else None
+    config = None
+    try:
+        config = _review_config_snapshot() if eligible else None
+        provider = _provider_hash(config) if config is not None else None
+    except Exception:
+        provider = None
     prompt_path = None
     try:
         prompt = processor.load_prompt() if provider is not None else None
@@ -1106,8 +1258,12 @@ def _run_reviews(task: ReviewTask, runtime: Path, workers: int, batch_size: int,
 
     write_reviews(selection)
     # Retain the sidecar for diagnostics/older readers, never as cache proof.
+    info = task.manifest["stages"]["llm"]
     _write_json(task, context_path, {"cache_version": REVIEW_CACHE_VERSION, "inputs": hashes,
-                                      "input_signatures": input_hashes, "provider": provider})
+                                      "input_signatures": input_hashes, "provider": provider,
+                                      "attempt": info.get("attempt"), "input_revision": info.get("input_revision"),
+                                      "input_ids": info.get("input_ids", []),
+                                      "review_prompt_file": prompt_path.relative_to(task.path).as_posix() if prompt_path else None})
 
     def review_map() -> dict[str, dict]:
         value = _read_json(task, review_path, {})
@@ -1147,6 +1303,9 @@ def _run_reviews(task: ReviewTask, runtime: Path, workers: int, batch_size: int,
     initial_manifest = {"candidate_count": len(eligible), "completed_count": selection.hit_count,
                         "pending_count": len(eligible) - selection.hit_count, "failed_count": 0,
                         "fallback_count": 0, "workers": workers, **counts}
+    if config is not None:
+        initial_manifest.update(model=config.model, reasoning_effort=config.effective_reasoning_effort,
+                                api_mode=config.api_mode, chat_stream=config.chat_stream)
     # Do not let a stale final manifest describe a newly started/interrupted
     # invocation.  The child will replace this with its own checkpoints.
     _write_json(task, manifest_path, {**initial_manifest, "status": "running"})
@@ -1158,7 +1317,7 @@ def _run_reviews(task: ReviewTask, runtime: Path, workers: int, batch_size: int,
         code = 0
         _write_json(task, manifest_path, {**initial_manifest, "status": "completed"})
     elif eligible:
-        command = _process_command(task, runtime, "llm", workers, batch_size, None)
+        command = _process_command(task, runtime, "llm", workers, batch_size, None, review_config=config)
         command.extend(("--prompt-file", str(prompt_path), "--conversation-size", "1"))
         emit.log(f"AI 使用 {workers} 个并发请求，每个岗位独立复核；不跨岗位续接会话或重放历史。"
                  "每岗单独校验并保存检查点，已有有效成功结果继续复用。")
@@ -1214,22 +1373,15 @@ def _run_reviews(task: ReviewTask, runtime: Path, workers: int, batch_size: int,
     results = []
     for job in inputs:
         item = _analyze_ai_stage(job, reviews.get(job_id(job)))
-        if job.get("jd_completeness") == "complete" and job_id(job) not in reviews:
+        if _detail_completeness(job) == "complete" and job_id(job) not in reviews:
             item["model_error"] = issues[0] if issues else "未获得有效AI判断；岗位不进入保留或剔除名单，待人工核实"
         results.append(item)
     _index(task, runtime, results)
-    try:
-        settings = project_llm_settings.load_settings(project_llm_settings.default_settings_path()) or {}
-    except project_llm_settings.ProjectProviderError:
-        settings = {}
-    model = manifest.get("model") or settings.get("model", AI_DEFAULT_MODEL)
-    api_mode = manifest.get("api_mode") or settings.get("api_mode", project_llm_settings.API_MODE_RESPONSES)
-    configured_effort = settings.get("reasoning_effort", AI_DEFAULT_REASONING_EFFORT)
-    verified = project_llm_settings.is_chat_reasoning_verified(
-        settings.get("base_url", project_llm_settings.DEFAULT_BASE_URL), model, configured_effort,
-        settings.get("chat_reasoning_verified_for", ""), chat_stream=settings.get("chat_stream", False),
-    )
-    effective_effort = manifest.get("reasoning_effort", configured_effort if api_mode == "responses" or verified else None)
+    model = config.model if config is not None else AI_DEFAULT_MODEL
+    api_mode = config.api_mode if config is not None else project_llm_settings.API_MODE_RESPONSES
+    effective_effort = config.effective_reasoning_effort if config is not None else None
+    stats.update(model=model, api_mode=api_mode, reasoning_effort=effective_effort,
+                 chat_stream=config.chat_stream if config is not None else False)
     mode_label = project_llm_settings.API_MODE_LABELS[api_mode]
     effort_label = f"强度 {effective_effort}" if effective_effort is not None else "Chat 思考强度未验证，未发送"
     stats["llm_verification_count"] = sum(item["llm_stage_decision"] == "pending_verification" for item in results)
@@ -1409,12 +1561,15 @@ def execute_stage(task: ReviewTask, stage: str, *, scraper_root: Path | None = N
         emit.log(f"已重置「{STAGE_LABELS[stage]}」：本阶段文件与进度已清理，尚未运行；需要再次点击运行本步。")
         emit.emit("finished", result["stages"][stage])
         return result
-    if type(workers) is not int or not 1 <= workers <= MAX_WORKERS:
+    if stage == "llm" and (type(workers) is not int or not 1 <= workers <= MAX_WORKERS):
         raise ValueError("AI 并发数须为 1–32。")
-    if type(jd_workers) is not int or not 1 <= jd_workers <= MAX_WORKERS:
+    if stage == "fetch-jd" and (type(jd_workers) is not int or not 1 <= jd_workers <= MAX_WORKERS):
         raise ValueError("JD 页面并发数须为 1–32。")
-    if type(batch_size) is not int or not 1 <= batch_size <= 100:
+    if stage == "fetch-jd" and (type(batch_size) is not int or not 1 <= batch_size <= 100):
         raise ValueError("JD 每批数量须为 1–100。")
+    workers = workers if stage == "llm" else AI_DEFAULT_WORKERS
+    jd_workers = jd_workers if stage == "fetch-jd" else JD_DEFAULT_WORKERS
+    batch_size = batch_size if stage == "fetch-jd" else 30
     control = control or StageControl()
     chrome_profile_dir = chrome_profile_dir or chrome_profile
     edge_profile_dir = edge_profile_dir or edge_profile
@@ -1448,6 +1603,9 @@ def execute_stage(task: ReviewTask, stage: str, *, scraper_root: Path | None = N
         status, issues = "completed", []
         if stage == "import":
             rows, stats = _run_import(task, runtime, control, emit)
+            if stats.get("invalid_files"):
+                issues.append(f"{stats['invalid_file_count']} 个源文件无效，未导入其内容；请核对数据源后重新导入：" +
+                              "、".join(stats["invalid_files"]))
         elif stage == "shortlist":
             rows, stats = _run_shortlist(task, runtime, control, emit)
         elif stage == "fetch-jd":

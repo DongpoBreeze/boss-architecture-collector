@@ -29,9 +29,12 @@ from pathlib import Path
 from typing import Any, Callable, Iterable, Iterator, TextIO
 
 import browser_setup
-from jd_parallel import detail_completeness, detail_quality as _detail_quality
+from checkpoint_io import read_json as read_checkpoint_json, replace_with_retry
+from desktop_data import company_name_source, experience_source
+from jd_parallel import detail_completeness, detail_quality as _detail_quality, validate_browser_configs
 from project_resources import DEFAULT_CONFIG, DEFAULT_PROMPT as PROMPT_PATH, PROJECT_ROOT
 import project_llm_settings
+import stage_rules
 from screening_policy import (
     AI_DEFAULT_MODEL, AI_DEFAULT_REASONING_EFFORT, AI_DEFAULT_WORKERS,
     JD_DEFAULT_WORKERS, JD_SCROLL_COUNT, MAX_WORKERS, LIST_QUEUE_LABELS,
@@ -78,18 +81,21 @@ _REQUIREMENT_HEADINGS = (
     "任职要求", "任职资格", "职位要求", "岗位要求", "任职条件", "岗位条件",
     "基本要求", "必备条件", "硬性要求", "技能要求", "专业要求", "技术要求",
     "经验要求", "职位资格", "要求", "加分项", "优先条件", "优先资格",
-    "requirements", "qualifications", "preferred qualifications", "benefits",
+    "requirements", "qualifications", "preferred qualifications",
 )
 _OTHER_HEADINGS = (
-    "我们提供", "福利待遇", "薪酬福利", "公司介绍", "关于我们", "公司简介",
-    "团队介绍", "企业文化", "about us", "who we are", "what we offer",
+    "我们提供", "福利待遇", "薪酬福利", "福利", "公司介绍", "关于我们", "公司简介",
+    "团队介绍", "企业文化", "about us", "who we are", "what we offer", "benefits",
 )
 _SECTION_HEADING_RE = re.compile(
-    r"(?:^|(?<=[\r\n])|(?<=[。；;]))[ \t]*(?:#{1,6}[ \t]*|[•*▪-][ \t]*|\d+[、.)）][ \t]*)?"
+    r"(?:^|(?<=[\r\n])|(?<=[。；;]))[ \t]*"
+    r"(?:#{1,6}[ \t]*|[•*▪-][ \t]*)?"
+    r"(?:(?:[（(][一二三四五六七八九十百\d]+[）)]|[一二三四五六七八九十百\d]+[、.．)）])[ \t]*)?"
+    r"(?:[【\[（(][ \t]*)?"
     r"(?P<heading>" + "|".join(
         re.escape(value) for value in sorted((*_DUTY_HEADINGS, *_REQUIREMENT_HEADINGS, *_OTHER_HEADINGS),
                                              key=len, reverse=True)
-    ) + r")[ \t]*(?:[:：][ \t]*|[ \t]+|(?=\r?$))",
+    ) + r")(?:[ \t]*[】\]）)][ \t]*[:：]?[ \t]*|[ \t]*[:：][ \t]*|[ \t]+|(?=\r?$))",
     re.I | re.M,
 )
 _DUTY_ACTION_RE = re.compile(
@@ -269,7 +275,7 @@ def extract_jd_sections(jd: str, *, preserve_responsibilities: bool = False) -> 
 
 
 def read_json(path: Path) -> Any:
-    return json.loads(path.read_text(encoding="utf-8-sig"))
+    return read_checkpoint_json(path)
 
 
 @contextmanager
@@ -284,18 +290,9 @@ def _atomic_text_writer(path: Path) -> Iterator[TextIO]:
                                          dir=path.parent, delete=False) as handle:
             temporary = Path(handle.name)
             yield handle
-        for attempt in range(5):
-            try:
-                os.replace(temporary, path)
-                break
-            except OSError as exc:
-                # Windows may report reader sharing violations as access
-                # denied (5), sharing violation (32), or lock violation (33).
-                # Retry only replacement, for at most 100 ms in total.
-                if (not isinstance(exc, PermissionError)
-                        and getattr(exc, "winerror", None) not in {5, 32, 33}) or attempt == 4:
-                    raise
-                time.sleep(.01 * (attempt + 1))
+            handle.flush()
+            os.fsync(handle.fileno())
+        replace_with_retry(temporary, path)
     finally:
         if temporary is not None:
             try:
@@ -747,10 +744,54 @@ def identity_values(row: dict[str, Any]) -> list[tuple[str, str]]:
 _SOURCE_FIELDS = ("title", "salary", "skills", "skill_tags", "job_labels")
 _SOURCE_METADATA = ("source_file", "source_row", "source_line_number", "source_context",
                     "field_candidates", "field_conflicts")
+_DELIVERY_IDENTITY_FIELDS = ("boss_job_id", "encrypt_job_id", "encryptJobId",
+                             "job_link", "job_url", "link", "url")
+_COMPANY_MERGE_FIELDS = ("company", "company_name_source")
+_EXPERIENCE_MERGE_FIELDS = ("experience", "experience_source")
 
 
 def _stable_value(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, sort_keys=True, default=text)
+
+
+def _merge_delivery_identities(item: dict[str, Any], row: dict[str, Any]) -> None:
+    """Keep raw target alternatives, including identities displaced by dedupe."""
+    prior = row.get("delivery_identity_candidates")
+    # An already merged row can combine display fields from different raw
+    # rows. Its saved candidates are the originals; do not invent a new pair.
+    incoming = list(prior) if isinstance(prior, list) else []
+    current = {key: row[key] for key in _DELIVERY_IDENTITY_FIELDS
+               if row.get(key) not in (None, "", [], {})}
+    if any(not any(isinstance(candidate, dict) and key in candidate
+                   and _stable_value(candidate[key]) == _stable_value(value) for candidate in incoming)
+           for key, value in current.items()):
+        incoming.append(current)
+    known = {}
+    for source in [*(item.get("delivery_identity_candidates") or []), *incoming]:
+        if not isinstance(source, dict):
+            continue
+        candidate = {key: source[key] for key in _DELIVERY_IDENTITY_FIELDS
+                     if source.get(key) not in (None, "", [], {})}
+        if candidate:
+            known[_stable_value(candidate)] = candidate
+    item["delivery_identity_candidates"] = [known[key] for key in sorted(known)]
+
+
+def _merge_company_name(item: dict[str, Any], row: dict[str, Any]) -> None:
+    name, source = company_name_source(row)
+    current, current_source = company_name_source(item)
+    if name and (not current or current_source == "legacy_api_boss_name" and source != current_source):
+        item["company"] = name
+        item["company_name_source"] = source
+
+
+def _merge_experience(item: dict[str, Any], row: dict[str, Any]) -> None:
+    value, source = experience_source(row)
+    current, current_source = experience_source(item)
+    explicit_sources = ("experience", "job_experience", "jobExperience")
+    if value and (not current or current_source not in explicit_sources and source in explicit_sources):
+        item["experience"] = value
+        item["experience_source"] = source
 
 
 def _field_source_reference(source: dict[str, Any]) -> dict[str, Any]:
@@ -761,22 +802,42 @@ def _field_source_reference(source: dict[str, Any]) -> dict[str, Any]:
     return reference
 
 
-def _merge_field_candidates(item: dict[str, Any], row: dict[str, Any], sources: list[dict]) -> None:
+def _company_candidate_value(value: Any) -> Any:
+    """Retain company names, never unrelated/recruiter fields from objects."""
+    if isinstance(value, str):
+        return value.strip() or None
+    if isinstance(value, dict):
+        return {key: value[key].strip() for key in stage_rules.IMPORT_COMPANY_NAME_FIELDS
+                if isinstance(value.get(key), str) and value[key].strip()} or None
+    return None
+
+
+def _merge_field_candidates(item: dict[str, Any], row: dict[str, Any], sources: list[dict], *,
+                            company_row: dict[str, Any] | None = None) -> None:
     """Keep each observed value attached to its original source contexts."""
     destination = item.setdefault("field_candidates", {})
     prior = row.get("field_candidates")
     prior = prior if isinstance(prior, dict) else {}
-    for field in _SOURCE_FIELDS:
+    for field in (*_SOURCE_FIELDS, *stage_rules.IMPORT_COMPANY_FIELDS):
         incoming = prior.get(field)
         if not isinstance(incoming, list) or not incoming:
-            value = row.get(field)
+            original = company_row if company_row is not None and field in stage_rules.IMPORT_COMPANY_FIELDS else row
+            value = original.get(field)
+            if field == "company" and value in (None, "", [], {}):
+                # Verified legacy API names were resolved on this original row
+                # before dedupe; no other recruiter fields are candidates.
+                value = row.get(field)
             incoming = [{"value": value, "sources": sources}] if value not in (None, "", [], {}) else []
         known = {_stable_value(entry["value"]): entry for entry in destination.get(field, [])}
         for entry in incoming:
             if not isinstance(entry, dict) or entry.get("value") in (None, "", [], {}):
                 continue
-            key = _stable_value(entry["value"])
-            candidate = known.setdefault(key, {"value": entry["value"], "sources": []})
+            value = (_company_candidate_value(entry["value"])
+                     if field in stage_rules.IMPORT_COMPANY_FIELDS else entry["value"])
+            if value in (None, "", [], {}):
+                continue
+            key = _stable_value(value)
+            candidate = known.setdefault(key, {"value": value, "sources": []})
             for source in entry.get("sources", sources):
                 if isinstance(source, dict):
                     reference = _field_source_reference(source)
@@ -804,8 +865,18 @@ def merge_rows(rows: Iterable[dict[str, Any]]) -> tuple[list[dict[str, Any]], di
     by_key: dict[str, dict[str, Any]] = {}
     aliases: dict[str, str] = {}
     raw_count = 0
-    for row in rows:
+    for source_row in rows:
         raw_count += 1
+        # Resolve company/experience on each original row before generic
+        # dedupe can mix company evidence or otherwise ambiguous tags. Work on copies
+        # so imports never rewrite raw collection files or caller dictionaries.
+        row = dict(source_row)
+        name, source = company_name_source(row)
+        row["company"] = name
+        row["company_name_source"] = source or "unavailable"
+        experience, experience_origin = experience_source(row)
+        row["experience"] = experience
+        row["experience_source"] = experience_origin or "unavailable"
         identities = identity_values(row)
         if not identities:
             key = f"unkeyed:{raw_count}"
@@ -819,6 +890,7 @@ def merge_rows(rows: Iterable[dict[str, Any]]) -> tuple[list[dict[str, Any]], di
             item["dedupe_key"] = key
             item["dedupe_key_type"] = identities[0][1] if identities else "synthetic_source_row"
             item["observed_in"] = []
+            item["delivery_identity_candidates"] = []
             by_key[key] = item
         # A later row can connect two previously separate records (for
         # example, one record has only job_id and another only encrypt_job_id,
@@ -828,8 +900,11 @@ def merge_rows(rows: Iterable[dict[str, Any]]) -> tuple[list[dict[str, Any]], di
             other = by_key.pop(other_key, None)
             if other is None:
                 continue
+            _merge_delivery_identities(item, other)
+            _merge_company_name(item, other)
+            _merge_experience(item, other)
             for field, value in other.items():
-                if field in (*_SOURCE_METADATA, "observed_in"):
+                if field in (*_SOURCE_METADATA, *_COMPANY_MERGE_FIELDS, *_EXPERIENCE_MERGE_FIELDS, "observed_in"):
                     continue
                 if not item.get(field) and value not in (None, "", [], {}):
                     item[field] = value
@@ -840,9 +915,12 @@ def merge_rows(rows: Iterable[dict[str, Any]]) -> tuple[list[dict[str, Any]], di
             for alias, alias_key in list(aliases.items()):
                 if alias_key == other_key:
                     aliases[alias] = key
+        _merge_company_name(item, row)
+        _merge_experience(item, row)
         for field, value in row.items():
-            if field not in _SOURCE_METADATA and not item.get(field) and value not in (None, "", [], {}):
+            if field not in (*_SOURCE_METADATA, *_COMPANY_MERGE_FIELDS, *_EXPERIENCE_MERGE_FIELDS, "delivery_identity_candidates") and not item.get(field) and value not in (None, "", [], {}):
                 item[field] = value
+        _merge_delivery_identities(item, row)
         for value, _ in identities:
             aliases[value] = key
         existing_contexts = row.get("observed_in")
@@ -874,7 +952,7 @@ def merge_rows(rows: Iterable[dict[str, Any]]) -> tuple[list[dict[str, Any]], di
                 item["observed_in"].append(context)
             if not _has_observed_context(row_contexts, context):
                 row_contexts.append(context)
-        _merge_field_candidates(item, row, row_contexts)
+        _merge_field_candidates(item, row, row_contexts, company_row=source_row)
     jobs = list(by_key.values())
     for item in jobs:
         candidates = item.get("field_candidates", {})
@@ -882,7 +960,10 @@ def merge_rows(rows: Iterable[dict[str, Any]]) -> tuple[list[dict[str, Any]], di
         for field, entries in candidates.items():
             # Display fields are stable without inventing a preferred source.
             # Screening below inspects all candidates and their original context.
-            item[field] = entries[0]["value"]
+            # Company display/source priority is already resolved above; its
+            # candidates only widen import-rule evidence, not list/AI inputs.
+            if field in _SOURCE_FIELDS:
+                item[field] = entries[0]["value"]
         if not item.get("job_id"):
             item["job_id"] = item.get("dedupe_key")
     return jobs, {"raw_list_rows": raw_count, "unique_job_count": len(jobs), "dedupe_removed": raw_count - len(jobs)}
@@ -1135,11 +1216,13 @@ def _semantic_role_exclusions(title: str, fields: dict[str, str], *, title_as_co
     return {**flags, "reasons": reasons, "evidence": evidence, "application_counter": application_counter, "sales_counter": sales_counter, "system_counter": system_counter}
 
 
-def score_job(job: dict[str, Any]) -> dict[str, Any]:
+def score_job(job: dict[str, Any], rules: dict | None = None) -> dict[str, Any]:
     """Assign one list queue from positive title/skill clues, never JD duties."""
 
+    config = (stage_rules.default_stage_rules("shortlist") if rules is None
+              else stage_rules.validate_stage_rules("shortlist", rules))
     raw_fields = {key: " | ".join(text(value).strip() for value in _field_values(job, key))
-                  for key in ("title", "skills", "skill_tags", "job_labels") if _field_values(job, key)}
+                  for key in stage_rules.SHORTLIST_MATCH_FIELDS if _field_values(job, key)}
     fields = {key: _responsibility_text(value) for key, value in raw_fields.items()}
     title = fields.get("title", "")
     source = " | ".join(fields.values())
@@ -1212,29 +1295,66 @@ def score_job(job: dict[str, Any]) -> dict[str, Any]:
     add_family("自动化/RPA过渡", has(("RPA", "流程自动化", "业务自动化")), ("RPA", "流程自动化", "业务自动化"))
     exclusions = _semantic_role_exclusions(title, raw_fields)
     development = detect_pure_development(fields)
-    if development["excluded"]:
+    if not config["use_default_direction_rules"]:
+        families, evidence, priority_families, hits, score = [], [], [], [], 0
+        exclusions["reasons"], exclusions["evidence"] = [], []
+    if config["exclude_pure_development"] and development["excluded"]:
         exclusions["reasons"].extend(development["reasons"])
         exclusions["evidence"].extend(development["evidence"])
+    elif development["excluded"] and not families:
+        families.append("纯开发排除已关闭，方向待核实")
     conflict_notes = _source_conflict_notes(job)
     if conflict_notes:
         # A positive value from another source must not erase an explicit role
         # exclusion supported by one original title/skills observation.
         projections: dict[str, dict[str, str]] = {}
-        for field in ("title", "skills", "skill_tags", "job_labels"):
+        for field in stage_rules.SHORTLIST_MATCH_FIELDS:
             for entry in (job.get("field_candidates") or {}).get(field, []):
                 for context in entry.get("sources", []):
                     projections.setdefault(_stable_value(context), {})[field] = text(entry["value"])
         for source_fields in projections.values():
             source_exclusions = _semantic_role_exclusions(source_fields.get("title", ""), source_fields)
             source_development = detect_pure_development(source_fields)
-            exclusions["reasons"].extend(source_exclusions["reasons"] + source_development["reasons"])
-            exclusions["evidence"].extend(source_exclusions["evidence"] + source_development["evidence"])
+            if config["use_default_direction_rules"]:
+                exclusions["reasons"].extend(source_exclusions["reasons"])
+                exclusions["evidence"].extend(source_exclusions["evidence"])
+            if config["exclude_pure_development"]:
+                exclusions["reasons"].extend(source_development["reasons"])
+                exclusions["evidence"].extend(source_development["evidence"])
         exclusions["reasons"] = list(dict.fromkeys(exclusions["reasons"]))
     salaries = [parse_salary(value) for value in _field_values(job, "salary")]
     salary_below_target = bool(salaries) and all(value["upper_k"] is not None and value["upper_k"] < SALARY_TARGET_K for value in salaries)
-    if salary_below_target:
+    if salary_below_target and config["use_default_direction_rules"]:
         exclusions["reasons"].append(SALARY_CEILING_REASON)
         exclusions["evidence"].append({"family": SALARY_CEILING_REASON, "field": "salary", "quote": " / ".join(text(value) for value in _field_values(job, "salary"))})
+    # User words are literal, case-insensitive substrings. They inspect the
+    # same list-field whitelist as direction rules, including source variants;
+    # neither arbitrary nested metadata nor JD text can create a match.
+    def keyword_evidence(words: list[str], family: str) -> tuple[list[str], list[dict]]:
+        matched, found = [], []
+        for word in words:
+            matching = [(field, value) for field, value in raw_fields.items()
+                        if word.casefold() in value.casefold()]
+            if matching:
+                matched.append(word)
+                found.extend({"family": family, "field": field, "quote": value} for field, value in matching)
+        return matched, found
+
+    if config["include_keywords"]:
+        matched, found = keyword_evidence(config["include_keywords"], "自定义包含词")
+        if matched:
+            families.append("自定义包含词")
+            priority_families.append("自定义包含词")
+            evidence.extend(found)
+            hits.extend(matched)
+        else:
+            exclusions["reasons"].append("未命中自定义包含词")
+    elif not config["use_default_direction_rules"]:
+        families.append("自定义规则未限制包含词，方向待核实")
+    matched, found = keyword_evidence(config["exclude_keywords"], "自定义排除词")
+    if matched:
+        exclusions["reasons"].append("命中自定义排除词：" + "、".join(matched))
+        exclusions["evidence"].extend(found)
     list_pass = bool(families) and not exclusions["reasons"]
     # Strong title evidence can be relevant even with no skill tags. Only
     # substantive role/object ambiguity demotes it; neither queue is JD proof.
@@ -1244,11 +1364,11 @@ def score_job(job: dict[str, Any]) -> dict[str, Any]:
     unclear_domain = has((*HARDWARE_OBJECT_TERMS, "芯片", "半导体", "整车", "硬件", "数据中心", "IDC", "CUDA", "算子", "编译器", "基础设施", "底层架构", "平台架构")) and not has((*INTEGRATION_TERMS, "客户技术方案", "方案设计", "业务场景", "业务流程", "业务自动化", "企业知识库"))
     unclear_sales = _has_sales_title(title) and not exclusions["sales_counter"]
     ambiguity = list(conflict_notes)
-    if unclear_sales:
+    if config["use_default_direction_rules"] and unclear_sales:
         ambiguity.append("销售/商务标题尚无本人技术方案、集成或交付证据")
-    if weak_specialist:
+    if config["use_default_direction_rules"] and weak_specialist:
         ambiguity.append("算法/基础设施仅为相邻方向，应用与底层研发边界待核实")
-    if unclear_domain:
+    if config["use_default_direction_rules"] and unclear_domain:
         ambiguity.append("行业/平台工作对象存在歧义，需核对业务应用与底层/硬件职责")
     if not list_pass:
         queue = "excluded"
@@ -1279,6 +1399,9 @@ def score_job(job: dict[str, Any]) -> dict[str, Any]:
         verification.extend(ambiguity)
     if list_pass:
         verification.append("列表仅用于补JD召回，六项职责及岗位硬要求仍待核实")
+    if queue == "verify" and not config["keep_verification"]:
+        list_pass = False
+        queue_reason += "；当前设置不建议保留待核实岗位"
     return {
         "score": score,
         "hit_terms": hits,
@@ -1628,24 +1751,31 @@ def detail_records_from_file(path: Path) -> list[dict[str, Any]]:
     return [item for item in records if isinstance(item, dict) and detail_key(item)]
 
 
-def browser_detail_checkpoint_status(output_path: Path, expected: set[str]) -> dict[str, dict[str, Any]]:
+def browser_detail_checkpoint_status(output_path: Path, expected: Iterable[str], *,
+                                     expected_by_browser: dict[str, set[str]] | None = None) -> dict[str, dict[str, Any]]:
     """Summarize dual-browser side checkpoints without reading browser state."""
 
+    ordered = sorted(expected) if isinstance(expected, set) else list(dict.fromkeys(expected))
+    split = (len(ordered) + 1) // 2
+    groups = expected_by_browser or {"chrome": set(ordered[:split]), "edge": set(ordered[split:])}
+    merged = {detail_key(row): row for row in detail_records_from_file(output_path)}
     result: dict[str, dict[str, Any]] = {}
     for browser in ("chrome", "edge"):
         path = output_path.with_name(f"{output_path.stem}.{browser}{output_path.suffix}")
         records = detail_records_from_file(path)
-        owned = [record for record in records if detail_key(record) in expected]
-        owned_keys = {detail_key(record) for record in owned}
-        complete = {detail_key(record) for record in owned
-                    if detail_completeness(record) == "complete"}
-        paused = any(record.get("status") == "paused" or record.get("security_or_login_gate") for record in owned)
-        # Each side owns only its half of the batch. Compare against that
-        # side's checkpoint keys rather than the full batch, otherwise both
-        # browsers would remain incorrectly labelled "partial" forever.
-        status = "paused" if paused else "completed" if complete == owned_keys and owned_keys else "partial" if owned else "pending"
-        result[browser] = {"status": status, "count": len(owned),
-                           "completed_count": len(complete), "job_ids": sorted(detail_key(record) for record in owned)}
+        owned_expected = groups.get(browser, set())
+        side = [record for record in records if detail_key(record) in owned_expected]
+        owned = {key: record for key, record in merged.items() if key in owned_expected}
+        merge_detail_records(owned, side)
+        complete = {key for key, record in owned.items() if detail_completeness(record) == "complete"}
+        paused = any(record.get("status") == "paused" or record.get("security_or_login_gate") for record in side)
+        failed = any(record.get("status") == "failed" and detail_key(record) not in complete for record in side)
+        status = ("paused" if paused else "failed" if failed else "completed" if complete == owned_expected
+                  else "partial" if owned else "pending")
+        result[browser] = {"status": status, "count": len(owned), "total": len(owned_expected),
+                           "completed_count": len(complete), "job_ids": sorted(owned),
+                           "expected_job_ids": sorted(owned_expected),
+                           "missing_job_ids": sorted(owned_expected - complete)}
     return result
 
 
@@ -1700,25 +1830,29 @@ def fetch_jd(
     edge_port: int = 9223,
     chrome_profile_dir: Path | str | None = None,
     edge_profile_dir: Path | str | None = None,
+    jd_scroll_count: int = JD_SCROLL_COUNT,
+    *,
+    jd_page_wait_min: int = 0,
+    jd_page_wait_max: int = 0,
 ) -> dict[str, Any]:
+    rendering = stage_rules.validate_stage_rules("fetch-jd", {
+        "scroll_count": jd_scroll_count, "detail_speed_profile": detail_speed_profile,
+        "page_wait_min": jd_page_wait_min, "page_wait_max": jd_page_wait_max,
+    })
+    jd_scroll_count = rendering["scroll_count"]
+    jd_page_wait_min, jd_page_wait_max = rendering["page_wait_min"], rendering["page_wait_max"]
     if type(jd_workers) is not int or not 1 <= jd_workers <= MAX_WORKERS:
         raise ValueError("JD 页面并发数须为 1–32。")
     if type(batch_size) is not int or not 1 <= batch_size <= 100:
         raise ValueError("JD 每批数量须为 1–100。")
-    if browser_mode not in {"single", "dual"}:
-        raise ValueError("browser_mode 必须为 single 或 dual。")
-    for name, port in (("Chrome", chrome_port), ("Edge", edge_port)):
-        if type(port) is not int or not 1 <= port <= 65535:
-            raise ValueError(f"{name} CDP 端口必须为 1–65535 的整数。")
     # Our launcher owns browser/profile flags; upstream only receives its CDP
     # port for login checks. This module never reads cookies.
-    chrome_profile_dir = chrome_profile_dir or _default_browser_profile("chrome")
-    edge_profile_dir = edge_profile_dir or _default_browser_profile("edge")
-    if browser_mode == "dual":
-        if chrome_port == edge_port:
-            raise ValueError("双浏览器必须使用独立 CDP 端口。")
-        if os.path.normcase(os.path.abspath(chrome_profile_dir)) == os.path.normcase(os.path.abspath(edge_profile_dir)):
-            raise ValueError("双浏览器必须使用独立 profile 目录。")
+    browser_configs = validate_browser_configs(browser_mode, {
+        "chrome": {"port": chrome_port, "profile_dir": chrome_profile_dir},
+        "edge": {"port": edge_port, "profile_dir": edge_profile_dir},
+    })
+    chrome_profile_dir = browser_configs["chrome"].profile_dir
+    edge_profile_dir = browser_configs["edge"].profile_dir
     shortlist_path = output_root / "prepared" / "jd_shortlists" / "jd_input.json"
     if not shortlist_path.exists():
         raise FileNotFoundError(f"找不到 JD 初筛输入：{shortlist_path}")
@@ -1752,7 +1886,9 @@ def fetch_jd(
             current_records[number] = record
     manifest["records"] = [current_records[number] for number in sorted(current_records)]
     manifest.update({"total_jobs": len(jobs), "batch_size": batch_size, "jd_workers": jd_workers,
-                     "scroll_count": JD_SCROLL_COUNT, "browser_mode": browser_mode,
+                     "scroll_count": jd_scroll_count, "detail_speed_profile": detail_speed_profile,
+                     "page_wait_min": jd_page_wait_min, "page_wait_max": jd_page_wait_max,
+                     "browser_mode": browser_mode,
                      "cdp_ports": {"chrome": chrome_port, "edge": edge_port},
                      "profile_dirs": {"chrome": str(chrome_profile_dir) if chrome_profile_dir else None,
                                       "edge": str(edge_profile_dir) if edge_profile_dir else None},
@@ -1773,11 +1909,23 @@ def fetch_jd(
     def is_complete(key: str) -> bool:
         return detail_completeness(details.get(key)) == "complete"
 
+    def browsers_with_pending_jobs() -> set[str]:
+        """Mirror the adapter's full-batch partition, not the pending subset."""
+        needed = set()
+        for start in range(0, len(jobs), batch_size):
+            full_batch = jobs[start:start + batch_size]
+            split = (len(full_batch) + 1) // 2
+            for browser, shard in (("chrome", full_batch[:split]), ("edge", full_batch[split:])):
+                if any(not is_complete(detail_key(job)) for job in shard):
+                    needed.add(browser)
+        return needed
+
     completed_total = sum(1 for key in job_keys if is_complete(key))
     pending_total = len(job_keys) - completed_total
     print(
         f"JD 详情进度：候选 {len(job_keys)} 条，已完成 {completed_total} 条，待抓 {pending_total} 条；"
-        f"批次 {batch_count} 个，页面并发 {jd_workers}，每页滚动 {JD_SCROLL_COUNT} 次，速度档位 {detail_speed_profile}。",
+        f"批次 {batch_count} 个，页面并发 {jd_workers}，每页滚动 {jd_scroll_count} 次，速度档位 {detail_speed_profile}，"
+        f"每页额外等待 {jd_page_wait_min}–{jd_page_wait_max} 秒。",
         flush=True,
     )
     def check_browser_ready(browser: str, port: int, profile: Path | str | None) -> tuple[bool, str | None]:
@@ -1799,17 +1947,19 @@ def fetch_jd(
     if pending_total == 0:
         cdp_ready, cdp_error = True, None
     elif browser_mode == "dual":
+        needed_browsers = browsers_with_pending_jobs()
         readiness = {}
         for browser, port, profile in (("chrome", chrome_port, chrome_profile_dir),
                                        ("edge", edge_port, edge_profile_dir)):
-            if browser == "edge" and pending_total == 1:
-                readiness[browser] = (False, None)
+            if browser not in needed_browsers:
+                # An empty or completely cached side needs no live login.
+                readiness[browser] = (True, None)
                 continue
             try:
                 readiness[browser] = check_browser_ready(browser, port, profile)
             except Exception as exc:
                 readiness[browser] = (False, f"{browser} CDP 检查失败：{type(exc).__name__}")
-        ready = [name for name, (ok, _error) in readiness.items() if ok]
+        ready = [name for name, (ok, _error) in readiness.items() if ok and name in needed_browsers]
         errors = [f"{name}: {error}" for name, (ok, error) in readiness.items() if not ok and error]
         # A healthy side can continue while the other side is paused/failed;
         # the adapter keeps side checkpoints separate for a later resume.
@@ -1844,6 +1994,7 @@ def fetch_jd(
             record = {
                 "batch": number,
                 "browser_mode": browser_mode,
+                "page_wait_min": jd_page_wait_min, "page_wait_max": jd_page_wait_max,
                 "cdp_ports": {"chrome": chrome_port, "edge": edge_port},
                 "count": len(batch),
                 "job_ids": sorted(expected),
@@ -1879,6 +2030,7 @@ def fetch_jd(
             record = {
                 "batch": number,
                 "browser_mode": browser_mode,
+                "page_wait_min": jd_page_wait_min, "page_wait_max": jd_page_wait_max,
                 "cdp_ports": {"chrome": chrome_port, "edge": edge_port},
                 "count": len(batch),
                 "job_ids": sorted(expected),
@@ -1906,12 +2058,20 @@ def fetch_jd(
             pending_batch = [job for job in batch if not is_complete(detail_key(job))]
             if not pending_batch:
                 break
-            write_json(input_path, {"keyword": "architecture-screen-jd-batch", "city": "多城市", "filters": {"degree": "203"}, "total": len(pending_batch), "jobs": pending_batch})
+            # Keep dual-browser ownership stable across retries. Seed all known
+            # results before passing the full batch; the adapter skips complete
+            # descriptions and uses the same ceil(N/2) partition every time.
+            adapter_batch = batch if browser_mode == "dual" else pending_batch
+            if browser_mode == "dual":
+                write_json(output_path, [details[key] for key in sorted(expected) if key in details])
+            write_json(input_path, {"keyword": "architecture-screen-jd-batch", "city": "多城市", "filters": {"degree": "203"}, "total": len(adapter_batch), "jobs": adapter_batch})
             command = [
                 str(python), "-u", str(PROJECT_ROOT / "jd_parallel.py"),
                 "--scraper-root", str(scraper_root), "--input", str(input_path),
                 "--detail-output", str(output_path), "--workers", str(jd_workers),
                 "--detail-speed-profile", detail_speed_profile,
+                "--scroll-count", str(jd_scroll_count),
+                "--page-wait-min", str(jd_page_wait_min), "--page-wait-max", str(jd_page_wait_max),
             ]
             command.extend(("--browser-mode", browser_mode, "--chrome-port", str(chrome_port),
                             "--edge-port", str(edge_port)))
@@ -1956,13 +2116,14 @@ def fetch_jd(
             fetched = {key for key in expected if is_complete(key)}
             completed_total = sum(1 for key in job_keys if is_complete(key))
             gate = bool(_DETAIL_GATE_RE.search(log_text))
-            browser_results = browser_detail_checkpoint_status(output_path, expected) if browser_mode == "dual" else {"chrome": {"status": "pending", "count": 0, "completed_count": 0}}
+            browser_results = browser_detail_checkpoint_status(output_path, [detail_key(job) for job in batch]) if browser_mode == "dual" else {"chrome": {"status": "pending", "count": 0, "completed_count": 0}}
             adapter_paused = completed.returncode == 2 and any(
                 value.get("status") == "paused" for value in browser_results.values())
             status = "paused" if gate or adapter_paused else "failed" if completed.returncode != 0 or not output_path.exists() else "partial" if expected - fetched else "success"
             if browser_mode != "dual":
                 browser_results = {"chrome": {"status": status, "count": len(fetched), "completed_count": len(fetched)}}
             record = {"batch": number, "browser_mode": browser_mode,
+                      "page_wait_min": jd_page_wait_min, "page_wait_max": jd_page_wait_max,
                       "cdp_ports": {"chrome": chrome_port, "edge": edge_port},
                       "browser_results": browser_results,
                       "count": len(batch), "job_ids": sorted(expected), "fetched_count": len(fetched), "missing_job_ids": sorted(expected - fetched), "input": str(input_path), "output": str(output_path), "log": str(log_path), "status": status, "exit_code": completed.returncode, "started_at": started, "finished_at": now_iso(), "elapsed_seconds": round(time.monotonic() - batch_started, 1), "progress_completed": completed_total, "progress_total": len(job_keys), "security_or_login_gate": gate}
@@ -1987,9 +2148,10 @@ def fetch_jd(
                 # until the user has completed verification and resumed.
                 return {"total_jobs": len(jobs), "details": len(details), "manifest": manifest}
             if browser_mode == "dual":
+                needed_browsers = browsers_with_pending_jobs()
                 for browser, port, profile in (("chrome", chrome_port, chrome_profile_dir),
                                                ("edge", edge_port, edge_profile_dir)):
-                    if not browser_readiness[browser]["ready"]:
+                    if browser in needed_browsers and not browser_readiness[browser]["ready"]:
                         ok, error = check_browser_ready(browser, port, profile)
                         browser_readiness[browser] = {"ready": ok, "error": error}
                 manifest["browser_readiness"] = browser_readiness
@@ -2079,10 +2241,10 @@ def review_experience_assessment(review: dict[str, Any] | None) -> dict[str, Any
     return value if isinstance(value, dict) else {}
 
 
-def run_llm(output_root: Path, workers: int = AI_DEFAULT_WORKERS, timeout: int = 120, max_retries: int = 3, codex_home: str | None = None, base_url: str | None = None, api_key: str | None = None, model: str | None = None, reasoning_effort: str | None = None, *, prompt_file: Path | None = None, api_mode: str | None = None, conversation_size: int = 1) -> dict[str, Any]:
+def run_llm(output_root: Path, workers: int = AI_DEFAULT_WORKERS, timeout: int = 120, max_retries: int = 3, codex_home: str | None = None, base_url: str | None = None, api_key: str | None = None, model: str | None = None, reasoning_effort: str | None = None, *, prompt_file: Path | None = None, api_mode: str | None = None, conversation_size: int = 1, resolved_config: Any = None) -> dict[str, Any]:
     from llm_client import (CodexResponsesClient, InvalidJsonResponseError, JsonSchemaValidationError,
                             LLMRequestError, SIMPLE_REVIEW_FORMAT, REVIEW_RESPONSE_SCHEMA,
-                            load_codex_config, validate_json_schema)
+                            load_review_config, validate_json_schema)
     from review_cache import (CACHE_INPUT_SIGNATURE_FIELD, CACHE_SIGNATURE_FIELD, REVIEW_CACHE_VERSION,
                               provider_signature, review_input_signature, review_signature, select_cached_reviews)
 
@@ -2156,29 +2318,10 @@ def run_llm(output_root: Path, workers: int = AI_DEFAULT_WORKERS, timeout: int =
     # ``load_codex_config`` accepts concrete config/auth paths.  Resolve an
     # optional home directory here so the processing CLI never leaks or logs
     # credentials while still honoring the user's local Codex installation.
-    env_home = os.environ.get("CODEX_HOME")
-    home = Path(codex_home).expanduser() if codex_home else Path(env_home).expanduser() if env_home else None
-    config_path = home / "config.toml" if home else None
-    auth_path = home / "auth.json" if home else None
     try:
-        project_settings_path = None if codex_home else project_llm_settings.default_settings_path()
-        project_settings = (
-            project_llm_settings.load_settings(project_settings_path)
-            if project_settings_path is not None else None
-        )
-        cfg = load_codex_config(
-            config_path=config_path,
-            auth_path=auth_path,
-            project_settings_path=project_settings_path,
-            base_url=base_url,
-            api_key=api_key,
-            model=model or (project_settings or {}).get("model") or AI_DEFAULT_MODEL,
-            reasoning_effort=reasoning_effort or (project_settings or {}).get("reasoning_effort") or AI_DEFAULT_REASONING_EFFORT,
-            api_mode=(api_mode or (project_settings or {}).get("api_mode")
-                      or (None if codex_home else project_llm_settings.API_MODE_RESPONSES)),
-            timeout=timeout,
-            max_retries=max_retries,
-        )
+        cfg = resolved_config if resolved_config is not None else load_review_config(
+            codex_home=codex_home, base_url=base_url, api_key=api_key, model=model,
+            reasoning_effort=reasoning_effort, api_mode=api_mode, timeout=timeout, max_retries=max_retries)
         provider = provider_signature(cfg)
         # The same prompt snapshot is used for every signature and request.
         prompt = Path(prompt_file).read_text(encoding="utf-8") if prompt_file is not None else load_prompt()
@@ -3249,6 +3392,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--edge-profile-dir", type=Path, default=None)
     parser.add_argument("--batch-size", type=int, default=10)
     parser.add_argument("--detail-speed-profile", choices=("safe", "fast"), default="fast")
+    parser.add_argument("--jd-scroll-count", type=int, default=JD_SCROLL_COUNT,
+                        help="JD 每页实际滚动次数，1–20，默认 3")
+    parser.add_argument("--jd-page-wait-min", type=int, default=0, help="JD 每页额外等待下限（秒），0–30，默认 0")
+    parser.add_argument("--jd-page-wait-max", type=int, default=0, help="JD 每页额外等待上限（秒），0–30，默认 0")
     parser.add_argument("--scraper-root", type=Path, default=None)
     parser.add_argument("--python", dest="python_path", default=None)
     parser.add_argument("--timeout", type=int, default=120)
@@ -3256,6 +3403,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--codex-home", default=None)
     parser.add_argument("--base-url", default=None)
     parser.add_argument("--api-key", default=None)
+    parser.add_argument("--config-stdin", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--api-mode", choices=project_llm_settings.API_MODES, default=None,
                         help="API 协议；默认读取项目本机配置，旧配置为 responses；chat_completions 不发送思考强度")
     parser.add_argument("--prompt-file", type=Path, default=None,
@@ -3278,6 +3426,14 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("--jd-workers 须为 1–32")
     if not 1 <= args.batch_size <= 100:
         parser.error("--batch-size 须为 1–100")
+    if not 1 <= args.jd_scroll_count <= 20:
+        parser.error("--jd-scroll-count 须为 1–20")
+    try:
+        stage_rules.validate_stage_rules("fetch-jd", {
+            "page_wait_min": args.jd_page_wait_min, "page_wait_max": args.jd_page_wait_max,
+        })
+    except ValueError as exc:
+        parser.error(str(exc))
     source_root = args.root.expanduser().resolve()
     out = args.output_root.expanduser().resolve() if args.output_root else output_root_for(source_root, args.city, args.sample_size, args.run_timestamp)
     out.mkdir(parents=True, exist_ok=True)
@@ -3302,6 +3458,9 @@ def main(argv: list[str] | None = None) -> int:
             args.python_path,
             wait_on_gate=args.wait_on_gate,
             detail_speed_profile=args.detail_speed_profile,
+            jd_scroll_count=args.jd_scroll_count,
+            jd_page_wait_min=args.jd_page_wait_min,
+            jd_page_wait_max=args.jd_page_wait_max,
             gui_interactive=args.gui_interactive,
             jd_workers=args.jd_workers,
             browser_mode=args.browser_mode,
@@ -3320,6 +3479,9 @@ def main(argv: list[str] | None = None) -> int:
             return 1 if fatal and not paused else 0
     if args.stage in ("llm", "all"):
         prompt_options = {"prompt_file": args.prompt_file} if args.prompt_file is not None else {}
+        if args.config_stdin:
+            from llm_client import config_from_private_payload
+            prompt_options["resolved_config"] = config_from_private_payload(sys.stdin.read(65537))
         if args.api_mode is not None:
             prompt_options["api_mode"] = args.api_mode
         run_llm(out, args.workers, args.timeout, args.max_retries, args.codex_home, args.base_url, args.api_key, args.model, args.reasoning_effort, conversation_size=args.conversation_size, **prompt_options)

@@ -16,6 +16,7 @@ boss-architecture-export = "delivery_export:main"
 packages = ["boss_architecture_resources"]
 py-modules = [
     "browser_setup",
+    "checkpoint_io",
     "collect_architecture",
     "collection_plan",
     "collection_runtime",
@@ -23,6 +24,7 @@ py-modules = [
     "delivery_export",
     "desktop_app",
     "desktop_collection",
+    "desktop_controls",
     "desktop_data",
     "desktop_delivery",
     "desktop_preferences",
@@ -42,6 +44,7 @@ py-modules = [
     "review_pipeline",
     "review_rules",
     "screening_policy",
+    "stage_rules",
 ]
 include-package-data = false
 

@@ -2,6 +2,7 @@
 
 import argparse
 import copy
+import hashlib
 import json
 from pathlib import Path
 import stat
@@ -22,11 +23,35 @@ import desktop_ui
 import project_llm_settings
 import review_pipeline
 from desktop_tasks import ReviewTask, STAGES, job_id
+from llm_client import CodexConfig
+from review_cache import REVIEW_CACHE_VERSION, provider_signature, review_input_signature, review_signature
 
 
 def write_json(path, value):
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(value, ensure_ascii=False), encoding="utf-8")
+
+
+def signed_ai_checkpoint_context(task, jobs):
+    """Synthetic execution binding, with no provider settings or secret I/O."""
+    prompt = "离线测试：按职责返回判断与理由。"
+    runtime = task.run_directory("llm")
+    prompt_path = runtime / "review_prompts" / (hashlib.sha256(prompt.encode("utf-8")).hexdigest() + ".md")
+    prompt_path.parent.mkdir(parents=True, exist_ok=True)
+    prompt_path.write_text(prompt, encoding="utf-8")
+    provider = provider_signature(CodexConfig(model="fixture-model", base_url="https://fixture.invalid/v1", api_key="fixture-key"))
+    info = task.snapshot()["stages"]["llm"]
+    write_json(runtime / "review_cache_context.json", {
+        "cache_version": REVIEW_CACHE_VERSION, "attempt": info["attempt"], "input_revision": info["input_revision"],
+        "input_ids": info["input_ids"], "provider": provider,
+        "review_prompt_file": prompt_path.relative_to(task.path).as_posix(),
+    })
+    by_id = {job_id(job): job for job in jobs}
+    def sign(review):
+        payload = ui.processor.model_input(by_id[review["job_id"]])
+        return {**review, "cache_signature": review_signature(payload, prompt, provider),
+                "cache_input_signature": review_input_signature(payload, prompt)}
+    return sign
 
 
 class ReviewUIHelpersTests(unittest.TestCase):
@@ -896,19 +921,77 @@ class ReviewTkTests(unittest.TestCase):
             self.assertEqual(bool(app.jd_settings_frame.winfo_manager()), stage == "fetch-jd")
             self.assertEqual(bool(app.llm_settings_frame.winfo_manager()), stage == "llm")
             self.assertFalse(app.settings_frame.winfo_manager())
-        self.assertEqual(app.edit_rules_button.cget("text"), "修改复核规则")
+        self.assertEqual(app.edit_rules_button.cget("text"), "修改本步规则")
         self.assertTrue(app.edit_rules_button.winfo_manager())
         self.assertIn("每页滚动3次", app.jd_mode_label.cget("text"))
         self.assertIn("仅补正文不筛选", app.jd_mode_label.cget("text"))
         self.assertIn("AI 并发（每岗独立）", [str(widget.cget("text"))
                                          for widget in app.llm_settings_frame.winfo_children()
                                          if isinstance(widget, ui.ttk.Label)])
-        self.assertIn("gpt-5.6-luna", app.model_config_label.cget("text"))
-        self.assertIn("max", app.model_config_label.cget("text"))
-        self.assertIn("https://nikoapi.xyz/v1", app.model_config_label.cget("text"))
-        self.assertIn("API Key：Windows Credential Manager", app.model_config_label.cget("text"))
+        self.assertIn("尚未保存项目模型配置", app.model_config_label.cget("text"))
+        self.assertIn("全局服务", app.model_config_label.cget("text"))
+        self.assertNotIn(project_llm_settings.DEFAULT_BASE_URL, app.model_config_label.cget("text"))
         self.assertEqual(app.model_config_button.cget("text"), "修改模型配置")
         self.assertEqual(self.calls, [])
+
+    def test_jd_page_wait_editor_saves_task_range_and_reopens_with_default_zero(self):
+        self.complete_through("shortlist", confirm_last=True)
+        app, task = self.app, self.app.task
+        self.assertEqual(app.stage.get(), "fetch-jd")
+        self.assertIn("每页等待 0–0 秒", app.jd_mode_label.cget("text"))
+        calls = len(self.calls)
+        app.edit_rules_button.invoke()
+        self.assertIsNotNone(app._stage_rules_dialog)
+        self.assertEqual(app._stage_rules_inputs["page_wait_min"].get(), "0")
+        self.assertEqual(app._stage_rules_inputs["page_wait_max"].get(), "0")
+        app._stage_rules_inputs["page_wait_min"].set("3")
+        app._stage_rules_inputs["page_wait_max"].set("8")
+        app._stage_rules_buttons["save"].invoke()
+        self.wait_idle()
+        self.assertIsNone(app._stage_rules_dialog)
+        self.assertEqual(len(self.calls), calls, "saving the wait range must not start collection")
+        self.assertIn("每页等待 3–8 秒", app.jd_mode_label.cget("text"))
+        actual = task.get_stage_rules("fetch-jd")
+        self.assertEqual((actual["page_wait_min"], actual["page_wait_max"]), (3, 8))
+        root, reopened = self.make_window()
+        reopened._open_task(task.path)
+        self.wait_idle(reopened, root)
+        reopened._select_stage("fetch-jd")
+        self.wait_idle(reopened, root)
+        self.assertIn("每页等待 3–8 秒", reopened.jd_mode_label.cget("text"))
+        reopened.edit_rules_button.invoke()
+        self.assertEqual(reopened._stage_rules_inputs["page_wait_min"].get(), "3")
+        self.assertEqual(reopened._stage_rules_inputs["page_wait_max"].get(), "8")
+        reopened._stage_rules_buttons["reset"].invoke()
+        self.assertEqual(reopened._stage_rules_inputs["page_wait_min"].get(), "0")
+        self.assertEqual(reopened._stage_rules_inputs["page_wait_max"].get(), "0")
+        self.assertEqual(task.get_stage_rules("fetch-jd"), actual, "restore only changes the draft before save")
+        reopened._stage_rules_buttons["save"].invoke()
+        self.wait_idle(reopened, root)
+        self.assertIn("每页等待 0–0 秒", reopened.jd_mode_label.cget("text"))
+        self.assertEqual(task.get_stage_rules("fetch-jd")["page_wait_max"], 0)
+        self.assertEqual((self.source / "raw/current/shanghai/jobs.json").read_bytes(), self.raw_before)
+        self.browser.assert_not_called()
+
+    def test_jd_page_wait_editor_rejects_invalid_ranges_without_writes(self):
+        self.complete_through("shortlist", confirm_last=True)
+        app = self.app
+        app.edit_rules_button.invoke()
+        original = (app.task.path / "task_manifest.json").read_bytes()
+        for minimum, maximum in (("-1", "3"), ("0", "31"), ("5", "4"), ("1.5", "3"), ("bad", "3")):
+            with self.subTest(minimum=minimum, maximum=maximum):
+                app._stage_rules_inputs["page_wait_min"].set(minimum)
+                app._stage_rules_inputs["page_wait_max"].set(maximum)
+                app._stage_rules_buttons["save"].invoke()
+                self.assertIsNotNone(app._stage_rules_dialog)
+                self.assertIn("未保存", app._stage_rules_status.get())
+                self.assertEqual((app.task.path / "task_manifest.json").read_bytes(), original)
+        app._stage_rules_inputs["page_wait_min"].set("30")
+        app._stage_rules_inputs["page_wait_max"].set("30")
+        app._stage_rules_buttons["save"].invoke()
+        self.wait_idle()
+        self.assertIn("每页等待 30–30 秒", app.jd_mode_label.cget("text"))
+        self.assertEqual(self.errors.call_count, 0)
 
     def test_review_rules_editor_saves_only_this_task_and_invalidates_ai_and_report(self):
         self.complete_through("report", confirm_last=True)
@@ -1002,9 +1085,13 @@ class ReviewTkTests(unittest.TestCase):
         app = self.app
         app._select_stage("llm")
         self.assertTrue(app.edit_rules_button.winfo_manager())
-        self.assertEqual(str(app.edit_rules_button.cget("state")), "disabled")
+        self.assertEqual(str(app.edit_rules_button.cget("state")), "normal")
         app.edit_rules_button.invoke()
-        self.assertIsNone(app._review_rules_dialog)
+        self.assertIsNotNone(app._review_rules_dialog)
+        self.assertEqual(app._review_rules_editor.get("1.0", "end-1c"), ui.default_review_rules())
+        self.assertIn("先创建", app._review_rules_status.get())
+        self.assertIn("disabled", app._review_rules_buttons["save"].state())
+        app._close_review_rules_editor()
         self.complete_through("fetch-jd", confirm_last=True)
         app.edit_rules_button.invoke()
         for theme in ("dark", "light"):
@@ -1014,9 +1101,13 @@ class ReviewTkTests(unittest.TestCase):
         app._close_review_rules_editor()
         app._busy, app._operation = True, "execute"
         app._render(render_rows=False)
-        self.assertEqual(str(app.edit_rules_button.cget("state")), "disabled")
+        self.assertEqual(str(app.edit_rules_button.cget("state")), "normal")
         app._edit_review_rules()
-        self.assertIsNone(app._review_rules_dialog)
+        self.assertIsNotNone(app._review_rules_dialog)
+        self.assertEqual(str(app._review_rules_editor.cget("state")), "disabled")
+        self.assertIn("disabled", app._review_rules_buttons["save"].state())
+        self.assertNotIn("disabled", app._review_rules_buttons["cancel"].state())
+        app._close_review_rules_editor()
         app._busy, app._operation = False, ""
         app._render(render_rows=False)
 
@@ -1744,7 +1835,8 @@ class ReviewTkTests(unittest.TestCase):
         stage, thread_id, options = self.calls[-1]
         self.assertEqual(stage, "fetch-jd")
         self.assertNotEqual(thread_id, app.ui_thread_id)
-        self.assertEqual((options["jd_workers"], options["workers"], options["batch_size"]), (7, 13, 30))
+        self.assertEqual((options["jd_workers"], options["workers"], options["batch_size"]), (7, ui.AI_DEFAULT_WORKERS, 30))
+        self.assertEqual(app.workers.get(), "13", "unrelated form values are retained for their own stage")
         calls = len(self.calls)
         app._confirm_stage()
         self.wait_idle()
@@ -1755,7 +1847,8 @@ class ReviewTkTests(unittest.TestCase):
         self.wait_idle()
         self.assertEqual(self.calls[-1][0], "llm")
         options = self.calls[-1][2]
-        self.assertEqual((options["jd_workers"], options["workers"], options["batch_size"]), (7, 19, 30))
+        self.assertEqual((options["jd_workers"], options["workers"], options["batch_size"]), (ui.JD_DEFAULT_WORKERS, 19, 30))
+        self.assertEqual(app.jd_workers.get(), "7")
 
     def test_jd_table_and_details_show_body_completeness_instead_of_keyword_rejection(self):
         self.complete_through("shortlist", confirm_last=True)
@@ -1838,11 +1931,13 @@ class ReviewTkTests(unittest.TestCase):
         app.restore_button.invoke()
         self.wait_idle()
         self.assertIn(identity, self.task_json()["stages"]["shortlist"]["keep_ids"])
+        before = (app.task.path / "task_manifest.json").read_bytes()
         app.select_page_button.invoke()
         self.wait_idle()
         visible = set(app._page_ids)
         self.assertEqual(len(visible), ui.PAGE_SIZE)
-        self.assertTrue(visible <= set(self.task_json()["stages"]["shortlist"]["keep_ids"]))
+        self.assertEqual(set(app.results_table.selection()), visible)
+        self.assertEqual((app.task.path / "task_manifest.json").read_bytes(), before)
         app.exclude_button.invoke()
         self.wait_idle()
         self.assertTrue(visible <= set(self.task_json()["stages"]["shortlist"]["excluded_ids"]))
@@ -1915,7 +2010,7 @@ class ReviewTkTests(unittest.TestCase):
         self.assertEqual(app._page_ids, [removed])
         self.assertIn("待核实", app.results_table.set(removed, "reason"))
         content = app.detail_text.get("1.0", "end-1c")
-        for text in ("人工名单：剔除", "列表方向队列：待核实", "工作对象待 JD 核实"):
+        for text in ("当前名单：剔除", "列表方向队列：待核实", "工作对象待 JD 核实"):
             self.assertIn(text, content)
         app.list_queue_filter.set("明确相关")
         self.pump()
@@ -2615,6 +2710,10 @@ class ReviewTkTests(unittest.TestCase):
         self.assertEqual(visible, set(pending[1:]))
         app.select_page_button.invoke()
         self.wait_idle()
+        self.assertEqual(set(app.results_table.selection()), visible)
+        self.assertTrue(visible <= set(app._stage_info()["pending_ids"]))
+        app.restore_button.invoke()
+        self.wait_idle()
         self.assertTrue(visible <= set(app._stage_info()["keep_ids"]))
         self.assertEqual(app._stage_info()["pending_ids"], [])
         self.assertEqual(app.filter_buttons["待核实"].cget("text"), "待核实 0")
@@ -2718,6 +2817,8 @@ class ReviewTkTests(unittest.TestCase):
             {"job_id": job_id(jobs[3]), "status": "failed", "review_format": ui.SIMPLE_REVIEW_FORMAT,
              "error": "Responses API 请求失败（HTTP 429）"},
         ]
+        sign = signed_ai_checkpoint_context(task, jobs)
+        reviews = [sign(review) for review in reviews]
         write_json(task.run_directory("llm") / "prepared" / "llm_reviews.json", {"reviews": reviews})
         try:
             view = ui._capture_task(task, cache=ui.TaskViewCache())
@@ -2842,12 +2943,13 @@ class ReviewTkTests(unittest.TestCase):
         def streaming(current_task, stage, **options):
             current_task.begin(stage)
             jobs = current_task.input_jobs(stage)
+            sign = signed_ai_checkpoint_context(current_task, jobs)
             path = current_task.run_directory(stage) / "prepared/llm_reviews.json"
             for index in range(6):
                 if options["control"].requested:
                     break
-                reviews.append({"job_id": job_id(jobs[index]), "status": "success", "review_format": "simple-v1",
-                                "判断": ("符合", "不符合", "信息不足")[index % 3], "理由": f"持续落盘 {index}"})
+                reviews.append(sign({"job_id": job_id(jobs[index]), "status": "success", "review_format": "simple-v1",
+                                     "判断": ("符合", "不符合", "信息不足")[index % 3], "理由": f"持续落盘 {index}"}))
                 # Use the production atomic writer, allowing the UI to read
                 # every durable generation while the executor remains alive.
                 review_pipeline.processor.write_json(path, {"reviews": list(reviews)})
@@ -2917,13 +3019,14 @@ class ReviewTkTests(unittest.TestCase):
         def silent_executor(current_task, stage, **options):
             current_task.begin(stage)
             jobs = current_task.input_jobs(stage)
+            sign = signed_ai_checkpoint_context(current_task, jobs)
             reviews = []
             for index, job in enumerate(jobs[:2]):
-                reviews.append({
+                reviews.append(sign({
                     "job_id": job_id(job), "status": "success",
                     "review_format": ui.SIMPLE_REVIEW_FORMAT,
                     "判断": "符合" if index == 0 else "不符合", "理由": "测试检查点",
-                })
+                }))
                 write_json(current_task.run_directory(stage) / "prepared" / "llm_reviews.json",
                            {"reviews": reviews})
                 current_task.record_progress(stage, index + 1, len(jobs),
@@ -2957,10 +3060,11 @@ class ReviewTkTests(unittest.TestCase):
         owner = self.app
         owner.task.begin("llm")
         jobs = owner.task.input_jobs("llm")
+        sign = signed_ai_checkpoint_context(owner.task, jobs)
         path = owner.task.run_directory("llm") / "prepared/llm_reviews.json"
-        write_json(path, {"reviews": [{"job_id": job_id(jobs[0]), "status": "success",
-                                        "review_format": ui.SIMPLE_REVIEW_FORMAT,
-                                        "判断": "符合", "理由": "外部窗口已落盘"}]})
+        write_json(path, {"reviews": [sign({"job_id": job_id(jobs[0]), "status": "success",
+                                              "review_format": ui.SIMPLE_REVIEW_FORMAT,
+                                              "判断": "符合", "理由": "外部窗口已落盘"})]})
         observer_root, observer = self.make_window()
         observer._open_task(owner.task.path)
         self.wait_idle(observer, observer_root)
@@ -3241,22 +3345,34 @@ class ReviewTkTests(unittest.TestCase):
         self.assertEqual(self.app._after_ids, set())
 
     def test_invalid_execution_settings_do_not_call_the_executor(self):
-        self.create_task()
-        for variable in (self.app.workers, self.app.jd_workers):
-            for value in ("0", "-1", "33", "bad"):
-                variable.set(value)
-                self.app._run_stage()
-            variable.set("10")
-        self.assertEqual(self.calls, [])
-        self.assertEqual(self.errors.call_count, 8)
-        for jd_workers, workers in ((1, 32), (32, 1)):
-            self.app.jd_workers.set(str(jd_workers))
-            self.app.workers.set(str(workers))
+        self.complete_through("shortlist", confirm_last=True)
+        calls = len(self.calls)
+        for value in ("0", "-1", "33", "bad"):
+            self.app.jd_workers.set(value)
+            self.app._run_stage()
+        self.assertEqual(len(self.calls), calls)
+        self.assertEqual(self.errors.call_count, 4)
+        self.app.workers.set("bad")  # Not a JD execution parameter.
+        for value in (1, 32):
+            self.app.jd_workers.set(str(value))
             self.app._run_stage()
             self.wait_idle()
-            self.assertEqual(self.calls[-1][2]["workers"], workers)
-            self.assertEqual(self.calls[-1][2]["jd_workers"], jd_workers)
-            self.assertEqual(self.calls[-1][2]["batch_size"], 30)
+            self.assertEqual(self.calls[-1][2]["jd_workers"], value)
+        self.app._confirm_stage()
+        self.wait_idle()
+        calls = len(self.calls)
+        for value in ("0", "-1", "33", "bad"):
+            self.app.workers.set(value)
+            self.app._run_stage()
+        self.assertEqual(len(self.calls), calls)
+        self.assertEqual(self.errors.call_count, 8)
+        self.app.jd_workers.set("bad")  # Not an AI execution parameter.
+        self.app.batch_size.set("bad")
+        for value in (1, 32):
+            self.app.workers.set(str(value))
+            self.app._run_stage()
+            self.wait_idle()
+            self.assertEqual(self.calls[-1][2]["workers"], value)
 
     def test_real_local_executor_empty_chain_exports_empty_delivery_without_services(self):
         write_json(self.source / "raw/current/shanghai/current__shanghai__aiarch__20_50__1_3.json",
@@ -3290,8 +3406,8 @@ class ReviewTkTests(unittest.TestCase):
             document = json.loads(delivery_export.export_task(self.app.task).read_text(encoding="utf-8"))
             child.assert_not_called()
         self.assertEqual(document["summary"], {"selected_count": 0, "ready_count": 0, "blocked_count": 0})
-        self.assertEqual(document["jobs"], [])
-        self.assertEqual(document["blocked_jobs"], [])
+        self.assertNotIn("jobs", document)
+        self.assertNotIn("blocked_jobs", document)
         self.assertEqual(self.app._stage_info("report")["status"], "pending")
         self.assertEqual((self.source / "raw/current/shanghai/jobs.json").read_bytes(), self.raw_before)
         self.browser.assert_not_called()

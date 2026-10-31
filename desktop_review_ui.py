@@ -10,11 +10,13 @@ from __future__ import annotations
 
 import argparse
 import copy
+import hashlib
 import inspect
 import json
 import os
 from pathlib import Path
 import queue
+import re
 import stat
 import subprocess
 import sys
@@ -25,9 +27,11 @@ from tkinter import filedialog, messagebox, ttk
 from typing import Any, Callable
 from urllib.parse import urlsplit
 
+import checkpoint_io
 import desktop_data
 from collection_sources import review_config_for_source
 from desktop_collection import CollectionPage
+from desktop_controls import DialogActions, Pagination, ReadOnlyText, PAGE_SIZE, page_caption, configure_editor_dialog, bind_search
 from desktop_delivery import DeliveryPage
 from desktop_tasks import (ReviewTask, STAGES, STAGE_LABELS, TaskStateError, job_id,
                            stage_selection_version, _file_version)
@@ -35,18 +39,23 @@ from desktop_preferences import load_preferences, save_preferences
 from desktop_theme import configure_combobox_popdown, configure_styles, normalize_theme, palette_for
 from desktop_tk_lifecycle import BooleanVar, StringVar, destroy_tk_widget, install_tk_lifecycle
 from process_architecture import detail_completeness, report_decision, report_pool_eligible
+import process_architecture as processor
 import project_llm_settings
 from llm_client import (CodexResponsesClient, JsonSchemaValidationError,
                         SIMPLE_REVIEW_FORMAT, simple_review_payload)
 from project_resources import DEFAULT_CONFIG, PROJECT_ROOT, default_state_root
 from review_pipeline import (
     StageControl, _analyze_ai_stage, _read_json, _safe_path, execute_stage,
+    _detail_checkpoint, _jd_stats, shortlist_live_signature,
     prepare_browser, reset_stage as reset_review_stage,
 )
 from review_rules import default_review_rules
+from review_cache import REVIEW_CACHE_VERSION, matching_reviews, review_input_signature, review_signature
+from stage_rules import default_stage_rules, stage_rule_fields, validate_stage_rules
 from screening_policy import (
     AI_DEFAULT_MODEL, AI_DEFAULT_REASONING_EFFORT, AI_DEFAULT_WORKERS,
     JD_DEFAULT_WORKERS, JD_SCROLL_COUNT, LIST_QUEUE_LABELS, MAX_WORKERS,
+    AI_STAGE_RESULT_FIELDS,
 )
 
 
@@ -76,16 +85,17 @@ STATUS_LABELS = {
 }
 STAGE_DESCRIPTIONS = {
     "import": "从唯一绑定的 raw/current 与 raw/target 导入、去重、抽样，保留全部检索来源。",
-    "shortlist": "列表方向队列不等于最终可投；默认保留明确相关＋待核实，仍需人工确认后补 JD。",
+    "shortlist": "列表方向队列不等于最终可投；当前规则摘要说明建议保留范围，人工确认后才补 JD。",
     "fetch-jd": "只为上一步确认的岗位补抓 JD；复用本任务检查点，登录或安全验证时停住。",
     "llm": "只复核已确认名单；AI明确判断符合才建议保留、明确不符合才建议剔除。失败、未运行、JD不完整或信息不足均进入待核实，不自动归入保留或剔除。模型设置仅作用于本项目。",
     "report": "生成全部导入岗位的追踪报告；人工确认剔除项明确排除出可投池。完成后可点击“打开报告”查看 Markdown，无需先确认报告完成。",
 }
-PAGE_SIZE = 20
 REVIEW_STAGES = STAGES[:-1]
 MAX_LOG_CHARS = 250_000
 POLL_MS = 75
+LIVE_STAGES = ("shortlist", "fetch-jd", "llm")
 ALL_LIST_QUEUES = "全部队列"
+JD_COMPLETENESS_CHOICES = {"全部正文": None, "正文完整": "complete", "正文部分可用": "partial", "正文缺失": "missing"}
 LEGACY_LIST_QUEUE_NOTICE = "旧版本，需重跑初筛更新队列"
 API_MODE_CHOICES = {
     project_llm_settings.API_MODE_LABELS[project_llm_settings.API_MODE_RESPONSES]: project_llm_settings.API_MODE_RESPONSES,
@@ -188,6 +198,8 @@ def _saved_list_queue(job: dict[str, Any]) -> tuple[str | None, bool]:
     The second value marks compatibility-only labels. A legacy pass without
     an old priority is uncertain, never upgraded to an explicit direction.
     """
+    if job.get("_review_pending_stage") == "shortlist":
+        return None, False
     saved = job.get("list_queue")
     if isinstance(saved, str) and saved in LIST_QUEUE_LABELS:
         return saved, False
@@ -246,7 +258,7 @@ def _metric_parts(stage: str, stats: dict[str, Any]) -> list[str]:
     """Use the adapter's durable, stage-specific counters; never infer them."""
     specific = {
         "import": (("原始记录", ("raw_record_count",)), ("去重岗位", ("deduplicated_job_count",)),
-                   ("本任务", ("selected_job_count", "sampled_job_count"))),
+                   ("本任务", ("selected_job_count", "sampled_job_count")), ("损坏文件", ("invalid_file_count",))),
         "shortlist": (("已处理", ("processed_count", "completed_count")), ("建议保留", ("recommended_count",))),
         "fetch-jd": (("JD 成功", ("jd_success_count", "success_count")),
                      ("部分可用", ("jd_partial_count", "partial_count")),
@@ -288,21 +300,20 @@ def _confined_path(task: ReviewTask, value: Any, *, allow_missing: bool = False)
     if not path.is_absolute():
         path = base / path
     path = path.absolute()
-    if ".." in path.parts or not path.is_relative_to(base):
+    try:
+        _relative, resolved = checkpoint_io.confined_path(path, base)
+        for component in (*reversed(path.parents), path):
+            try:
+                info = component.lstat()
+            except FileNotFoundError:
+                if allow_missing and component == path:
+                    continue
+                return None
+            if stat.S_ISLNK(info.st_mode) or getattr(info, "st_file_attributes", 0) & 0x400:
+                return None
+    except (OSError, ValueError, RuntimeError):
         return None
-    for component in (*reversed(path.parents), path):
-        try:
-            info = component.lstat()
-        except FileNotFoundError:
-            if allow_missing and component == path:
-                continue
-            return None
-        if stat.S_ISLNK(info.st_mode) or getattr(info, "st_file_attributes", 0) & 0x400:
-            return None
-    path = path.resolve()
-    if not path.is_relative_to(base.resolve()):
-        return None
-    return path
+    return resolved
 
 
 def _confined_file(task: ReviewTask, value: Any) -> Path | None:
@@ -337,6 +348,21 @@ def _build_search(jobs: list[dict[str, Any]]) -> dict[str, str]:
             for job in jobs}
 
 
+def _filter_rows(candidates: list[dict], index: dict[str, str], query: str, selected_queue: str | None) -> list[dict]:
+    if not query and selected_queue is None:
+        return candidates
+    return [job for job in candidates if (not query or query in index.get(job_id(job), ""))
+            and (selected_queue is None or _saved_list_queue(job)[0] == selected_queue)]
+
+
+def _row_candidates(row_view: dict, selection: str, selected_queue: str | None) -> list[dict]:
+    if selected_queue in {"complete", "partial", "missing"} and "jd_groups" in row_view:
+        return row_view["jd_groups"].get(selection, row_view["jd_groups"]["全部"])[selected_queue]
+    if selected_queue is not None and "queue_groups" in row_view:
+        return row_view["queue_groups"].get(selection, row_view["queue_groups"]["全部"])[selected_queue]
+    return row_view["groups"].get(selection, row_view["groups"]["全部"])
+
+
 class TaskViewCache:
     """One task's latest view only, owned by its serial worker, never by Tk.
 
@@ -355,6 +381,9 @@ class TaskViewCache:
         self.trace: tuple[tuple, list[dict]] | None = None
         self.report: tuple[tuple, list[dict], dict[str, str]] | None = None
         self.live_ai: dict | None = None
+        self.live_ai_context: dict | None = None
+        self.live_shortlist: dict | None = None
+        self.live_jd: dict | None = None
         self.row_views: dict[str, tuple] = {}
 
     def prepare(self, task: ReviewTask, manifest: dict, *, include_report: bool = True) -> None:
@@ -431,23 +460,234 @@ def _trace_key(manifest: dict, cache: TaskViewCache) -> tuple:
                 for stage, info in stages.items()))
 
 
+def _checkpoint_file_version(task: ReviewTask, path: Path) -> tuple | None:
+    path = _safe_path(task, path)
+    try:
+        path.lstat()
+    except FileNotFoundError:
+        return None
+    return _file_version(path)
+
+
+def _live_shortlist_rows(task: ReviewTask, reader: _CapturedTaskRows, info: dict,
+                         cache: TaskViewCache, path: Path, version: tuple | None) -> dict | None:
+    """Read one complete, current-attempt prefix; unprocessed input stays pending.
+
+    These are display rows only. Neither a live file nor a full prefix commits
+    a stage result, grants edit permission, or confirms a task.
+    """
+    signature = shortlist_live_signature(info)
+    input_key = (info.get("input_file"), tuple(info["input_ids"]),
+                 cache.versions.get(("shortlist", info.get("input_file"))), signature)
+    previous = cache.live_shortlist
+    if previous is not None and previous["input_key"] == input_key and previous["version"] == version:
+        return previous
+    payload = _read_json(task, path, {}) if version is not None else {}
+    if version is not None and _checkpoint_file_version(task, path) != version:
+        raise TaskStateError("初筛检查点在读取时发生变化，请刷新后重试。")
+    count = payload.get("processed_count") if isinstance(payload, dict) else None
+    results = payload.get("jobs") if isinstance(payload, dict) else None
+    valid = (isinstance(payload, dict) and payload.get("stage") == "shortlist"
+             and type(payload.get("attempt")) is int and payload["attempt"] == info["attempt"]
+             and type(payload.get("input_revision")) is int and payload["input_revision"] == info["input_revision"]
+             and payload.get("input_signature") == signature
+             and type(payload.get("total")) is int and payload["total"] == len(info["input_ids"])
+             and type(count) is int and 0 <= count <= len(info["input_ids"])
+             and isinstance(results, list) and len(results) == count)
+    if valid:
+        try:
+            valid = ([job_id(job) for job in results] == info["input_ids"][:count]
+                     and all(type(job.get("list_pass")) is bool
+                             and type(job.get("recommended_keep")) is bool
+                             and job.get("list_queue") in LIST_QUEUE_LABELS for job in results))
+        except (TaskStateError, TypeError):
+            valid = False
+    if not valid:
+        count, results = 0, []
+    inputs = reader._read_jobs("shortlist", info.get("input_file"))
+    if [job_id(job) for job in inputs] != info["input_ids"]:
+        raise TaskStateError("初筛输入 ID 与检查点清单不一致。")
+    reusable = previous is not None and previous["input_key"] == input_key
+    jobs, changed = [], []
+    for index, job in enumerate(inputs):
+        candidate = results[index] if index < count else None
+        old = previous["jobs"][index] if reusable else None
+        if candidate is None:
+            projected = old if old is not None and old.get("_review_pending_stage") == "shortlist" else {
+                **job, "_review_pending_stage": "shortlist"}
+        elif old is not None and old == candidate:
+            projected = old
+        else:
+            projected = dict(candidate)
+            projected.pop("_review_pending_stage", None)
+        jobs.append(projected)
+        if projected is not old:
+            changed.append(projected)
+    if reusable and not changed:
+        jobs, search = previous["jobs"], previous["search"]
+    else:
+        search = dict(previous["search"]) if reusable else {}
+        search.update(_build_search(changed))
+    recommended = [job_id(job) for job in results if job["recommended_keep"]]
+    excluded = [job_id(job) for job in results if not job["recommended_keep"]]
+    counts, _legacy = _list_queue_summary(results)
+    cache.live_shortlist = {"input_key": input_key, "version": version, "valid": valid,
+                            "jobs": jobs, "search": search, "processed_count": count,
+                            "recommended_keep_ids": recommended, "recommended_exclude_ids": excluded,
+                            "stats": {"processed_count": count, "recommended_count": len(recommended),
+                                      "pending_count": len(inputs) - count, "list_queue_counts": counts}}
+    return cache.live_shortlist
+
+
+def _shortlist_live_info(info: dict, live: dict) -> dict:
+    recommended = set(live["recommended_keep_ids"])
+    excluded = set(live["recommended_exclude_ids"])
+    manual = info["manual_choices"]
+    keep_ids, excluded_ids, pending_ids = [], [], []
+    for identity in info["input_ids"]:
+        choice = manual.get(identity)
+        if type(choice) is bool:
+            (keep_ids if choice else excluded_ids).append(identity)
+        elif identity in recommended:
+            keep_ids.append(identity)
+        elif identity in excluded:
+            excluded_ids.append(identity)
+        else:
+            pending_ids.append(identity)
+    return {**info, "result_ids": list(info["input_ids"]), "keep_ids": keep_ids,
+            "excluded_ids": excluded_ids, "pending_ids": pending_ids,
+            "recommended_keep_ids": live["recommended_keep_ids"],
+            "recommended_exclude_ids": live["recommended_exclude_ids"],
+            "manual_choices": dict(manual), "live_checkpoint": True,
+            "live_incomplete": True, "confirmed": False, "confirmed_revision": None,
+            "progress": {"done": live["processed_count"], "total": len(info["input_ids"])},
+            "stats": {**info["stats"], **live["stats"]}}
+
+
+def _jd_checkpoint_versions(task: ReviewTask, runtime: Path) -> tuple:
+    folder = _safe_path(task, runtime / "prepared" / "jd_shortlists")
+    batches = _safe_path(task, folder / "detail_batches")
+    paths = [folder / "details.json", folder / "details_manifest.json",
+             *sorted(batches.glob("details_*.json"))]
+    return tuple((str(path), _checkpoint_file_version(task, path)) for path in paths)
+
+
+def _live_jd_rows(task: ReviewTask, reader: _CapturedTaskRows, info: dict,
+                   cache: TaskViewCache, runtime: Path, version: tuple) -> dict:
+    input_key = (info.get("input_file"), tuple(info["input_ids"]), info["input_revision"],
+                 cache.versions.get(("fetch-jd", info.get("input_file"))), info["attempt"])
+    previous = cache.live_jd
+    if previous is not None and previous["input_key"] == input_key and previous["version"] == version:
+        return previous
+    inputs = reader._read_jobs("fetch-jd", info.get("input_file"))
+    if [job_id(job) for job in inputs] != info["input_ids"]:
+        raise TaskStateError("JD 输入 ID 与检查点清单不一致。")
+    details, manifest = _detail_checkpoint(task, runtime, inputs)
+    if _jd_checkpoint_versions(task, runtime) != version:
+        raise TaskStateError("JD 检查点在读取时发生变化，请刷新后重试。")
+    reusable = previous is not None and previous["input_key"] == input_key
+    jobs, changed = [], []
+    for index, job in enumerate(inputs):
+        identity = job_id(job)
+        detail = details.get(identity)
+        if reusable and previous["details"].get(identity) == detail:
+            projected = previous["jobs"][index]
+        else:
+            projected = {key: value for key, value in job.items()
+                         if key not in (*AI_STAGE_RESULT_FIELDS, "jd_fetch_issue", "jd_record")}
+            body = processor.text((detail or {}).get("jd"))
+            completeness = detail_completeness(detail)
+            projected.update(jd=body, jd_completeness=completeness, recommended_keep=True,
+                             jd_status="已抓取" if completeness == "complete" else "部分可用" if completeness == "partial" else "待处理",
+                             jd_fetched=bool(body.strip()), jd_analysis_status="not_run")
+            if detail:
+                projected["jd_record"] = detail
+            if completeness == "missing":
+                projected["_review_pending_stage"] = "fetch-jd"
+                projected["jd_fetch_issue"] = "尚未获得 JD；本步未完成，可继续查看检查点。"
+            elif completeness == "partial":
+                projected["jd_fetch_issue"] = "JD 部分可用，需重试获取完整正文；本步未据此筛选。"
+            changed.append(projected)
+        jobs.append(projected)
+    if reusable and not changed:
+        jobs, search = previous["jobs"], previous["search"]
+    else:
+        search = dict(previous["search"]) if reusable else {}
+        search.update(_build_search(changed))
+    cache.live_jd = {"input_key": input_key, "version": version, "details": details,
+                     "jobs": jobs, "search": search, "stats": _jd_stats(inputs, details, manifest)}
+    return cache.live_jd
+
+
+def _live_ai_context(task: ReviewTask, info: dict, inputs: list[dict],
+                     input_key: tuple, cache: TaskViewCache) -> dict:
+    """Bind live results to this attempt's immutable prompt and provider hash.
+
+    This reads only task-local metadata, never credentials or current settings.
+    Per-record signatures are recomputed from the actual captured inputs.
+    """
+    runtime = task._runtime_path("llm", info.get("runtime_directory", "runtime/llm"))
+    path = _safe_path(task, runtime / "review_cache_context.json")
+    version = _checkpoint_file_version(task, path)
+    previous = cache.live_ai_context
+    if previous is not None and previous["key"][:2] == (input_key, version):
+        prompt_path = previous["prompt_path"]
+        prompt_version = _checkpoint_file_version(task, prompt_path) if prompt_path is not None else None
+        if previous["key"][2] == prompt_version:
+            return previous
+    context = _read_json(task, path, {}) if version is not None else {}
+    prompt_path, prompt_version, prompt = None, None, None
+    valid = (isinstance(context, dict) and context.get("cache_version") == REVIEW_CACHE_VERSION
+             and type(context.get("attempt")) is int and context["attempt"] == info["attempt"]
+             and type(context.get("input_revision")) is int and context["input_revision"] == info["input_revision"]
+             and context.get("input_ids") == info["input_ids"]
+             and isinstance(context.get("provider"), str)
+             and re.fullmatch(re.escape(REVIEW_CACHE_VERSION) + r":provider:[a-f0-9]{64}", context["provider"]) is not None)
+    if valid:
+        reference = context.get("review_prompt_file")
+        relative_runtime = runtime.relative_to(task.path).as_posix()
+        valid = (isinstance(reference, str) and re.fullmatch(
+            re.escape(relative_runtime) + r"/review_prompts/[a-f0-9]{64}\.md", reference) is not None)
+        if valid:
+            prompt_path = _safe_path(task, task.path / reference)
+            prompt_version = _checkpoint_file_version(task, prompt_path)
+            try:
+                prompt = prompt_path.read_text(encoding="utf-8")
+                valid = hashlib.sha256(prompt.encode("utf-8")).hexdigest() == prompt_path.stem
+            except (OSError, UnicodeError):
+                valid = False
+    if (_checkpoint_file_version(task, path) != version
+            or prompt_path is not None and _checkpoint_file_version(task, prompt_path) != prompt_version):
+        raise TaskStateError("AI 复核上下文在读取时发生变化，请刷新后重试。")
+    signatures, input_signatures = {}, {}
+    if valid:
+        for job in inputs:
+            if detail_completeness(job) == "complete":
+                payload = processor.model_input(job)
+                signatures[job_id(job)] = review_signature(payload, prompt, context["provider"])
+                input_signatures[job_id(job)] = review_input_signature(payload, prompt)
+    cache.live_ai_context = {"key": (input_key, version, prompt_version), "prompt_path": prompt_path,
+                             "signatures": signatures, "input_signatures": input_signatures}
+    return cache.live_ai_context
+
+
 def _live_ai_rows(task: ReviewTask, reader: _CapturedTaskRows, info: dict,
                   cache: TaskViewCache, path: Path, version: tuple | None) -> dict:
     """Replace only jobs whose durable model record changed."""
     input_key = (info.get("input_file"), tuple(info["input_ids"]),
-                 cache.versions.get(("llm", info.get("input_file"))))
-    previous = cache.live_ai
-    if previous is not None and previous["input_key"] == input_key and previous["version"] == version:
-        return previous
+                 cache.versions.get(("llm", info.get("input_file"))), info["attempt"], info["input_revision"])
     inputs = reader._read_jobs("llm", info.get("input_file"))
     if [job_id(job) for job in inputs] != info["input_ids"]:
         raise TaskStateError("任务输入 ID 与检查点清单不一致。")
+    context = _live_ai_context(task, info, inputs, input_key, cache)
+    input_key += (context["key"],)
+    previous = cache.live_ai
+    if previous is not None and previous["input_key"] == input_key and previous["version"] == version:
+        return previous
     checkpoint = _read_json(task, path, {}) if version is not None else {}
     if version is not None and _file_version(path) != version:
         raise TaskStateError("AI 检查点在读取时发生变化，请刷新后重试。")
-    checkpoint_rows = checkpoint.get("reviews", []) if isinstance(checkpoint, dict) else []
-    reviews = {row["job_id"]: row for row in checkpoint_rows
-               if isinstance(row, dict) and isinstance(row.get("job_id"), str)}
+    reviews = matching_reviews(checkpoint, context["signatures"], input_signatures=context["input_signatures"])
     reusable = previous is not None and previous["input_key"] == input_key
     changed = []
     jobs = []
@@ -503,7 +743,25 @@ def _row_view(jobs: list[dict], info: dict, stage: str, cache: TaskViewCache) ->
         excluded = [by_id[identity] for identity in info["excluded_ids"] if identity in by_id]
         pending = [by_id[identity] for identity in info["pending_ids"] if identity in by_id]
     result = {"by_id": by_id, "groups": {"全部": jobs, "保留": kept, "剔除": excluded, "待核实": pending},
-              "kept_ids": frozenset(info["keep_ids"]), "pending_ids": frozenset(info["pending_ids"])}
+              "kept_ids": frozenset(info["keep_ids"]), "pending_ids": frozenset(info["pending_ids"]),
+              "simple_ai_rows": stage != "llm" or all(job.get("review_format") == SIMPLE_REVIEW_FORMAT for job in jobs)}
+    if stage == "shortlist":
+        result["list_queue_counts"], result["legacy_list_queue_count"] = _list_queue_summary(jobs)
+        result["queue_groups"] = {}
+        for label, candidates in result["groups"].items():
+            queues = {key: [] for key in LIST_QUEUE_LABELS}
+            for job in candidates:
+                queue_key = _saved_list_queue(job)[0]
+                if queue_key in queues:
+                    queues[queue_key].append(job)
+            result["queue_groups"][label] = queues
+    if stage == "fetch-jd":
+        result["jd_groups"] = {}
+        for label, candidates in result["groups"].items():
+            groups = {key: [] for key in ("complete", "partial", "missing")}
+            for job in candidates:
+                groups[detail_completeness(job)].append(job)
+            result["jd_groups"][label] = groups
     cache.row_views[stage] = (token, result)
     return result
 
@@ -519,11 +777,40 @@ def _capture_task(task: ReviewTask, *, read_log: bool = False, cache: TaskViewCa
     search: dict[str, dict[str, str]] = {}
     previews: set[str] = set()
     live_ai_checkpoint_version: tuple | None = None
+    live_checkpoint_versions: dict[str, tuple | None] = {}
     display_manifest = manifest
     for index, stage in enumerate(STAGES[:-1]):
         info = manifest["stages"][stage]
         preview = not info["result_ids"] and info["status"] == "pending"
         key = (cache.result_key(info, stage), preview)
+        if stage == "shortlist" and info["status"] in {"running", "paused", "stopped", "waiting", "failed"}:
+            runtime = task._runtime_path(stage, info.get("runtime_directory", "runtime/shortlist"))
+            path = _safe_path(task, runtime / "prepared" / "live_shortlist.json")
+            version = _checkpoint_file_version(task, path)
+            live = _live_shortlist_rows(task, reader, info, cache, path, version)
+            live_checkpoint_versions[stage] = version
+            if live is not None:
+                rows[stage], search[stage] = live["jobs"], live["search"]
+                display_manifest = {**display_manifest, "stages": {
+                    **display_manifest["stages"], stage: _shortlist_live_info(info, live)}}
+                continue
+        elif stage == "shortlist":
+            cache.live_shortlist = None
+        if stage == "fetch-jd" and info["status"] == "running":
+            runtime = task._runtime_path(stage, info.get("runtime_directory", "runtime/fetch-jd"))
+            version = _jd_checkpoint_versions(task, runtime)
+            live = _live_jd_rows(task, reader, info, cache, runtime, version)
+            rows[stage], search[stage] = live["jobs"], live["search"]
+            live_info = {**info, "result_ids": list(info["input_ids"]),
+                         "recommended_keep_ids": list(info["input_ids"]), "recommended_exclude_ids": [],
+                         "manual_choices": dict(info["manual_choices"]),
+                         "stats": {**info["stats"], **live["stats"]}, "live_checkpoint": True}
+            reader._select(live_info, stage)
+            live_checkpoint_versions[stage] = version
+            display_manifest = {**display_manifest, "stages": {**display_manifest["stages"], stage: live_info}}
+            continue
+        if stage == "fetch-jd":
+            cache.live_jd = None
         live_ai = stage == "llm" and info["status"] == "running"
         if live_ai:
             runtime = task._runtime_path("llm", info.get("runtime_directory", "runtime/llm"))
@@ -539,7 +826,8 @@ def _capture_task(task: ReviewTask, *, read_log: bool = False, cache: TaskViewCa
             live_info = {**info, **live["selection"], "manual_choices": dict(info["manual_choices"]),
                          "stats": {**info["stats"], **live["stats"]}}
             reader._select(live_info, "llm")
-            display_manifest = {**manifest, "stages": {**manifest["stages"], "llm": live_info}}
+            display_manifest = {**display_manifest, "stages": {**display_manifest["stages"], "llm": live_info}}
+            live_checkpoint_versions[stage] = live_ai_checkpoint_version
             continue
         if stage == "llm":
             cache.live_ai = None
@@ -568,8 +856,10 @@ def _capture_task(task: ReviewTask, *, read_log: bool = False, cache: TaskViewCa
             "row_views": {stage: _row_view(rows[stage], display_manifest["stages"][stage], stage, cache)
                           for stage in rows},
             "artifacts": artifacts, "review_rules": reader.get_review_rules(),
-            "default_review_rules": default_review_rules()}
-    if display_manifest is not manifest:
+            "default_review_rules": default_review_rules(),
+            "stage_rules": {stage: reader.get_stage_rules(stage) for stage in ("import", "shortlist", "fetch-jd")},
+            "live_checkpoint_versions": live_checkpoint_versions}
+    if "llm" in live_checkpoint_versions:
         view["live_ai_checkpoint_version"] = live_ai_checkpoint_version
     if read_log:
         try:
@@ -681,7 +971,28 @@ def _evidence_text(job: dict[str, Any], *, stage: str | None = None) -> str:
             lines.extend(("人工选择审计：", _display(job["review_selection"])))
         lines.append("完整正文见“JD 原文”，检索来源见“全部来源”。")
         return "\n".join(lines)
-    elif (job.get("review_format") == SIMPLE_REVIEW_FORMAT
+    elif stage in {"import", "shortlist", "input"}:
+        lines = [f"岗位：{_display(job.get('title'))}",
+                 f"公司：{_display(desktop_data._company(job))}",
+                 f"岗位 ID：{_display(job_id(job))}",
+                 f"地区：{_display(job.get('city') or job.get('location'))}",
+                 f"薪资：{_display(job.get('salary'))}",
+                 f"经验：{_display(job.get('experience'))}"]
+        if stage == "import":
+            choice = job.get("import_rule_keep")
+            suggestion = "建议保留" if choice is True else "建议剔除" if choice is False else "未记录导入规则建议"
+            lines.extend((f"导入建议：{suggestion}",
+                          "导入依据：" + _display(job.get("import_rule_reason")),
+                          "导入只调整当前任务建议，不删除原始记录。"))
+        elif stage == "shortlist":
+            lines.extend((f"列表方向队列：{_list_queue_label(job)}",
+                          f"队列原因：{_list_queue_reason(job)}",
+                          "方向队列不是人工保留状态，仍须 JD 和 AI 复核；列表初筛不读取 JD。"))
+            for key, label in (("list_match_evidence", "方向命中依据"), ("list_exclusion_evidence", "排除依据")):
+                if job.get(key):
+                    lines.extend((label + "：", _display(job[key])))
+        lines.append("检索来源见“全部来源”，已有正文见“JD 原文”。")
+    elif stage != "fetch-jd" and (job.get("review_format") == SIMPLE_REVIEW_FORMAT
           or isinstance(job.get("llm_review"), dict) and job["llm_review"].get("review_format") == SIMPLE_REVIEW_FORMAT):
         return desktop_data.format_job_detail(job)
     elif stage == "fetch-jd":
@@ -704,13 +1015,7 @@ def _evidence_text(job: dict[str, Any], *, stage: str | None = None) -> str:
             if metadata:
                 lines.extend(("", "抓取记录（正文另见原文页）：", _display(metadata)))
     else:
-        lines = []
-        if stage == "shortlist":
-            lines.extend((f"列表方向队列：{_list_queue_label(job)}",
-                          f"队列原因：{_list_queue_reason(job)}",
-                          "明确相关仅表示列表方向相关，仍须 JD 核实；队列不是人工保留状态，也不是最终重点 / 海投 / 暂不投分层。",
-                          ""))
-        lines.append(desktop_data.format_job_detail(job))
+        lines = [desktop_data.format_job_detail(job)]
     for key, label in (
         ("excluded_at", "已确认剔除于"), ("review_selection", "人工选择审计"),
         ("salary_flags", "薪资风险"), ("salary_risks", "薪资风险"),
@@ -721,6 +1026,8 @@ def _evidence_text(job: dict[str, Any], *, stage: str | None = None) -> str:
         ("risk_flags", "风险提示"), ("hard_rule_reasons", "代码硬规则"),
         ("llm_review", "模型已有完整结论（只读）"),
     ):
+        if stage in {"import", "shortlist"} and key == "llm_review":
+            continue
         if job.get(key) is not None:
             lines.extend(("", label + "：", _display(job[key])))
     return "\n".join(lines)
@@ -755,6 +1062,8 @@ class ReviewDesktopApp:
         self._view_filter: tuple | None = None
         self._prepared_filter: tuple | None = None
         self._filter_cache: tuple | None = None
+        self._filter_worker: threading.Thread | None = None
+        self._filter_working_key: tuple | None = None
         self._live_ai_checkpoint_version: tuple | None = None
         self._previews: set[str] = set()
         self._artifacts: dict[str, Path] = {}
@@ -778,6 +1087,16 @@ class ReviewDesktopApp:
         self._model_config_request_busy = False
         self._saved_review_rules = ""
         self._default_review_rules = ""
+        self._saved_stage_rules = {stage: default_stage_rules(stage) for stage in ("import", "shortlist", "fetch-jd")}
+        self._stage_rules_dialog: tk.Toplevel | None = None
+        self._stage_rules_stage: str | None = None
+        self._stage_rules_task: Path | None = None
+        self._stage_rules_status: StringVar | None = None
+        self._stage_rules_fields: dict[str, dict] = {}
+        self._stage_rules_inputs: dict[str, Any] = {}
+        self._stage_rules_controls: list[tuple[Any, str]] = []
+        self._stage_rules_buttons: dict[str, ttk.Button] = {}
+        self._stage_rules_canvas: tk.Canvas | None = None
         self._review_rules_dialog: tk.Toplevel | None = None
         self._review_rules_editor: tk.Text | None = None
         self._review_rules_status: StringVar | None = None
@@ -794,6 +1113,7 @@ class ReviewDesktopApp:
         # cache from a worker.
         self._live_refresh_after_id: str | None = None
         self._live_refresh_busy = False
+        self._live_refresh_started = 0.0
         self._live_refresh_worker: threading.Thread | None = None
         self._filter_after_id: str | None = None
         self._closing = False
@@ -840,6 +1160,7 @@ class ReviewDesktopApp:
         self.filter = StringVar(root, "全部")
         self.list_queue_filter = StringVar(root, ALL_LIST_QUEUES)
         self.list_queue_hint = StringVar(root, "")
+        self.jd_completeness_filter = StringVar(root, "全部正文")
         self.notice = StringVar(root, "选择包含 raw/current、raw/target 的完整数据根并新建任务，或显式打开已有任务。启动和切换步骤不会执行任务。")
         self.status_text = StringVar(root, "尚未绑定任务")
         self.stage_title = StringVar(root)
@@ -868,6 +1189,7 @@ class ReviewDesktopApp:
         self.search.trace_add("write", self._debounce_filters)
         self.filter.trace_add("write", self._debounce_filters)
         self.list_queue_filter.trace_add("write", self._debounce_filters)
+        self.jd_completeness_filter.trace_add("write", self._debounce_filters)
         root.bind("<Control-f>", self._focus_search)
         root.bind("<F5>", self._refresh_workspace)
         root.protocol("WM_DELETE_WINDOW", self._close)
@@ -903,11 +1225,11 @@ class ReviewDesktopApp:
         ttk.Label(header, textvariable=self.workspace_description, style="Muted.TLabel").grid(row=1, column=0, sticky="w")
         actions = ttk.Frame(header)
         actions.grid(row=0, column=1, rowspan=2, sticky="e")
-        self.collector_button = ttk.Button(actions, text="01  岗位采集", style="Small.TButton", command=self._open_collector)
+        self.collector_button = ttk.Button(actions, text="01  岗位采集", style="Workspace.TButton", command=self._open_collector)
         self.collector_button.pack(side="left", padx=(0, 8))
         self.review_button = ttk.Button(actions, text="02  后处理审核", style="Theme.TButton", command=lambda: self._show_workspace("review"))
         self.review_button.pack(side="left", padx=(0, 8))
-        self.delivery_button = ttk.Button(actions, text="03  投递数据导出", style="Small.TButton", command=lambda: self._show_workspace("delivery"))
+        self.delivery_button = ttk.Button(actions, text="03  投递数据导出", style="Workspace.TButton", command=lambda: self._show_workspace("delivery"))
         self.delivery_button.pack(side="left", padx=(0, 8))
         self.theme_button = ttk.Button(actions, textvariable=self.theme_button_text, style="Theme.TButton", command=self._toggle_theme)
         self.theme_button.pack(side="left")
@@ -918,7 +1240,7 @@ class ReviewDesktopApp:
         ttk.Label(self.setup_frame, text="完整数据根").grid(row=0, column=0, sticky="w", padx=(0, 10))
         self.source_entry = ttk.Entry(self.setup_frame, textvariable=self.source_root)
         self.source_entry.grid(row=0, column=1, sticky="ew", padx=(0, 8))
-        self.choose_source_button = ttk.Button(self.setup_frame, text="选择文件夹", style="Small.TButton", command=self._choose_source)
+        self.choose_source_button = ttk.Button(self.setup_frame, text="选择文件夹", style="Workspace.TButton", command=self._choose_source)
         self.choose_source_button.grid(row=0, column=2)
         options = ttk.Frame(self.setup_frame)
         options.grid(row=1, column=0, columnspan=3, sticky="ew", pady=5)
@@ -943,11 +1265,11 @@ class ReviewDesktopApp:
         ttk.Label(self.setup_frame, text="任务保存位置").grid(row=3, column=0, sticky="w", padx=(0, 10))
         self.parent_entry = ttk.Entry(self.setup_frame, textvariable=self.task_parent)
         self.parent_entry.grid(row=3, column=1, sticky="ew", padx=(0, 8))
-        self.choose_parent_button = ttk.Button(self.setup_frame, text="选择位置", style="Small.TButton", command=self._choose_parent)
+        self.choose_parent_button = ttk.Button(self.setup_frame, text="选择位置", style="Workspace.TButton", command=self._choose_parent)
         self.choose_parent_button.grid(row=3, column=2)
         setup_actions = ttk.Frame(self.setup_frame)
         setup_actions.grid(row=4, column=0, columnspan=3, sticky="ew", pady=(6, 0))
-        self.create_button = ttk.Button(setup_actions, text="创建具名任务", style="Primary.TButton", command=self._create_task)
+        self.create_button = ttk.Button(setup_actions, text="创建具名任务", style="Workspace.Primary.TButton", command=self._create_task)
         self.create_button.pack(side="left", padx=(0, 8))
         self.open_button = ttk.Button(setup_actions, text="打开已有任务…", command=self._choose_task)
         self.open_button.pack(side="left")
@@ -962,16 +1284,16 @@ class ReviewDesktopApp:
         ttk.Label(self.binding_frame, textvariable=self.binding_title, style="Review.Binding.TLabel").grid(row=0, column=0, sticky="w")
         bound_actions = ttk.Frame(self.binding_frame)
         bound_actions.grid(row=0, column=1, rowspan=2, sticky="ne")
-        self.new_task_button = ttk.Button(bound_actions, text="新建 / 改数量", style="Small.TButton", command=self._new_task)
+        self.new_task_button = ttk.Button(bound_actions, text="新建 / 改数量", style="Workspace.TButton", command=self._new_task)
         self.new_task_button.pack(side="left", padx=4)
-        self.open_bound_button = ttk.Button(bound_actions, text="打开任务…", style="Small.TButton", command=self._choose_task)
+        self.open_bound_button = ttk.Button(bound_actions, text="打开任务…", style="Workspace.TButton", command=self._choose_task)
         self.open_bound_button.pack(side="left", padx=4)
-        self.task_folder_button = ttk.Button(bound_actions, text="任务目录", style="Small.TButton", command=lambda: self._open_location("task"))
+        self.task_folder_button = ttk.Button(bound_actions, text="打开任务目录", style="Workspace.TButton", command=lambda: self._open_location("task"))
         self.task_folder_button.pack(side="left", padx=4)
         ttk.Label(self.binding_frame, textvariable=self.binding_scope, style="Review.Context.TLabel").grid(row=1, column=0, sticky="w")
         self.binding_source_label = ttk.Label(self.binding_frame, textvariable=self.binding_source, style="Review.Context.TLabel", wraplength=940)
         self.binding_output_label = ttk.Label(self.binding_frame, textvariable=self.binding_output, style="Review.Context.TLabel", wraplength=940)
-        self.binding_details_button = ttk.Button(bound_actions, text="输入 / 输出绑定", style="Small.TButton", command=self._toggle_bindings)
+        self.binding_details_button = ttk.Button(bound_actions, text="输入 / 输出绑定", style="Workspace.TButton", command=self._toggle_bindings)
         self.binding_details_button.pack(side="left", padx=4)
 
         nav = self.stage_navigation = ttk.Frame(self.root, padding=(18, 2, 18, 3))
@@ -1005,24 +1327,23 @@ class ReviewDesktopApp:
         description.columnconfigure(0, weight=1)
         self.description_label = ttk.Label(description, textvariable=self.stage_description, style="Hint.TLabel", wraplength=820)
         self.description_label.grid(row=0, column=0, sticky="ew")
-        self.reset_button = ttk.Button(description, text="重置本阶段", style="Small.TButton", command=self._reset_stage)
+        self.reset_button = ttk.Button(description, text="重置本阶段", style="Workspace.TButton", command=self._reset_stage)
         self.reset_button.grid(row=0, column=1, sticky="ne", padx=(8, 0))
         controls = ttk.Frame(work, style="Card.TFrame")
         controls.grid(row=2, column=0, sticky="ew", pady=(0, 3))
-        self.run_button = ttk.Button(controls, text="运行本步", style="Review.Primary.TButton", command=self._run_stage)
+        self.run_button = ttk.Button(controls, text="运行本步", style="Workspace.Primary.TButton", command=self._run_stage)
         self.run_button.pack(side="left", padx=(0, 6))
-        self.pause_button = ttk.Button(controls, text="暂停", style="Small.TButton", command=self._pause_stage)
+        self.pause_button = ttk.Button(controls, text="暂停", style="Workspace.TButton", command=self._pause_stage)
         self.pause_button.pack(side="left", padx=3)
-        self.stop_button = ttk.Button(controls, text="停止", style="Small.TButton", command=self._stop_stage)
+        self.stop_button = ttk.Button(controls, text="停止", style="Workspace.TButton", command=self._stop_stage)
         self.stop_button.pack(side="left", padx=3)
-        self.continue_button = ttk.Button(controls, text="人工处理完成，继续", style="Small.TButton", command=self._continue_stage)
-        self.continue_button.pack(side="left", padx=3)
-        self.settings_button = ttk.Button(controls, text="执行设置", style="Small.TButton", command=self._toggle_settings)
+        self.continue_button = self.run_button  # Compatibility name for the single stage action.
+        self.settings_button = ttk.Button(controls, text="执行设置", style="Workspace.TButton", command=self._toggle_settings)
         self.settings_button.pack(side="right")
-        self.refresh_button = ttk.Button(controls, text="刷新", style="Small.TButton", command=self._refresh_task)
+        self.refresh_button = ttk.Button(controls, text="刷新", style="Workspace.TButton", command=self._refresh_task)
         self.refresh_button.pack(side="right", padx=5)
-        self.edit_rules_button = ttk.Button(controls, text="修改复核规则", style="Small.TButton",
-                                            command=self._edit_review_rules)
+        self.edit_rules_button = ttk.Button(controls, text="修改本步规则", style="Workspace.TButton",
+                                            command=self._edit_stage_rules)
 
         progress_area = ttk.Frame(work, style="Card.TFrame")
         progress_area.grid(row=3, column=0, sticky="ew", pady=(0, 3))
@@ -1037,11 +1358,11 @@ class ReviewDesktopApp:
         ttk.Label(jd_options_line, text="浏览器模式", style="Hint.TLabel").pack(side="left", padx=(12, 6))
         self.browser_mode_box = ttk.Combobox(
             jd_options_line, textvariable=self.browser_mode, values=BROWSER_MODE_CHOICES,
-            state="readonly", width=18, style="Review.TCombobox",
+            state="readonly", width=18, style="Workspace.TCombobox",
         )
         self.browser_mode_box.pack(side="left")
         self.browser_mode_box.bind("<<ComboboxSelected>>", self._browser_mode_selected)
-        self.prepare_browser_button = ttk.Button(jd_options_line, text="准备 Chrome + Edge / 登录", style="Small.TButton", command=self._prepare_browser)
+        self.prepare_browser_button = ttk.Button(jd_options_line, text="准备 Chrome + Edge / 登录", style="Workspace.TButton", command=self._prepare_browser)
         self.prepare_browser_button.pack(side="left", padx=(12, 0))
         jd_browser_line = ttk.Frame(self.jd_settings_frame, style="Card.TFrame")
         jd_browser_line.pack(fill="x", pady=(1, 0))
@@ -1061,7 +1382,7 @@ class ReviewDesktopApp:
                                            text="", style="Hint.TLabel", wraplength=620, justify="left")
         self.model_config_label.pack(side="left", padx=(12, 0), anchor="w", fill="x", expand=True)
         self.model_config_button = ttk.Button(
-            self.llm_settings_frame, text="修改模型配置", style="Small.TButton", command=self._edit_model_configuration,
+            self.llm_settings_frame, text="修改模型配置", style="Workspace.TButton", command=self._edit_model_configuration,
         )
         self.model_config_button.pack(side="right", padx=(8, 0))
         self._refresh_model_config_label()
@@ -1083,7 +1404,7 @@ class ReviewDesktopApp:
         self.scraper_entry.grid(row=1, column=1, sticky="ew")
         scraper_actions = ttk.Frame(self.settings_frame, style="Card.TFrame")
         scraper_actions.grid(row=1, column=2)
-        self.scraper_choose_button = ttk.Button(scraper_actions, text="选择", style="Small.TButton", command=self._choose_scraper)
+        self.scraper_choose_button = ttk.Button(scraper_actions, text="选择", style="Workspace.TButton", command=self._choose_scraper)
         self.scraper_choose_button.pack(side="left", padx=4)
         browser_line = ttk.Frame(self.settings_frame, style="Card.TFrame")
         browser_line.grid(row=2, column=0, columnspan=3, sticky="ew", pady=(5, 0))
@@ -1136,12 +1457,12 @@ class ReviewDesktopApp:
         ttk.Label(queue_tools, text="方向队列", style="Hint.TLabel").pack(side="left", padx=(0, 5))
         self.list_queue_box = ttk.Combobox(queue_tools, textvariable=self.list_queue_filter,
                                           values=(ALL_LIST_QUEUES, *LIST_QUEUE_LABELS.values()),
-                                          width=10, state="readonly", style="Review.TCombobox")
+                                          width=10, state="readonly", style="Workspace.TCombobox")
         self.list_queue_box.pack(side="left", padx=(0, 6))
-        self.relevant_only_button = ttk.Button(queue_tools, text="仅保留明确相关", style="Small.TButton",
+        self.relevant_only_button = ttk.Button(queue_tools, text="仅保留明确相关", style="Workspace.TButton",
                                                command=self._keep_relevant_only)
         self.relevant_only_button.pack(side="left", padx=(0, 4))
-        self.add_verify_button = ttk.Button(queue_tools, text="加入待核实", style="Small.TButton",
+        self.add_verify_button = ttk.Button(queue_tools, text="加入待核实", style="Workspace.TButton",
                                             command=self._add_verify_queue)
         self.add_verify_button.pack(side="left")
         self.list_queue_hint_label = ttk.Label(self.list_queue_frame, textvariable=self.list_queue_hint,
@@ -1149,26 +1470,34 @@ class ReviewDesktopApp:
         self.list_queue_hint_label.grid(row=1, column=0, sticky="ew", pady=(2, 0))
         self.list_queue_frame.bind("<Configure>", lambda event: self.list_queue_hint_label.configure(wraplength=max(240, event.width - 4)))
         self._comboboxes.append(self.list_queue_box)
+        self.jd_filter_frame = ttk.Frame(controls, style="Card.TFrame")
+        ttk.Label(self.jd_filter_frame, text="JD 正文", style="Hint.TLabel").pack(side="left", padx=(0, 5))
+        self.jd_filter_box = ttk.Combobox(self.jd_filter_frame, textvariable=self.jd_completeness_filter,
+                                         values=tuple(JD_COMPLETENESS_CHOICES), state="readonly",
+                                         width=10, style="Workspace.TCombobox")
+        self.jd_filter_box.pack(side="left", padx=(0, 6))
+        self._comboboxes.append(self.jd_filter_box)
         tools = ttk.Frame(listing, style="Card.TFrame")
         tools.grid(row=1, column=0, sticky="ew", pady=(0, 3))
-        ttk.Label(tools, text="人工名单", style="Hint.TLabel").pack(side="left", padx=(0, 4))
+        ttk.Label(tools, text="审核名单", style="Hint.TLabel").pack(side="left", padx=(0, 4))
         self.filter_buttons: dict[str, ttk.Button] = {}
         for label in ("全部", "保留", "剔除", "待核实"):
-            button = ttk.Button(tools, text=label, style="Small.TButton", command=lambda value=label: self.filter.set(value))
+            button = ttk.Button(tools, text=label, style="Workspace.TButton", command=lambda value=label: self.filter.set(value))
             button.pack(side="left", padx=(0, 3))
             self.filter_buttons[label] = button
-        self.search_entry = ttk.Entry(tools, textvariable=self.search, width=17, style="Review.TEntry")
+        self.search_entry = ttk.Entry(tools, textvariable=self.search, width=17, style="Workspace.TEntry")
+        bind_search(self.search_entry, self.search)
         self.search_entry.pack(side="right", fill="x", expand=True, padx=(8, 0))
         ttk.Label(tools, text="搜索", style="Hint.TLabel").pack(side="right", padx=(4, 0))
         bulk = ttk.Frame(listing, style="Card.TFrame")
         bulk.grid(row=2, column=0, sticky="ew", pady=(0, 3))
-        self.select_page_button = ttk.Button(bulk, text="全选本页", style="Small.TButton", command=self._select_page)
+        self.select_page_button = ttk.Button(bulk, text="全选本页", style="Workspace.TButton", command=self._select_page)
         self.select_page_button.pack(side="left", padx=(0, 3))
-        self.exclude_button = ttk.Button(bulk, text="剔除所选", style="Small.TButton", command=lambda: self._set_selected_keep(False))
+        self.exclude_button = ttk.Button(bulk, text="剔除所选", style="Workspace.TButton", command=lambda: self._set_selected_keep(False))
         self.exclude_button.pack(side="left", padx=3)
-        self.restore_button = ttk.Button(bulk, text="恢复所选", style="Small.TButton", command=lambda: self._set_selected_keep(True))
+        self.restore_button = ttk.Button(bulk, text="保留所选", style="Workspace.TButton", command=lambda: self._set_selected_keep(True))
         self.restore_button.pack(side="left", padx=3)
-        self.recommend_button = ttk.Button(bulk, text="采用建议", style="Small.TButton", command=self._apply_recommendations)
+        self.recommend_button = ttk.Button(bulk, text="采用建议", style="Workspace.TButton", command=self._apply_recommendations)
         self.recommend_button.pack(side="left", padx=3)
 
         table_frame = ttk.Frame(listing, style="Card.TFrame")
@@ -1194,13 +1523,10 @@ class ReviewDesktopApp:
         self.results_table.bind("<space>", self._table_space)
         self.empty_label = ttk.Label(table_frame, textvariable=self.empty_text, style="Hint.TLabel", anchor="center", wraplength=430)
         self.empty_label.place(relx=.5, rely=.5, anchor="center")
-        pagination = ttk.Frame(listing, style="Card.TFrame")
+        pagination = Pagination(listing, textvariable=self.page_text,
+                                previous=lambda: self._change_page(-1), next=lambda: self._change_page(1))
         pagination.grid(row=4, column=0, sticky="ew", pady=(5, 0))
-        self.previous_page_button = ttk.Button(pagination, text="上一页", style="Small.TButton", command=lambda: self._change_page(-1))
-        self.previous_page_button.pack(side="left")
-        ttk.Label(pagination, textvariable=self.page_text, style="Hint.TLabel").pack(side="left", padx=7)
-        self.next_page_button = ttk.Button(pagination, text="下一页", style="Small.TButton", command=lambda: self._change_page(1))
-        self.next_page_button.pack(side="left")
+        self.previous_page_button, self.next_page_button = pagination.previous_button, pagination.next_button
 
         detail = ttk.Frame(self.review_pane, style="Card.TFrame", padding=(10, 0, 0, 0))
         self.review_pane.add(detail, weight=2)
@@ -1212,19 +1538,19 @@ class ReviewDesktopApp:
         self.detail_text = self._text_tab(self.detail_notebook, "依据")
         self.jd_text = self._text_tab(self.detail_notebook, "JD 原文")
         self.sources_text = self._text_tab(self.detail_notebook, "全部来源")
-        self.detail_toggle_button = ttk.Button(detail, text="剔除 / 恢复当前岗位", style="Small.TButton", command=self._toggle_focused_keep)
+        self.detail_toggle_button = ttk.Button(detail, text="剔除 / 恢复当前岗位", style="Workspace.TButton", command=self._toggle_focused_keep)
         self.detail_toggle_button.grid(row=2, column=0, sticky="w", pady=(5, 0))
 
         footer = ttk.Frame(work, style="Card.TFrame")
         footer.grid(row=5, column=0, sticky="ew", pady=(4, 0))
         footer.columnconfigure(0, weight=1)
         ttk.Label(footer, textvariable=self.count_text, style="Hint.TLabel").grid(row=0, column=0, sticky="w")
-        self.open_report_button = ttk.Button(footer, text="打开报告", style="Review.Primary.TButton",
+        self.open_report_button = ttk.Button(footer, text="打开报告", style="Workspace.Primary.TButton",
                                              command=lambda: self._open_location("markdown"))
-        self.go_delivery_button = ttk.Button(footer, text="前往 03 投递数据导出", style="Review.Primary.TButton",
+        self.go_delivery_button = ttk.Button(footer, text="前往 03 投递数据导出", style="Workspace.Primary.TButton",
                                              command=lambda: self._show_workspace("delivery"))
         self.go_delivery_button.grid(row=0, column=1, sticky="e", padx=(10, 6))
-        self.confirm_button = ttk.Button(footer, textvariable=self.confirm_text, style="Review.Primary.TButton", command=self._confirm_stage)
+        self.confirm_button = ttk.Button(footer, textvariable=self.confirm_text, style="Workspace.Primary.TButton", command=self._confirm_stage)
         self.confirm_button.grid(row=0, column=2, sticky="e")
 
         log_panel = ttk.Frame(self.main_pane, style="Card.TFrame", padding=(10, 5))
@@ -1235,10 +1561,10 @@ class ReviewDesktopApp:
         log_tools = ttk.Frame(log_panel, style="Card.TFrame")
         log_tools.grid(row=0, column=0, sticky="ew", pady=(0, 3))
         ttk.Label(log_tools, text="真实运行日志", style="Section.TLabel").pack(side="left")
-        self.log_button = ttk.Button(log_tools, text="日志文件", style="Small.TButton", command=lambda: self._open_location("log"))
+        self.log_button = ttk.Button(log_tools, text="日志文件", style="Workspace.TButton", command=lambda: self._open_location("log"))
         self.log_button.pack(side="right", padx=(4, 0))
-        self.markdown_button = ttk.Button(log_tools, text="报告 Markdown", style="Small.TButton", command=lambda: self._open_location("markdown"))
-        self.json_button = ttk.Button(log_tools, text="报告 JSON", style="Small.TButton", command=lambda: self._open_location("json"))
+        self.markdown_button = ttk.Button(log_tools, text="报告 Markdown", style="Workspace.TButton", command=lambda: self._open_location("markdown"))
+        self.json_button = ttk.Button(log_tools, text="报告 JSON", style="Workspace.TButton", command=lambda: self._open_location("json"))
         log_frame = ttk.Frame(log_panel)
         log_frame.grid(row=1, column=0, sticky="nsew")
         log_frame.columnconfigure(0, weight=1)
@@ -1292,9 +1618,9 @@ class ReviewDesktopApp:
                 widget.grid()
             self.workspace_description.set("其他页面正在处理，后处理暂不可启动；可切回查看进度。" if self._collection_busy or self._delivery_busy else
                                            "四步审核并确认最终保留；投递数据在 03 显式导出。")
-        self.collector_button.configure(style="Theme.TButton" if collecting else "Small.TButton")
-        self.review_button.configure(style="Theme.TButton" if workspace == "review" else "Small.TButton")
-        self.delivery_button.configure(style="Theme.TButton" if delivering else "Small.TButton")
+        self.collector_button.configure(style="Theme.TButton" if collecting else "Workspace.TButton")
+        self.review_button.configure(style="Theme.TButton" if workspace == "review" else "Workspace.TButton")
+        self.delivery_button.configure(style="Theme.TButton" if delivering else "Workspace.TButton")
         self.delivery_page.render_controls()
 
     def _collection_state_changed(self, _busy: bool) -> None:
@@ -1324,15 +1650,8 @@ class ReviewDesktopApp:
         self._notify("已将采集目录填入新任务表单；尚未创建任务、导入或筛选。已有任务和原始数据均保留。")
 
     def _text_tab(self, notebook: ttk.Notebook, label: str) -> tk.Text:
-        frame = ttk.Frame(notebook)
-        frame.columnconfigure(0, weight=1)
-        frame.rowconfigure(0, weight=1)
-        text = tk.Text(frame, wrap="word", state="disabled", height=5, width=27, relief="flat", borderwidth=0,
-                       padx=8, pady=7, font=("Microsoft YaHei UI", 9), exportselection=False)
-        text.grid(row=0, column=0, sticky="nsew")
-        scroll = ttk.Scrollbar(frame, orient="vertical", command=text.yview)
-        scroll.grid(row=0, column=1, sticky="ns")
-        text.configure(yscrollcommand=scroll.set)
+        frame = ReadOnlyText(notebook, height=5, width=27)
+        text = frame.text
         notebook.add(frame, text=label)
         self._text_widgets.append((text, False))
         return text
@@ -1363,8 +1682,13 @@ class ReviewDesktopApp:
             overhead = panel.winfo_reqheight() - self.log_view.winfo_reqheight()
             sash = int(ttk.Style(self.root).lookup("TPanedwindow", "sashwidth") or 6)
             maximum = max(0, height - max(0, overhead) - 40 - sash)
-            if self.main_pane.sashpos(0) > maximum:
-                self.main_pane.sashpos(0, maximum)
+            current = self.main_pane.sashpos(0)
+            # Stage-specific filters must not take the last visible job rows.
+            # Keep the user's sash position when both panes remain usable.
+            minimum = current + max(0, 60 - self.results_table.winfo_height())
+            position = min(maximum, max(current, minimum))
+            if current != position:
+                self.main_pane.sashpos(0, position)
 
     def _toggle_bindings(self) -> None:
         if self.binding_source_label.winfo_manager():
@@ -1410,9 +1734,14 @@ class ReviewDesktopApp:
     def _refresh_model_config_label(self) -> None:
         """Show the effective project model settings without reading its secret."""
         try:
-            settings = project_llm_settings.load_settings() or {}
+            settings = project_llm_settings.load_settings()
         except project_llm_settings.ProjectProviderError:
             self.model_config_label.configure(text="本机模型配置无效 · 点击“修改模型配置”修复")
+            return
+        if settings is None:
+            self.model_config_label.configure(text=(
+                "尚未保存项目模型配置 · 执行时可能使用全局服务\n"
+                "请点击“修改模型配置”核对并保存本项目服务。"))
             return
         base_url = settings.get("base_url", project_llm_settings.DEFAULT_BASE_URL)
         model = settings.get("model", AI_DEFAULT_MODEL)
@@ -1474,7 +1803,7 @@ class ReviewDesktopApp:
         ttk.Label(body, text="API 协议", style="Hint.TLabel").grid(row=2, column=0, sticky="w", padx=(0, 12), pady=5)
         api_mode_box = ttk.Combobox(
             body, textvariable=api_mode, values=tuple(API_MODE_CHOICES),
-            state="readonly", width=24, style="Review.TCombobox",
+            state="readonly", width=24, style="Workspace.TCombobox",
         )
         api_mode_box.grid(row=2, column=1, sticky="w", pady=5)
         stream_check = ttk.Checkbutton(body, text="使用流式响应", variable=chat_stream)
@@ -1486,10 +1815,10 @@ class ReviewDesktopApp:
 
         ttk.Label(body, text="模型名称", style="Hint.TLabel").grid(row=4, column=0, sticky="w", padx=(0, 12), pady=5)
         model_box = ttk.Combobox(body, textvariable=model, values=(model.get(),) if model.get() else (),
-                                 state="normal", width=44, style="Review.TCombobox")
+                                 state="normal", width=44, style="Workspace.TCombobox")
         model_box.grid(row=4, column=1, sticky="ew", pady=5)
         read_models_button = ttk.Button(
-            body, text="读取模型", style="Small.TButton",
+            body, text="读取模型", style="Workspace.TButton",
             command=lambda: self._run_model_config_check(dialog, "models"),
         )
         read_models_button.grid(row=4, column=2, sticky="e", padx=(8, 0), pady=5)
@@ -1497,11 +1826,11 @@ class ReviewDesktopApp:
         ttk.Label(body, text="思考强度", style="Hint.TLabel").grid(row=5, column=0, sticky="w", padx=(0, 12), pady=5)
         effort_box = ttk.Combobox(
             body, textvariable=effort, values=project_llm_settings.REASONING_EFFORTS,
-            state="readonly", width=16, style="Review.TCombobox",
+            state="readonly", width=16, style="Workspace.TCombobox",
         )
         effort_box.grid(row=5, column=1, sticky="w", pady=5)
         reasoning_button = ttk.Button(
-            body, text="验证思考强度", style="Small.TButton",
+            body, text="验证思考强度", style="Workspace.TButton",
             command=lambda: self._run_model_config_check(dialog, "reasoning"),
         )
         reasoning_button.grid(row=5, column=2, sticky="e", padx=(8, 0), pady=5)
@@ -1549,10 +1878,10 @@ class ReviewDesktopApp:
 
         actions = ttk.Frame(body)
         actions.grid(row=11, column=0, columnspan=3, sticky="e", pady=(8, 0))
-        ttk.Button(actions, text="取消", style="Small.TButton",
+        ttk.Button(actions, text="取消", style="Workspace.TButton",
                    command=lambda: self._close_model_configuration(dialog)).pack(side="right")
         save_button = ttk.Button(
-            actions, text="保存配置", style="Review.Primary.TButton",
+            actions, text="保存配置", style="Workspace.Primary.TButton",
             command=lambda: self._save_model_configuration(
                 dialog, base_url.get(), model.get(), effort.get(), api_key.get(), status,
                 API_MODE_CHOICES.get(api_mode.get(), project_llm_settings.API_MODE_RESPONSES),
@@ -1561,7 +1890,7 @@ class ReviewDesktopApp:
         )
         save_button.pack(side="right", padx=(0, 8))
         test_connection_button = ttk.Button(
-            actions, text="测试连接", style="Small.TButton",
+            actions, text="测试连接", style="Workspace.TButton",
             command=lambda: self._run_model_config_check(dialog, "connection"),
         )
         test_connection_button.pack(side="right", padx=(0, 8))
@@ -1941,12 +2270,8 @@ class ReviewDesktopApp:
         style.configure("Review.Title.TLabel", font=("Microsoft YaHei UI", 18, "bold"))
         style.configure("Review.Binding.TLabel", font=("Microsoft YaHei UI", 11, "bold"))
         style.configure("Review.Context.TLabel", font=("Microsoft YaHei UI", 9), foreground=p["muted"])
-        style.configure("Small.TButton", padding=(6, 3))
         # Highlight a filter without increasing the whole toolbar's height.
         style.configure("Review.Theme.TButton", padding=(6, 3))
-        style.configure("Review.Primary.TButton", padding=(10, 5))
-        style.configure("Review.TEntry", padding=4, font=("Microsoft YaHei UI", 9))
-        style.configure("Review.TCombobox", padding=3, font=("Microsoft YaHei UI", 9))
         style.configure("Review.Treeview", rowheight=31)
         style.configure("Review.Treeview.Heading", padding=(7, 4))
         style.configure("Review.Step.TButton", padding=(6, 4), font=("Microsoft YaHei UI", 9))
@@ -1964,6 +2289,7 @@ class ReviewDesktopApp:
                            selectforeground=p["log_selected_text" if log else "selected_text"],
                            insertbackground=p["text"], highlightbackground=p["border"], highlightcolor=p["focus"])
         self._style_review_rules_editor()
+        self._style_stage_rules_editor()
         self.results_table.tag_configure("excluded", background=p["table_excluded"], foreground=p["muted"])
         self.results_table.tag_configure("kept", background=p["surface"], foreground=p["text"])
         self.results_table.tag_configure("suggest_keep", background=p["surface"], foreground=p["text"])
@@ -1999,39 +2325,241 @@ class ReviewDesktopApp:
         self._paint_notice()
 
     def _toggle_settings(self) -> None:
+        if self.stage.get() != "fetch-jd":
+            self.settings_frame.grid_remove()
+            return
         if self.settings_frame.winfo_manager():
             self.settings_frame.grid_remove()
         else:
             self.settings_frame.grid(row=3, column=0, sticky="ew", pady=(4, 0))
 
-    def _edit_review_rules(self) -> None:
-        if self.task is None or self._execution_blocked:
+    def _rules_editable(self) -> bool:
+        return (not self._execution_blocked
+                and not any(info.get("status") == "running" for info in self.manifest.get("stages", {}).values()))
+
+    def _edit_stage_rules(self) -> None:
+        stage = self.stage.get()
+        if stage == "llm":
+            self._edit_review_rules()
+            return
+        if self._closing or stage not in {"import", "shortlist", "fetch-jd"}:
+            return
+        if self._stage_rules_dialog is not None:
+            self._stage_rules_dialog.lift()
             return
         if self._review_rules_dialog is not None:
             self._review_rules_dialog.lift()
             return
         dialog = tk.Toplevel(self.root)
-        dialog.title("AI 语义复核 · 编辑本任务规则")
-        dialog.transient(self.root)
-        dialog.minsize(620, 460)
-        width = min(900, max(620, self.root.winfo_screenwidth() - 100))
-        height = min(760, max(460, self.root.winfo_screenheight() - 140))
-        dialog.geometry(f"{width}x{height}")
-        dialog.columnconfigure(0, weight=1)
-        dialog.rowconfigure(0, weight=1)
+        dialog.title(f"{STAGE_LABELS[stage]} · 本任务规则")
+        width = configure_editor_dialog(dialog, self.root)
+        body = ttk.Frame(dialog, padding=16)
+        body.grid(row=0, column=0, sticky="nsew")
+        body.columnconfigure(0, weight=1)
+        body.rowconfigure(2, weight=1)
+        heading = ttk.Label(body, text=f"修改{STAGE_LABELS[stage]}的参数、词表与开关", style="Section.TLabel")
+        heading.grid(row=0, column=0, sticky="w")
+        explanation = ttk.Label(body, text="只保存到当前任务。保存不会运行本步；修改已完成步骤的规则会使本步及后续结果失效，需手动运行并重新确认。词表可每行一词，或用逗号、分号分隔；空词表表示不添加限制。",
+                                style="Hint.TLabel", justify="left", wraplength=width - 60)
+        explanation.grid(row=1, column=0, sticky="ew", pady=(6, 10))
+        area = ttk.Frame(body)
+        area.grid(row=2, column=0, sticky="nsew")
+        area.columnconfigure(0, weight=1)
+        area.rowconfigure(0, weight=1)
+        canvas = tk.Canvas(area, highlightthickness=0, borderwidth=0)
+        canvas.grid(row=0, column=0, sticky="nsew")
+        scroll = ttk.Scrollbar(area, orient="vertical", command=canvas.yview)
+        scroll.grid(row=0, column=1, sticky="ns")
+        canvas.configure(yscrollcommand=scroll.set)
+        fields_frame = ttk.Frame(canvas)
+        fields_frame.columnconfigure(0, weight=1)
+        window = canvas.create_window(0, 0, anchor="nw", window=fields_frame)
+        help_labels = []
+        fields_frame.bind("<Configure>", lambda _event: canvas.configure(scrollregion=canvas.bbox("all")))
+
+        def resize(event: tk.Event) -> None:
+            canvas.itemconfigure(window, width=event.width)
+            for label in help_labels:
+                label.configure(wraplength=max(200, event.width - 14))
+
+        canvas.bind("<Configure>", resize)
+        self._stage_rules_fields = {field["key"]: field for field in stage_rule_fields(stage)}
+        self._stage_rules_inputs, self._stage_rules_controls = {}, []
+        saved = self._saved_stage_rules.get(stage, default_stage_rules(stage)) if self.task else default_stage_rules(stage)
+        for row, (key, field) in enumerate(self._stage_rules_fields.items()):
+            block = ttk.Frame(fields_frame, padding=(0, 3, 8, 9))
+            block.grid(row=row, column=0, sticky="ew")
+            block.columnconfigure(0, weight=1)
+            kind = field["type"]
+            if kind == "bool":
+                value = BooleanVar(dialog, bool(saved[key]))
+                control = ttk.Checkbutton(block, text=field["label"], variable=value)
+                control.grid(row=0, column=0, sticky="w")
+                normal = "normal"
+            else:
+                ttk.Label(block, text=field["label"], style="Hint.TLabel").grid(row=0, column=0, sticky="w")
+                if kind == "keywords":
+                    control = tk.Text(block, height=3, width=30, wrap="word", undo=True, relief="flat", borderwidth=1,
+                                      padx=8, pady=5, font=("Microsoft YaHei UI", 10), exportselection=False)
+                    control.grid(row=1, column=0, sticky="ew", pady=(3, 0))
+                    control.insert("1.0", "\n".join(saved[key]))
+                    value, normal = control, "normal"
+                else:
+                    value = StringVar(dialog, str(saved[key]))
+                    if kind == "int":
+                        control = ttk.Spinbox(block, textvariable=value, from_=field["min"], to=field["max"], width=9)
+                        normal = "normal"
+                    else:
+                        control = ttk.Combobox(block, textvariable=value, values=field["choices"], width=16, state="readonly")
+                        normal = "readonly"
+                    control.grid(row=1, column=0, sticky="w", pady=(3, 0))
+            if field.get("help"):
+                label = ttk.Label(block, text=field["help"], style="Hint.TLabel", wraplength=width - 80, justify="left")
+                label.grid(row=2, column=0, sticky="ew", pady=(3, 0))
+                help_labels.append(label)
+            self._stage_rules_inputs[key] = value
+            self._stage_rules_controls.append((control, normal))
+
+            def scroll_fields(event: tk.Event) -> str:
+                canvas.yview_scroll(-1 if event.delta > 0 else 1, "units")
+                return "break"
+
+            for widget in (block, *block.winfo_children()):
+                if not isinstance(widget, tk.Text):
+                    widget.bind("<MouseWheel>", scroll_fields)
+        canvas.bind("<MouseWheel>", lambda event: canvas.yview_scroll(-1 if event.delta > 0 else 1, "units"))
+        message = ("请先创建或打开任务后保存；当前展示默认规则。" if self.task is None else
+                   "任务正在处理；当前规则只读，暂停或停止后可修改。" if not self._rules_editable() else
+                   "修改后点击“保存本任务规则”；保存不会自动运行。")
+        status = StringVar(dialog, message)
+        status_label = ttk.Label(body, textvariable=status, style="Hint.TLabel", wraplength=width - 60, justify="left")
+        status_label.grid(row=3, column=0, sticky="ew", pady=(8, 4))
+        actions = DialogActions(body, save=self._save_stage_rules, cancel=self._close_stage_rules_editor,
+                                reset=self._reset_stage_rules_draft, save_text="保存本任务规则")
+        actions.grid(row=4, column=0, sticky="ew", pady=(6, 0))
+        self._stage_rules_dialog, self._stage_rules_canvas = dialog, canvas
+        self._stage_rules_stage = stage
+        self._stage_rules_task = self.task.path if self.task else None
+        self._stage_rules_status = status
+        self._stage_rules_buttons = actions.buttons
+        dialog.bind("<Configure>", lambda _event: (
+            explanation.configure(wraplength=max(200, dialog.winfo_width() - 40)),
+            status_label.configure(wraplength=max(200, dialog.winfo_width() - 40))))
+        dialog.protocol("WM_DELETE_WINDOW", self._close_stage_rules_editor)
+        dialog.bind("<Escape>", lambda _event: self._close_stage_rules_editor())
+        dialog.bind("<Control-s>", lambda _event: self._save_stage_rules())
+        self._style_stage_rules_editor()
+        self._render_rule_editors()
+        dialog.grab_set()
+
+    def _style_stage_rules_editor(self) -> None:
+        p = self.colors
+        if self._stage_rules_canvas is not None:
+            self._stage_rules_canvas.configure(background=p["surface"])
+        for value in self._stage_rules_inputs.values():
+            if isinstance(value, tk.Text):
+                value.configure(background=p["surface"], foreground=p["text"], insertbackground=p["text"],
+                                selectbackground=p["selection"], selectforeground=p["selected_text"],
+                                highlightbackground=p["border"], highlightcolor=p["focus"])
+
+    def _render_rule_editors(self) -> None:
+        editable = self._rules_editable()
+        saving_ai = self._busy and self._operation == "save-review-rules"
+        if self._review_rules_editor is not None:
+            self._review_rules_editor.configure(state="normal" if editable else "disabled")
+            for key, button in self._review_rules_buttons.items():
+                enabled = not saving_ai if key == "cancel" else editable and (key != "save" or self.task is not None)
+                self._enabled(button, enabled)
+        saving_stage = self._busy and self._operation == "save-stage-rules"
+        for control, normal in self._stage_rules_controls:
+            self._enabled(control, editable, normal)
+        for key, button in self._stage_rules_buttons.items():
+            enabled = not saving_stage if key == "cancel" else editable and (key != "save" or self.task is not None)
+            self._enabled(button, enabled)
+
+    def _reset_stage_rules_draft(self) -> None:
+        if not self._rules_editable() or self._stage_rules_stage is None:
+            return
+        for key, value in default_stage_rules(self._stage_rules_stage).items():
+            control = self._stage_rules_inputs[key]
+            if isinstance(control, tk.Text):
+                control.delete("1.0", "end")
+                control.insert("1.0", "\n".join(value))
+            else:
+                control.set(value)
+        if self._stage_rules_status is not None:
+            self._stage_rules_status.set("默认规则已载入编辑框；点击保存后才会应用到本任务。")
+
+    def _save_stage_rules(self) -> None:
+        if not self._rules_editable() or self.task is None or self._stage_rules_stage is None:
+            return
+        if self.task.path != self._stage_rules_task:
+            if self._stage_rules_status is not None:
+                self._stage_rules_status.set("当前任务已改变，请关闭编辑器后重新打开。")
+            return
+        try:
+            draft = {}
+            for key, field in self._stage_rules_fields.items():
+                control = self._stage_rules_inputs[key]
+                if field["type"] == "keywords":
+                    draft[key] = [word.strip() for word in re.split(r"[\n\r,，;；]", control.get("1.0", "end-1c")) if word.strip()]
+                elif field["type"] == "int":
+                    raw = control.get().strip()
+                    if not re.fullmatch(r"[0-9]+", raw):
+                        raise ValueError(f"{field['label']}须为 {field['min']}–{field['max']} 的整数。")
+                    draft[key] = int(raw)
+                else:
+                    draft[key] = control.get()
+            stage = self._stage_rules_stage
+            rules = validate_stage_rules(stage, draft)
+        except (ValueError, tk.TclError) as error:
+            if self._stage_rules_status is not None:
+                self._stage_rules_status.set("未保存，编辑内容已保留。" + _safe(error))
+            return
+        task = self.task
+        saved = None if rules == default_stage_rules(stage) else rules
+
+        def save() -> dict[str, Any]:
+            task.set_stage_rules(stage, saved)
+            return {"task": task, "view": self._capture_view(task), "close_stage_rules_editor": True,
+                    "notice": "本任务规则已保存；本步及后续已有结果如受影响会标记失效。请手动运行本步，再审核并确认。"}
+
+        self._submit("save-stage-rules", save, status=f"正在保存{STAGE_LABELS[stage]}规则…")
+
+    def _close_stage_rules_editor(self) -> None:
+        if self._busy and self._operation == "save-stage-rules":
+            return
+        dialog = self._stage_rules_dialog
+        if dialog is not None:
+            dialog.grab_release()
+            destroy_tk_widget(dialog)
+        self._stage_rules_dialog, self._stage_rules_canvas = None, None
+        self._stage_rules_stage, self._stage_rules_task, self._stage_rules_status = None, None, None
+        self._stage_rules_fields, self._stage_rules_inputs, self._stage_rules_buttons = {}, {}, {}
+        self._stage_rules_controls = []
+
+    def _edit_review_rules(self) -> None:
+        if self._closing:
+            return
+        if self._stage_rules_dialog is not None:
+            self._stage_rules_dialog.lift()
+            return
+        if self._review_rules_dialog is not None:
+            self._review_rules_dialog.lift()
+            return
+        dialog = tk.Toplevel(self.root)
+        dialog.title(f"{STAGE_LABELS['llm']} · 本任务规则")
+        width = configure_editor_dialog(dialog, self.root)
         body = ttk.Frame(dialog, padding=16)
         body.grid(row=0, column=0, sticky="nsew")
         body.columnconfigure(0, weight=1)
         body.rowconfigure(2, weight=1)
         ttk.Label(body, text="修改 AI 对岗位工作内容的判断规则", style="Section.TLabel").grid(
             row=0, column=0, sticky="w")
-        ttk.Label(body, text=("AI 接收完整职位职责与任职要求；模型只返回判断和理由，报告采用同一判断。"
-                              "规则只保存到当前任务，保存不会改变已发起请求。重置 AI 阶段不会改规则；"
-                              "重置后真正点击运行时会重新读取已保存规则。"
-                              "重置会清除本阶段旧结果，旧结果请在重置前查看。可恢复默认后保存。"
-                              "识别出的旧版六维规则仅在重置后再次运行 AI 时切换为简化默认；其他自定义规则保留。"),
-                  style="Hint.TLabel", wraplength=740, justify="left").grid(
-            row=1, column=0, sticky="ew", pady=(6, 10))
+        explanation = ttk.Label(body, text=("只保存到当前任务。保存不会请求模型；规则变化会使本步及后续结果失效，需手动运行并重新确认。"
+                                           "AI 接收完整职位职责与任职要求，只返回判断和理由。恢复默认只修改草稿，保存后才生效。"),
+                                style="Hint.TLabel", wraplength=width - 60, justify="left")
+        explanation.grid(row=1, column=0, sticky="ew", pady=(6, 10))
         area = ttk.Frame(body)
         area.grid(row=2, column=0, sticky="nsew")
         area.columnconfigure(0, weight=1)
@@ -2042,26 +2570,25 @@ class ReviewDesktopApp:
         scroll = ttk.Scrollbar(area, orient="vertical", command=editor.yview)
         scroll.grid(row=0, column=1, sticky="ns")
         editor.configure(yscrollcommand=scroll.set)
-        editor.insert("1.0", self._saved_review_rules)
+        editor.insert("1.0", self._saved_review_rules or default_review_rules())
         editor.edit_modified(False)
-        status = StringVar(dialog, "修改后点击“保存本任务规则”；保存不会自动请求模型或改变正在运行的请求。")
-        ttk.Label(body, textvariable=status, style="Hint.TLabel", wraplength=740,
-                  justify="left").grid(row=3, column=0, sticky="ew", pady=(8, 4))
-        actions = ttk.Frame(body)
+        status = StringVar(dialog, "请先创建或打开任务后保存；当前展示默认规则。" if self.task is None else
+                           "任务正在处理；当前规则只读，暂停或停止后可修改。" if not self._rules_editable() else
+                           "修改后点击“保存本任务规则”；保存不会自动请求模型或改变正在运行的请求。")
+        status_label = ttk.Label(body, textvariable=status, style="Hint.TLabel", wraplength=width - 60, justify="left")
+        status_label.grid(row=3, column=0, sticky="ew", pady=(8, 4))
+        actions = DialogActions(body, save=self._save_review_rules, cancel=self._close_review_rules_editor,
+                                reset=self._reset_review_rules_draft, save_text="保存本任务规则")
         actions.grid(row=4, column=0, sticky="ew", pady=(6, 0))
-        reset = ttk.Button(actions, text="恢复默认", style="Small.TButton",
-                           command=self._reset_review_rules_draft)
-        reset.pack(side="left")
-        cancel = ttk.Button(actions, text="取消", style="Small.TButton", command=self._close_review_rules_editor)
-        cancel.pack(side="right")
-        save = ttk.Button(actions, text="保存本任务规则", style="Review.Primary.TButton",
-                          command=self._save_review_rules)
-        save.pack(side="right", padx=(0, 8))
         self._review_rules_dialog, self._review_rules_editor = dialog, editor
         self._review_rules_status = status
-        self._review_rules_task = self.task.path
-        self._review_rules_buttons = {"save": save, "reset": reset, "cancel": cancel}
+        self._review_rules_task = self.task.path if self.task else None
+        self._review_rules_buttons = actions.buttons
+        dialog.bind("<Configure>", lambda _event: (
+            explanation.configure(wraplength=max(200, dialog.winfo_width() - 40)),
+            status_label.configure(wraplength=max(200, dialog.winfo_width() - 40))))
         self._style_review_rules_editor()
+        self._render_rule_editors()
         dialog.protocol("WM_DELETE_WINDOW", self._close_review_rules_editor)
         dialog.bind("<Escape>", lambda _event: self._close_review_rules_editor())
         dialog.bind("<Control-s>", lambda _event: self._save_review_rules())
@@ -2077,16 +2604,16 @@ class ReviewDesktopApp:
                              highlightbackground=p["border"], highlightcolor=p["focus"])
 
     def _reset_review_rules_draft(self) -> None:
-        if self._execution_blocked or self._review_rules_editor is None:
+        if not self._rules_editable() or self._review_rules_editor is None:
             return
         editor = self._review_rules_editor
         editor.delete("1.0", "end")
-        editor.insert("1.0", self._default_review_rules)
+        editor.insert("1.0", self._default_review_rules or default_review_rules())
         if self._review_rules_status is not None:
             self._review_rules_status.set("默认规则已载入编辑框，点击保存后才会应用到本任务。")
 
     def _save_review_rules(self) -> None:
-        if self._execution_blocked or self.task is None or self._review_rules_editor is None:
+        if not self._rules_editable() or self.task is None or self._review_rules_editor is None:
             return
         if self.task.path != self._review_rules_task:
             if self._review_rules_status is not None:
@@ -2103,7 +2630,7 @@ class ReviewDesktopApp:
         def save() -> dict[str, Any]:
             task.set_review_rules(rules)
             return {"task": task, "view": self._capture_view(task), "close_rules_editor": True,
-                    "notice": "本任务复核规则已保存。已有 AI 与报告结果如受影响会标记失效；请手动运行 AI 复核，再生成报告。"}
+                    "notice": "本任务复核规则已保存。请手动更新 AI 复核、审核确认名单，再前往 03 重新预览并导出 JSON。"}
 
         self._submit("save-review-rules", save, status="正在保存本任务复核规则…")
 
@@ -2113,7 +2640,7 @@ class ReviewDesktopApp:
         dialog = self._review_rules_dialog
         if dialog is not None:
             dialog.grab_release()
-            dialog.destroy()
+            destroy_tk_widget(dialog)
         self._review_rules_dialog, self._review_rules_editor = None, None
         self._review_rules_status = None
         self._review_rules_task = None
@@ -2137,12 +2664,17 @@ class ReviewDesktopApp:
         return True
 
     def _can_edit(self) -> bool:
+        stage = self.stage.get()
+        jobs = self._rows.get(stage, [])
+        row_view = self._row_views.get(stage, {})
+        valid_ai = (stage != "llm" or (row_view.get("simple_ai_rows", False)
+                    if row_view.get("groups", {}).get("全部") is jobs else
+                    all(job.get("review_format") == SIMPLE_REVIEW_FORMAT for job in jobs)))
         return (self.task is not None and not self._execution_blocked and self.stage.get() != "report"
                 and not any(info.get("status") == "running" for info in self.manifest.get("stages", {}).values())
                 and self._stage_info().get("status") not in (None, "pending", "running", "stale")
-                and bool(self._rows.get(self.stage.get()))
-                and (self.stage.get() != "llm" or all(job.get("review_format") == SIMPLE_REVIEW_FORMAT
-                                                     for job in self._rows["llm"])))
+                and not self._stage_info().get("live_incomplete")
+                and bool(jobs) and valid_ai)
 
     def _can_confirm(self) -> bool:
         return self._can_run() and self._stage_info().get("status") == "completed"
@@ -2155,7 +2687,14 @@ class ReviewDesktopApp:
     def _can_edit_list_queues(self) -> bool:
         return (self.stage.get() == "shortlist" and self._can_edit() and self._can_confirm()
                 and "shortlist" not in self._previews
-                and all(not _saved_list_queue(job)[1] for job in self._rows["shortlist"]))
+                and self._shortlist_queue_summary()[1] == 0)
+
+    def _shortlist_queue_summary(self) -> tuple[dict[str, int], int]:
+        rows = self._rows.get("shortlist", [])
+        view = self._row_views.get("shortlist", {})
+        if view.get("groups", {}).get("全部") is rows and "list_queue_counts" in view:
+            return view["list_queue_counts"], view["legacy_list_queue_count"]
+        return _list_queue_summary(rows)
 
     def _render_list_queues(self) -> None:
         if self.stage.get() != "shortlist":
@@ -2166,19 +2705,34 @@ class ReviewDesktopApp:
             return
         self.list_queue_frame.grid(row=0, column=0, sticky="ew", pady=(0, 2))
         jobs = self._rows.get("shortlist", [])
+        rules = self._saved_stage_rules.get("shortlist", default_stage_rules("shortlist"))
         preview = "shortlist" in self._previews
-        counts, legacy_count = _list_queue_summary(jobs) if not preview else ({key: 0 for key in LIST_QUEUE_LABELS}, 0)
-        if preview or not jobs:
-            hint = "尚无本步队列；初筛后默认保留明确相关＋待核实，仍须人工确认后补 JD。"
+        counts, legacy_count = self._shortlist_queue_summary() if not preview else ({key: 0 for key in LIST_QUEUE_LABELS}, 0)
+        if self._stage_info().get("live_checkpoint"):
+            hint = "实时检查点 · 本步未完成；待处理岗位不计为剔除。完成后方可编辑、确认名单。"
         elif legacy_count:
             hint = LEGACY_LIST_QUEUE_NOTICE + "；当前仅旧版兼容，队列动作禁用。"
         else:
-            hint = "默认保留明确相关＋待核实；仅列表方向，仍须 JD，不等于最终可投。"
-        self.list_queue_hint.set(hint)
+            hint = ""
+        summary = (f"当前规则：默认方向{'开' if rules['use_default_direction_rules'] else '关'} · "
+                   f"{'排除' if rules['exclude_pure_development'] else '不排除'}纯开发 · "
+                   f"{'建议保留' if rules['keep_verification'] else '不建议保留'}待核实 · "
+                   f"包含词 {len(rules['include_keywords'])} · 排除词 {len(rules['exclude_keywords'])}")
+        if self._stage_info().get("status") == "stale":
+            summary += "（须重新运行后生效）"
+        self.list_queue_hint.set((hint + "\n" if hint else "") + summary)
         self._enabled(self.list_queue_box, bool(jobs) and not preview and not self._closing, "readonly")
         editable = self._can_edit_list_queues()
         self._enabled(self.relevant_only_button, editable)
         self._enabled(self.add_verify_button, editable and counts["verify"] > 0)
+
+    def _render_jd_filter(self) -> None:
+        if self.stage.get() != "fetch-jd":
+            self.jd_filter_frame.pack_forget()
+            self._enabled(self.jd_filter_box, False)
+            return
+        self.jd_filter_frame.pack(side="left", padx=(10, 0))
+        self._enabled(self.jd_filter_box, bool(self._rows.get("fetch-jd")) and not self._closing, "readonly")
 
     @staticmethod
     def _enabled(widget: Any, enabled: bool, normal: str = "normal") -> None:
@@ -2235,16 +2789,21 @@ class ReviewDesktopApp:
             locked = bound and index > 0 and not self._stage_info(STAGES[index - 1]).get("confirmed") and stage_status == "pending"
             self._enabled(button, not self._busy and not self._closing and not locked)
         self.stage_title.set(f"{STAGES.index(key) + 1}. {STAGE_LABELS[key]}")
-        self.stage_description.set(STAGE_DESCRIPTIONS[key])
-        if key == "llm":
+        issues = info.get("issues") or []
+        self.stage_description.set(STAGE_DESCRIPTIONS[key] + ("\n注意：" + _safe(issues[0]) if issues else ""))
+        self.description_label.configure(foreground=self.colors["amber"] if issues else self.colors["muted"])
+        if key in REVIEW_STAGES:
             self.edit_rules_button.pack(side="right", padx=5)
         else:
             self.edit_rules_button.pack_forget()
-        self._enabled(self.edit_rules_button, key == "llm" and bound and not blocked)
-        if self._review_rules_editor is not None:
-            self._review_rules_editor.configure(state="disabled" if blocked else "normal")
-            for button in self._review_rules_buttons.values():
-                self._enabled(button, not blocked)
+        self._enabled(self.edit_rules_button, key in REVIEW_STAGES and not self._closing)
+        self._render_rule_editors()
+        if key == "fetch-jd":
+            if not self.settings_button.winfo_manager():
+                self.settings_button.pack(side="right")
+        else:
+            self.settings_button.pack_forget()
+            self.settings_frame.grid_remove()
         for stage_key, frame in (("fetch-jd", self.jd_settings_frame), ("llm", self.llm_settings_frame)):
             if key == stage_key:
                 frame.grid(row=0, column=0, sticky="ew", pady=(0, 4))
@@ -2254,19 +2813,27 @@ class ReviewDesktopApp:
             self.status_text.set("名单已确认" if info.get("confirmed") and status == "completed" else STATUS_LABELS.get(status, status) if bound else "尚未绑定任务")
         self._paint_badge()
         label = "更新本步" if status == "stale" else "继续本步" if status in ("paused", "stopped", "waiting", "failed") else "复用检查点运行" if status == "completed" else "运行本步"
+        if status == "waiting":
+            label = "人工处理完成，继续"
+        elif key in {"import", "shortlist"} and status != "pending":
+            label = "重新导入" if key == "import" else "重新初筛"
         self.run_button.configure(text=label)
         self._enabled(self.run_button, self._can_run())
         self._enabled(self.reset_button, self._can_reset_stage())
         active = self.workflow_running and self._control is not None
         self._enabled(self.pause_button, active)
         self._enabled(self.stop_button, active)
-        self._enabled(self.continue_button, not self._busy and status == "waiting" and self._can_run())
         for widget, normal in self._setting_controls:
             self._enabled(widget, not blocked, normal)
         self._browser_mode_changed()
         self._enabled(self.prepare_browser_button, bound and not blocked)
         if key == "fetch-jd" and not self._busy:
             self._apply_browser_status_result(info.get("stats"))
+        jd_rules = self._saved_stage_rules.get("fetch-jd", default_stage_rules("fetch-jd"))
+        self.jd_mode_label.configure(text=(
+            f"每页滚动{jd_rules['scroll_count']}次 / {jd_rules['detail_speed_profile']} / "
+            f"每页等待 {jd_rules.get('page_wait_min', 0)}–{jd_rules.get('page_wait_max', 0)} 秒 / 本步仅补正文不筛选"
+        ))
         progress = info.get("progress") or {}
         done, total = progress.get("done"), progress.get("total")
         known = type(done) is int and type(total) is int and done >= 0 and total >= 0
@@ -2276,7 +2843,7 @@ class ReviewDesktopApp:
         stats_parts = _metric_parts(key, stats)
         self.progress_text.set(progress_caption + (" · " + " / ".join(stats_parts) if stats_parts else ""))
         keep, excluded = len(info.get("keep_ids", [])), len(info.get("excluded_ids", []))
-        pending = len(info.get("pending_ids", [])) if key == "llm" else 0
+        pending = len(info.get("pending_ids", []))
         inputs = len(info.get("input_ids", []))
         if key == "report" and status == "completed" and stats.get("classification_counts"):
             counts = stats.get("actionable_classification_counts") or stats["classification_counts"]
@@ -2286,15 +2853,19 @@ class ReviewDesktopApp:
             if key == "llm":
                 self.count_text.set(f"本步输入 {inputs}  ·  明确保留 {keep}  ·  明确剔除 {excluded}  ·  待核实 {pending}" + ("  ·  旧结果仅供查看" if status == "stale" else ""))
             else:
-                self.count_text.set(f"本步输入 {inputs}  ·  保留 {keep}  ·  剔除 {excluded}" + ("  ·  旧结果仅供查看" if status == "stale" else ""))
+                scope = f"已导入 {len(self._rows.get('import', []))}" if key == "import" else f"本步输入 {inputs}"
+                self.count_text.set(f"{scope}  ·  保留 {keep}  ·  剔除 {excluded}"
+                                    + (f"  ·  待处理 {pending}" if key == "shortlist" and info.get("live_checkpoint") else "")
+                                    + ("  ·  旧结果仅供查看" if status == "stale" else ""))
         self.confirm_text.set(f"确认最终保留 {keep} 个" if key == "llm" else f"确认 {keep} 个进入下一步")
         self._enabled(self.confirm_button, self._can_confirm())
         editable = self._can_edit()
         for widget in (self.select_page_button, self.exclude_button, self.restore_button, self.recommend_button):
             self._enabled(widget, editable)
-        self.restore_button.configure(text="保留所选" if key == "llm" else "恢复所选")
+        self.restore_button.configure(text="保留所选")
         self._enabled(self.detail_toggle_button, editable and self._focus_id is not None)
         self._render_list_queues()
+        self._render_jd_filter()
         if key == "llm":
             self.go_delivery_button.grid()
         else:
@@ -2306,6 +2877,7 @@ class ReviewDesktopApp:
         if render_rows:
             self._render_rows()
         self._apply_workspace_visibility()
+        self._keep_log_reachable(None)
 
     def _kept(self, job: dict[str, Any]) -> bool:
         if self.stage.get() == "report":
@@ -2327,12 +2899,22 @@ class ReviewDesktopApp:
             return "输入预览 · 尚未运行"
         if self.stage.get() == "import":
             sources = job.get("observed_in")
+            if job.get("import_rule_keep") is False:
+                return "导入规则建议剔除 · " + _display(job.get("import_rule_reason")).replace("\n", " ")
             return f"去重完成 · {len(sources)} 个来源" if isinstance(sources, list) else "去重完成 · 来源待核实"
         if self.stage.get() == "fetch-jd":
+            if job.get("_review_pending_stage") == "fetch-jd":
+                return "待处理 · 尚未获得 JD · 本步未完成，不筛选岗位"
             issue = job.get("jd_fetch_issue")
             return _jd_completeness_label(job) + " · 本步不筛选" + (" · " + _display(issue).replace("\n", " ") if issue else "")
         if self.stage.get() == "shortlist":
-            return _list_queue_label(job) + " · " + _list_queue_reason(job).replace("\n", " ")
+            reason = ("待处理 · 初筛尚未完成，不计为剔除" if job.get("_review_pending_stage") == "shortlist" else
+                      _list_queue_label(job) + " · " + _list_queue_reason(job).replace("\n", " "))
+            info = self._stage_info() if hasattr(self, "_stage_info") else {}
+            manual = info.get("manual_choices", {}).get(job_id(job))
+            if type(manual) is bool:
+                return ("人工保留" if manual else "人工剔除") + ("（已确认）" if info.get("confirmed") else "（待确认）") + " · " + reason
+            return reason
         if self.stage.get() == "llm" and job.get("review_format") != SIMPLE_REVIEW_FORMAT:
             return "旧版结果 · 只读历史 · 需重跑AI采用新版判断"
         if self.stage.get() == "llm":
@@ -2373,22 +2955,29 @@ class ReviewDesktopApp:
             self._row_views[stage] = row_view
         query = self.search.get().strip().casefold()
         selected_filter = self.filter.get()
+        supports_pending = stage in {"llm", "report"} or stage == "shortlist" and info.get("live_checkpoint")
+        if selected_filter == "待核实" and not supports_pending:
+            self.filter.set("全部")
+            selected_filter = "全部"
+            self._page = 0
         selected_queue = next((key for key, label in LIST_QUEUE_LABELS.items()
                                if label == self.list_queue_filter.get()), None)
         preview = stage in self._previews
-        use_queue = stage == "shortlist" and not preview and selected_queue is not None
+        selected_category = (selected_queue if stage == "shortlist" and not preview else
+                             JD_COMPLETENESS_CHOICES.get(self.jd_completeness_filter.get()) if stage == "fetch-jd" else None)
         filter_key = (stage, id(row_view), id(self._search_index.get(stage)), query, selected_filter,
-                      selected_queue if use_queue else None)
-        self._view_filter = (stage, query, selected_filter, selected_queue if use_queue else None)
+                      selected_category)
+        self._view_filter = (stage, query, selected_filter, selected_category)
         if filter_key != self._filtered_key:
-            candidates = row_view["groups"].get(selected_filter, jobs)
+            candidates = _row_candidates(row_view, selected_filter, selected_category)
             index = self._search_index.get(stage, {})
             if self._prepared_filter is not None and self._prepared_filter[0] == filter_key:
                 self._filtered_jobs = self._prepared_filter[1]
+            elif query:
+                self._schedule_row_filter(filter_key, candidates, index, query, None)
+                return
             else:
-                self._filtered_jobs = (candidates if not query and not use_queue else
-                                       [job for job in candidates if (not query or query in index.get(job_id(job), ""))
-                                        and (not use_queue or _saved_list_queue(job)[0] == selected_queue)])
+                self._filtered_jobs = candidates
             self._filtered_key = filter_key
         filtered = self._filtered_jobs
         pages = max(1, (len(filtered) + PAGE_SIZE - 1) // PAGE_SIZE)
@@ -2424,7 +3013,7 @@ class ReviewDesktopApp:
                     row_tag = "pending_review"
                 elif preview or stage in {"import", "fetch-jd", "report"}:
                     row_tag = "kept" if kept or preview else "excluded"
-                elif stage == "llm" and identity in pending_ids:
+                elif identity in pending_ids:
                     row_tag = "pending_review"
                 elif stage == "llm" and type(manual_choices.get(identity)) is bool:
                     row_tag = "kept" if kept else "excluded"
@@ -2435,7 +3024,7 @@ class ReviewDesktopApp:
                     row_tag = ("suggest_keep" if recommendation is True else
                                "suggest_exclude" if recommendation is False else
                                "kept" if kept else "excluded")
-                values = (("—" if preview or stage == "llm" and identity in pending_ids else "☑" if kept else "☐",
+                values = (("—" if preview or identity in pending_ids else "☑" if kept else "☐",
                            f"{title} · {_safe(company)}", _safe(job.get("salary") or "待核实"),
                            _safe(self._row_reason(job))), (row_tag,))
                 if identity not in children:
@@ -2458,18 +3047,19 @@ class ReviewDesktopApp:
                 self.results_table.focus(self._focus_id)
             self.empty_label.place_forget() if shown else self.empty_label.place(relx=.5, rely=.5, anchor="center")
             self.empty_text.set("没有符合搜索或筛选的岗位。" if jobs else "尚未运行本步，或本步确认为空名单。" if self.task else "尚未导入；请先创建或打开一个任务。")
-            self.page_text.set(f"{self._page * PAGE_SIZE + 1}–{self._page * PAGE_SIZE + len(shown)} / {len(filtered)} 岗" if shown else "0 个岗位")
+            self.page_text.set(page_caption(len(filtered), self._page))
             self._enabled(self.previous_page_button, self._page > 0)
             self._enabled(self.next_page_button, self._page < pages - 1)
             for label, button in self.filter_buttons.items():
                 count = len(row_view["groups"].get(label, []))
                 if label == "待核实":
-                    if stage in {"llm", "report"}:
+                    if stage in {"llm", "report"} or stage == "shortlist" and info.get("live_checkpoint"):
                         if not button.winfo_manager():
                             button.pack(side="left", padx=(0, 3), after=self.filter_buttons["剔除"])
                     else:
                         button.pack_forget()
-                button.configure(text=f"{label} {count}", style="Review.Theme.TButton" if selected_filter == label else "Small.TButton")
+                caption = "待处理" if label == "待核实" and stage == "shortlist" else label
+                button.configure(text=f"{caption} {count}", style="Review.Theme.TButton" if selected_filter == label else "Workspace.TButton")
             self._rendered_rows_key = render_key
             self._show_detail()
         finally:
@@ -2501,22 +3091,23 @@ class ReviewDesktopApp:
             return
         self._detail_key = detail_key
         self.detail_title.set(_safe(job.get("title") or "未提供标题") if job else "选择一个岗位查看详情")
-        if job and self.stage.get() == "shortlist" and "shortlist" in self._previews:
-            evidence = "输入预览：尚未运行列表初筛，没有本步方向队列。\n\n" + _evidence_text(job)
+        if job and self.stage.get() == "shortlist" and job.get("_review_pending_stage") == "shortlist":
+            evidence = "实时检查点：待处理，尚未完成本次初筛。不是剔除决定；本步完成前不能编辑或确认名单。\n\n" + _evidence_text(job, stage="input")
+        elif job and self.stage.get() == "shortlist" and "shortlist" in self._previews:
+            evidence = "输入预览：尚未运行列表初筛，没有本步方向队列。\n\n" + _evidence_text(job, stage="input")
         else:
             detail_job = report_decision(job) if job and self.stage.get() == "report" else job
             evidence = _evidence_text(detail_job, stage=self.stage.get()) if job else "依据、风险与人工审计将在这里显示。"
-        if job and self.stage.get() == "shortlist" and "shortlist" not in self._previews:
-            evidence = f"人工名单：{'保留' if self._kept(job) else '剔除'}（仅本任务后续输入）\n\n" + evidence
-        if job and self.stage.get() == "llm" and "llm" not in self._previews:
+        if job and self.stage.get() in REVIEW_STAGES and self.stage.get() not in self._previews:
             info = self._stage_info()
             identity = job_id(job)
             manual = info.get("manual_choices", {}).get(identity)
-            selection = ("待核实" if identity in info.get("pending_ids", []) else
+            pending_label = "待核实" if self.stage.get() == "llm" else "待处理"
+            selection = (pending_label if identity in info.get("pending_ids", []) else
                          "保留" if self._kept(job) else "剔除")
-            origin = "人工决定" if type(manual) is bool else "默认建议" if selection != "待核实" else "尚未人工处理"
+            origin = "人工决定" if type(manual) is bool else "尚未人工处理" if selection == pending_label else "本步建议"
             confirmation = "已确认" if info.get("confirmed") else "待确认"
-            evidence = f"当前名单：{selection} · {origin} · {confirmation}\n人工决定只改变本任务名单；原始 AI 判断、理由与技术状态保留。\n\n" + evidence
+            evidence = f"当前名单：{selection} · {origin} · {confirmation}\n人工决定只改变本任务名单；原始数据、建议与技术状态保留。\n\n" + evidence
         if job and self.stage.get() == "report":
             evidence = self._row_reason(job) + "\n\n" + evidence
         self._replace_text(self.detail_text, evidence)
@@ -2568,7 +3159,20 @@ class ReviewDesktopApp:
 
     def _debounce_filters(self, *_args: Any) -> None:
         self._cancel_after(self._filter_after_id)
-        self._filter_after_id = self._after(120, self._apply_filters)
+        self._filter_after_id = self._after(60, self._apply_filters)
+
+    def _schedule_row_filter(self, key: tuple, candidates: list[dict], index: dict[str, str],
+                              query: str, selected_queue: str | None) -> None:
+        if self._closing or self._filter_working_key is not None:
+            return
+        self._filter_working_key = key
+
+        def filter_view() -> None:
+            filtered = _filter_rows(candidates, index, query, selected_queue)
+            self.events.put(("filtered-view", -1, (key, filtered)))
+
+        self._filter_worker = threading.Thread(target=filter_view, name="review-filter", daemon=True)
+        self._filter_worker.start()
 
     def _apply_filters(self) -> None:
         self._filter_after_id = None
@@ -2580,10 +3184,11 @@ class ReviewDesktopApp:
         self._render_rows()
 
     def _focus_search(self, _event: tk.Event | None = None) -> str:
-        if self.workspace.get() != "review":
-            return "break"
-        self.search_entry.focus_set()
-        self.search_entry.selection_range(0, "end")
+        entry = {"collection": self.collection_page.plan_search_entry,
+                 "delivery": self.delivery_page.search_entry}.get(self.workspace.get(), self.search_entry)
+        if "disabled" not in entry.state():
+            entry.focus_set()
+            entry.selection_range(0, "end")
         return "break"
 
     def _select_stage(self, stage: str) -> None:
@@ -2682,7 +3287,9 @@ class ReviewDesktopApp:
         if self.task is not None and not messagebox.askyesno("新建任务 / 更改数量", "当前任务的范围和数量已固定。更改数量会另建任务；原任务和审核结果不会被覆盖。继续填写新任务吗？", parent=self.root):
             return
         self._close_review_rules_editor()
+        self._close_stage_rules_editor()
         self._saved_review_rules, self._default_review_rules = "", ""
+        self._saved_stage_rules = {stage: default_stage_rules(stage) for stage in ("import", "shortlist", "fetch-jd")}
         self.task, self.manifest = None, {}
         self._view_cache = TaskViewCache()
         self._rows = {key: [] for key in REVIEW_STAGES}
@@ -2694,6 +3301,7 @@ class ReviewDesktopApp:
         self.search.set("")
         self.filter.set("全部")
         self.list_queue_filter.set(ALL_LIST_QUEUES)
+        self.jd_completeness_filter.set("全部正文")
         self._page, self._focus_id, self._selected_ids = 0, None, ()
         self._replace_text(self.log_view, "")
         self.delivery_page.set_current_task(None)
@@ -2738,7 +3346,6 @@ class ReviewDesktopApp:
             identities = list(self._page_ids)
             self.results_table.selection_set(identities)
             self._selected_ids = tuple(identities)
-            self._set_keep(identities, True)
 
     def _set_selected_keep(self, keep: bool) -> None:
         identities = list(self.results_table.selection())
@@ -2756,9 +3363,10 @@ class ReviewDesktopApp:
             return
         task, stage = self.task, self.stage.get()
         assert task is not None
+        expected_stage = copy.deepcopy(self._stage_info())
 
         def apply() -> dict[str, Any]:
-            task.apply_recommendations(stage)
+            task.apply_recommendations(stage, expected_stage=expected_stage)
             self._write_log(task, f"人工明确采用本步建议：{STAGE_LABELS[stage]}。\n")
             view = self._capture_view(task)
             stale = any(info.get("status") == "stale" for info in view["manifest"].get("stages", {}).values())
@@ -2902,9 +3510,13 @@ class ReviewDesktopApp:
             self._notify("请先运行并确认所有前置步骤；上游已修改时须重新确认。", warning=True)
             return
         try:
-            workers = _positive(self.workers.get(), "AI 请求并发", maximum=MAX_WORKERS)
-            jd_workers = _positive(self.jd_workers.get(), "JD 页面并发", maximum=MAX_WORKERS)
-            batch_size = _positive(self.batch_size.get(), "JD 每批岗位数", maximum=100)
+            stage = self.stage.get()
+            workers = (_positive(self.workers.get(), "AI 请求并发", maximum=MAX_WORKERS)
+                       if stage == "llm" else AI_DEFAULT_WORKERS)
+            jd_workers = (_positive(self.jd_workers.get(), "JD 页面并发", maximum=MAX_WORKERS)
+                          if stage == "fetch-jd" else JD_DEFAULT_WORKERS)
+            batch_size = (_positive(self.batch_size.get(), "JD 每批岗位数", maximum=100)
+                          if stage == "fetch-jd" else 30)
             # Validate browser settings when JD is actually being fetched;
             # file-only/report stages keep their historical input behavior.
             browser_options = self._browser_options(validate=self.stage.get() == "fetch-jd")
@@ -2915,6 +3527,7 @@ class ReviewDesktopApp:
         task, stage = self.task, self.stage.get()
         assert task is not None
         self._remember_execution_settings()
+        self._live_refresh_started = 0.0
         if stage == "llm":
             self._live_ai_checkpoint_version = None
         control = StageControl()
@@ -2944,7 +3557,7 @@ class ReviewDesktopApp:
                 if kind in ("progress", "waiting", "finished"):
                     now = time.monotonic()
                     if kind != "progress" or now - last_refresh >= .15:
-                        if stage == "llm":
+                        if stage in LIVE_STAGES:
                             # The callback never performs a view read. Tk
                             # coalesces requests with its checkpoint fallback.
                             self.events.put(("refresh-request", token, None))
@@ -2970,9 +3583,14 @@ class ReviewDesktopApp:
             elif status == "waiting":
                 notice = "已保存检查点并停住。请在专用浏览器完成人工登录或安全验证，再点击“人工处理完成，继续”；不会确认或跳步。"
             elif status in ("paused", "stopped"):
-                notice = "本步已暂停 / 停止并保留检查点。点击“继续本步”只恢复当前步骤。"
+                notice = ("本步已暂停 / 停止。重新运行会从头导入或初筛，保留已有人工选择。"
+                          if stage in {"import", "shortlist"} else
+                          "本步已暂停 / 停止并保留检查点。点击“继续本步”只恢复当前步骤。")
             else:
                 notice = "本步未完成，不能确认。请查看真实日志与问题后重试。"
+            issues = info.get("issues") or []
+            if status == "completed" and issues:
+                notice = "本步已完成，但有问题需要核对：" + _safe(issues[0]) + " 请检查后再确认名单。"
             browser_statuses = _browser_result_map(info.get("stats"))
             if stage == "fetch-jd" and not browser_statuses:
                 browser_statuses = {
@@ -2980,7 +3598,7 @@ class ReviewDesktopApp:
                     for browser in ("chrome", "edge")
                     if browser == "chrome" or browser_options.get("browser_mode") == "dual"
                 }
-            return {"task": task, "view": view, "notice": notice, "warning": status != "completed",
+            return {"task": task, "view": view, "notice": notice, "warning": status != "completed" or bool(issues),
                     "browser_statuses": browser_statuses}
 
         self._submit("execute", run, status=f"正在运行：{STAGE_LABELS[stage]}…")
@@ -3111,10 +3729,8 @@ class ReviewDesktopApp:
                 row_view, search = view["row_views"][stage], view["search"][stage]
                 key = (stage, id(row_view), id(search), query, selection, selected_queue)
                 if self._filter_cache is None or self._filter_cache[0] != key:
-                    candidates = row_view["groups"].get(selection, row_view["groups"]["全部"])
-                    filtered = (candidates if not query and selected_queue is None else
-                                [job for job in candidates if (not query or query in search.get(job_id(job), ""))
-                                 and (selected_queue is None or _saved_list_queue(job)[0] == selected_queue)])
+                    candidates = _row_candidates(row_view, selection, selected_queue)
+                    filtered = _filter_rows(candidates, search, query, None)
                     self._filter_cache = (key, filtered)
                 view["filtered_view"] = self._filter_cache
             self._capture_sequence += 1
@@ -3139,16 +3755,21 @@ class ReviewDesktopApp:
         old_shortlist = self._shortlist_result_file
         if task_changed:
             self._close_review_rules_editor()
+            self._close_stage_rules_editor()
         new_shortlist = view["manifest"].get("stages", {}).get("shortlist", {}).get("result_file")
         if task_changed or (new_shortlist is not None and old_shortlist != new_shortlist):
             self.list_queue_filter.set(ALL_LIST_QUEUES)
             self._cancel_after(self._filter_after_id)
             self._filter_after_id = None
             self._page, self._focus_id, self._selected_ids = 0, None, ()
+        if task_changed:
+            self.jd_completeness_filter.set("全部正文")
         self.task, self.manifest = task, view["manifest"]
         self.delivery_page.set_current_task(task.path, self.manifest.get("revision"))
         self._saved_review_rules = view.get("review_rules", "")
         self._default_review_rules = view.get("default_review_rules", "")
+        self._saved_stage_rules = view.get("stage_rules", {
+            stage: default_stage_rules(stage) for stage in ("import", "shortlist", "fetch-jd")})
         self._shortlist_result_file = new_shortlist
         self._rows = view["rows"]
         self._row_views = view.get("row_views", {})
@@ -3177,11 +3798,17 @@ class ReviewDesktopApp:
         needs_rows = False
         needs_refresh = False
         log_parts = []
+        latest_live = None
         try:
             for _ in range(120):
                 kind, token, value = self.events.get_nowait()
                 if kind == "preference_error":
                     self._append_log("主题已切换，但偏好无法保存：" + value + "\n")
+                    continue
+                if kind == "filtered-view":
+                    self._filter_working_key = None
+                    self._prepared_filter = value
+                    needs_rows = True
                     continue
                 if token != self._operation_id:
                     continue
@@ -3200,8 +3827,11 @@ class ReviewDesktopApp:
                     task, view = value
                     if self.task is None or self.task.path != task.path:
                         continue
-                    if self._apply_view(task, view):
-                        needs_render = needs_rows = True
+                    incoming = (view.get("manifest", {}).get("revision", 0), view.get("capture_sequence", 0))
+                    current = ((latest_live[1].get("manifest", {}).get("revision", 0),
+                                latest_live[1].get("capture_sequence", 0)) if latest_live else None)
+                    if current is None or incoming >= current:
+                        latest_live = value
                 elif kind == "live-refresh-error":
                     # Checkpoint replacement is intentionally atomic; a
                     # reader can briefly observe the old file between the
@@ -3223,6 +3853,8 @@ class ReviewDesktopApp:
                         self._apply_view(value["task"], value["view"])
                     if value.get("close_rules_editor"):
                         self._close_review_rules_editor()
+                    if value.get("close_stage_rules_editor"):
+                        self._close_stage_rules_editor()
                     if value.get("browser_statuses"):
                         self._set_browser_statuses(value["browser_statuses"])
                     if value.get("stage"):
@@ -3236,6 +3868,8 @@ class ReviewDesktopApp:
                     if value.get("error"):
                         if self._review_rules_status is not None:
                             self._review_rules_status.set("保存未完成，编辑内容已保留。" + value["error"])
+                        if self._stage_rules_status is not None:
+                            self._stage_rules_status.set("保存未完成，编辑内容已保留。" + value["error"])
                         self._notify("操作未完成：" + value["error"], warning=True)
                         self._error("操作未完成", value["error"])
                     elif value.get("notice"):
@@ -3244,33 +3878,35 @@ class ReviewDesktopApp:
                         self._open_path(value["open_path"])
         except queue.Empty:
             pass
+        if latest_live is not None:
+            task, view = latest_live
+            if self.task is not None and self.task.path == task.path and self._apply_view(task, view):
+                needs_render = needs_rows = True
         if log_parts:
             self._append_log("".join(log_parts))
         if needs_render:
             self._render(render_rows=needs_rows)
+        elif needs_rows:
+            self._render_rows()
         if needs_refresh:
             self._schedule_live_refresh()
         self._schedule_poll()
 
     def _schedule_live_refresh(self) -> None:
-        """Refresh a running AI queue from its durable checkpoint.
-
-        The executor emits progress events, but those events are best-effort
-        UI notifications.  The model worker writes ``llm_reviews.json``
-        independently for every completed job, so polling that file gives the
-        UI a reliable source of truth even when no progress callback arrives.
-        This is deliberately limited to the AI stage and one in-flight read.
-        """
-        observing_ai = self._stage_info("llm").get("status") == "running"
-        executing_ai = self.workflow_running and self.stage.get() == "llm"
-        if (self._closing or self._closed or not (observing_ai or executing_ai)
-                or self._live_refresh_busy or self._busy and not executing_ai):
+        """Coalesce notifications and poll durable stage checkpoints off Tk."""
+        observing_live = any(self._stage_info(stage).get("status") == "running" for stage in LIVE_STAGES)
+        executing_live = self.workflow_running and self.stage.get() in LIVE_STAGES
+        now = time.monotonic()
+        if (self._closing or self._closed or not (observing_live or executing_live)
+                or self._live_refresh_busy or self._busy and not executing_live
+                or now - self._live_refresh_started < .35):
             return
         token = self._operation_id
         task = self.task
         if task is None:
             return
         self._live_refresh_busy = True
+        self._live_refresh_started = now
 
         def read_view() -> None:
             try:
@@ -3389,7 +4025,8 @@ class ReviewDesktopApp:
         active = self.worker is not None and self.worker.is_alive()
         preferences = any(thread.is_alive() for thread in self._preference_workers)
         live_refresh = self._live_refresh_worker is not None and self._live_refresh_worker.is_alive()
-        if active or live_refresh or preferences or not self.collection_page.shutdown_complete or not self.delivery_page.shutdown_complete:
+        filtering = self._filter_worker is not None and self._filter_worker.is_alive()
+        if active or live_refresh or filtering or preferences or not self.collection_page.shutdown_complete or not self.delivery_page.shutdown_complete:
             self._after(50, self._finish_close)
             return
         for identifier in tuple(self._after_ids):

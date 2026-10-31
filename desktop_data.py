@@ -21,6 +21,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Iterable
 
+from checkpoint_io import read_text as read_checkpoint_text
+
 
 CLASSIFICATIONS = ("重点投递", "海投池", "暂不投")
 DIMENSIONS = (
@@ -147,7 +149,7 @@ class _JsonFile:
 
 def _read_json(path: Path, warnings: list[str], *, required: bool = False) -> _JsonFile:
     try:
-        raw = path.read_text(encoding="utf-8-sig")
+        raw = read_checkpoint_text(path)
     except FileNotFoundError:
         if required:
             warnings.append(f"缺失文件：{path.name}。")
@@ -239,14 +241,111 @@ def _jd_text(job: dict[str, Any]) -> str:
     return _text(job.get("jd") or job.get("job_description") or job.get("description")).strip()
 
 
-def _company(job: dict[str, Any]) -> str:
-    for key in ("company", "company_name", "brand_name"):
+_COMPANY_FIELDS = (
+    "company", "company_name", "companyName", "brand_name", "brandName",
+    "company_full_name", "companyFullName", "company_short_name", "companyShortName",
+    "brand_full_name", "brandFullName", "brand_short_name", "brandShortName",
+    "company_info", "companyInfo", "brand_info", "brandInfo",
+)
+_COMPANY_OBJECT_NAMES = (
+    "name", "full_name", "fullName", "short_name", "shortName",
+    "company_name", "companyName", "brand_name", "brandName",
+    "company_full_name", "companyFullName", "company_short_name", "companyShortName",
+    "brand_full_name", "brandFullName", "brand_short_name", "brandShortName",
+)
+_COMPANY_EXPLICIT_SOURCES = {
+    *_COMPANY_FIELDS,
+    *(f"{field}.{name}" for field in _COMPANY_FIELDS for name in _COMPANY_OBJECT_NAMES),
+}
+_LEGACY_COMPANY_METADATA = (
+    "company_scale", "company_stage", "company_industry", "encrypt_brand_id", "company_link",
+)
+
+
+def company_name_source(job: dict[str, Any]) -> tuple[str, str | None]:
+    """Read an explicit name or the verified old API brandName mapping.
+
+    The old API collector stored brandName in boss_name, whereas DOM rows
+    use boss_name for the recruiter. Require the complete API row shape for
+    recovery. Normalized rows retain their source so later dedupe cannot
+    assemble that evidence from unrelated rows or promote an inferred name.
+    """
+    saved_source = job.get("company_name_source")
+    inferred = ""
+    for key in _COMPANY_FIELDS:
         value = job.get(key)
-        if isinstance(value, dict):
-            value = value.get("name") or value.get("full_name") or value.get("company_name")
         if isinstance(value, str) and value.strip():
-            return value.strip()
-    return ""
+            if key == "company" and saved_source == "legacy_api_boss_name":
+                inferred = value.strip()
+                continue
+            source = (saved_source if key == "company" and isinstance(saved_source, str)
+                      and saved_source in _COMPANY_EXPLICIT_SOURCES else key)
+            return value.strip(), source
+        if isinstance(value, dict):
+            for name in _COMPANY_OBJECT_NAMES:
+                candidate = value.get(name)
+                if isinstance(candidate, str) and candidate.strip():
+                    return candidate.strip(), f"{key}.{name}"
+    if inferred:
+        return inferred, "legacy_api_boss_name"
+    if "company_name_source" not in job and job.get("salary_source") in ("api", "api_empty"):
+        if all(isinstance(job.get(key), str) for key in _LEGACY_COMPANY_METADATA):
+            value = job.get("boss_name")
+            if isinstance(value, str) and value.strip():
+                return value.strip(), "legacy_api_boss_name"
+    return "", None
+
+
+def _company(job: dict[str, Any]) -> str:
+    return company_name_source(job)[0]
+
+
+_EXPERIENCE_FIELDS = ("experience", "job_experience", "jobExperience")
+_EXPERIENCE_TAG_FIELDS = ("tags", "tags_list", "experience_tags", "job_labels")
+_EXPERIENCE_TAG_SPLIT = re.compile(r"[|｜,，;；、\r\n]+")
+_EXPERIENCE_TAG = re.compile(
+    r"(?:[0-9]{1,2}\s*[-–—~～至]\s*[0-9]{1,2}\s*年|"
+    r"[0-9]{1,2}\s*年(?:以上|以内|以下|\s*[+＋])|经验不限|"
+    r"(?:在校生?|应届生?|无经验)(?:\s*[/／]\s*(?:在校生?|应届生?|无经验))*)"
+)
+
+
+def experience_source(job: dict[str, Any]) -> tuple[str, str | None]:
+    """Read a job's stated experience without interpreting search filters/JD.
+
+    Old rows combine experience and education in list tags. Recover only a
+    complete, unambiguous experience tag, preserving its original wording.
+    A normalized source marker prevents reinterpreting tags combined by dedupe.
+    """
+    saved_source = job.get("experience_source")
+    inferred = ""
+    for key in _EXPERIENCE_FIELDS:
+        value = job.get(key)
+        if not isinstance(value, str) or not value.strip() or value.strip().isdigit():
+            continue
+        if key == "experience" and saved_source in _EXPERIENCE_TAG_FIELDS:
+            inferred = value.strip()
+            continue
+        source = (saved_source if key == "experience" and saved_source in _EXPERIENCE_FIELDS else key)
+        return value.strip(), source
+    if inferred:
+        return inferred, saved_source
+    if "experience_source" in job:
+        return "", None
+    candidates: dict[str, str] = {}
+    for key in _EXPERIENCE_TAG_FIELDS:
+        value = job.get(key)
+        values = [value] if isinstance(value, str) else value if isinstance(value, list) else []
+        for entry in values:
+            if not isinstance(entry, str):
+                continue
+            for part in _EXPERIENCE_TAG_SPLIT.split(entry):
+                label = part.strip()
+                if _EXPERIENCE_TAG.fullmatch(label):
+                    candidates.setdefault(label, key)
+    if len(candidates) == 1:
+        return next(iter(candidates.items()))
+    return "", None
 
 
 def _city(job: dict[str, Any]) -> str:
@@ -768,7 +867,7 @@ def filter_jobs(jobs: Iterable[dict[str, Any]], search: str = "", classification
                 continue
         searchable = " ".join(_text(job.get(key)) for key in (
             "title", "company", "company_name", "brand_name", "skills", "skill_tags", "city", "location",
-        )) + " " + _city(job)
+        )) + " " + _company(job) + " " + _city(job)
         if all(keyword in searchable.casefold() for keyword in keywords):
             selected.append(job)
     priorities = {name: index for index, name in enumerate(CLASSIFICATIONS)}
@@ -840,7 +939,7 @@ def format_job_detail(job: dict[str, Any]) -> str:
         f"招聘者：{display(job.get('boss_name'))}  {display(job.get('boss_title'))}",
         f"城市/地点：{display(job.get('location') or job.get('city') or _city(job))}",
         f"薪资：{display(job.get('salary'))}",
-        f"经验/学历：{display(_items(job.get('experience'), job.get('experience_tags'), job.get('tags'), job.get('job_labels'), job.get('tags_list')))}",
+        f"经验/学历：{display(_items(experience_source(job)[0], job.get('experience_tags'), job.get('tags'), job.get('job_labels'), job.get('tags_list')))}",
         f"技能：{display(_items(job.get('skills'), job.get('skill_tags')))}",
         f"岗位 ID：{display(_identifier(job))}",
         f"已有分层：{display(job.get('classification'))}  排序分：{display(job.get('score'))}",
@@ -941,7 +1040,7 @@ def export_jobs(path: Path, jobs: list[dict[str, Any]]) -> Path:
                 handle.write("\n")
             else:
                 fields = [
-                    "job_id", "title", "company", "city", "location", "salary", "tags", "skills",
+                    "job_id", "title", "company", "city", "location", "salary", "experience", "tags", "skills",
                     "classification", "reason", "score", "jd_status", "model_status", "jd_dimension_count",
                     "jd_dimensions", "jd_evidence", "model_evidence", "ability_gaps", "gaps",
                     "verification", "verify", "observed_in", "job_link", "jd", "llm_review",
@@ -952,6 +1051,7 @@ def export_jobs(path: Path, jobs: list[dict[str, Any]]) -> Path:
                 for original in rows:
                     row = dict(original)
                     row["company"] = _company(row) or "未知公司"
+                    row["experience"] = experience_source(row)[0]
                     row.setdefault("city", _city(row))
                     row.setdefault("job_link", row.get("link", ""))
                     row.setdefault("model_status", _model_state(row) or "unknown")

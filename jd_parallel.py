@@ -13,14 +13,19 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import random
 import re
 import signal
 import sys
+import tempfile
 import threading
 import time
 from types import ModuleType
 from typing import Any, Callable
 from urllib.parse import urlparse
+
+from checkpoint_io import read_json as read_checkpoint_json, replace_with_retry
+from stage_rules import validate_stage_rules
 
 
 DEFAULT_JD_WORKERS = 3
@@ -47,7 +52,7 @@ _SECURITY_TEXT_RE = re.compile(
 
 @dataclass(frozen=True)
 class RenderTiming:
-    """Internal injection point for offline tests; scroll count is not tunable."""
+    """Internal render-wait injection point for offline tests."""
 
     page_wait: float
     page_timeout: float
@@ -69,8 +74,73 @@ class _Gate(Exception):
     pass
 
 
+class CheckpointWriteError(OSError):
+    """A checkpoint failed to publish; retain codes without exception bodies."""
+
+    def __init__(self, path: Path, operation: str, error: OSError) -> None:
+        super().__init__(error.errno, "JD checkpoint write failed", str(path))
+        self.operation = operation
+        self.checkpoint_path = path
+        self.original_error = type(error).__name__
+        self.winerror = getattr(error, "winerror", None)
+
+
+def _write_checkpoint(path: str | Path, records: list, *, control: StopState | None = None) -> None:
+    """Publish complete JSON using a private temp and bounded reader-lock retry.
+
+    The upstream writer uses a PID-only temp and fails immediately when a
+    Windows progress reader denies replacement. Keep this adapter independent
+    of the processor, which imports the adapter's quality/isolation helpers.
+    """
+    path = Path(path)
+    temporary = None
+    operation = "mkdir"
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        operation = "create-temp"
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", newline="\n",
+                                         prefix=f".{path.name}.", suffix=".tmp",
+                                         dir=path.parent, delete=False) as handle:
+            temporary = Path(handle.name)
+            operation = "write-temp"
+            json.dump(records, handle, ensure_ascii=False, indent=2)
+            handle.write("\n")
+            operation = "flush-temp"
+            handle.flush()
+            operation = "fsync-temp"
+            os.fsync(handle.fileno())
+            operation = "close-temp"
+        operation = "replace"
+        replace_with_retry(temporary, path, stop_event=control.event if control is not None else None)
+    except OSError as exc:
+        raise CheckpointWriteError(path, operation, exc) from None
+    finally:
+        if temporary is not None:
+            try:
+                temporary.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+
+def _os_failure_diagnostic(operation: str, path: Path | None, error: OSError) -> str:
+    """Use caller-owned paths and numeric codes, never strerror or filenames."""
+    location = str(path) if path is not None else "[未提供]"
+    if re.search(r"https?:[\\/]", location, re.I):
+        location = "[含网址的路径已隐藏]"
+    else:
+        location = re.sub(
+            r"(?i)((?:authorization|cookie|token|api[_-]?key|password|secret)\s*[:=])[^\\/]*",
+            r"\1[已隐藏]", location,
+        )
+    error_name = error.original_error if isinstance(error, CheckpointWriteError) else type(error).__name__
+    codes = {name: value if type(value := getattr(error, name, None)) is int else None
+             for name in ("errno", "winerror")}
+    return (f"operation={operation} path={json.dumps(location, ensure_ascii=False)} "
+            f"error={error_name} errno={codes['errno']} winerror={codes['winerror']}")
+
+
 class StopState:
-    """A gate stops scheduling and wakes every page's render wait immediately."""
+    """A gate stops scheduling and wakes every page's wait immediately."""
 
     def __init__(self) -> None:
         self.event = threading.Event()
@@ -106,6 +176,10 @@ class BatchResult:
     port: int = CDP_PORT
     profile_dir: str | None = None
     browser_results: dict[str, dict[str, Any]] = field(default_factory=dict)
+    scroll_count: int = SCROLL_COUNT
+    detail_speed_profile: str = "fast"
+    page_wait_min: int = 0
+    page_wait_max: int = 0
 
     @property
     def exit_code(self) -> int:
@@ -323,15 +397,24 @@ def _detail_record(scraper: ModuleType, job: dict, fields: dict, tags: list,
 
 
 def _collect_one(job: dict, scraper: ModuleType, factory: Callable[[], Any],
-                 control: StopState, timing: RenderTiming) -> dict | None:
+                 control: StopState, timing: RenderTiming,
+                 scroll_count: int = SCROLL_COUNT, speed_profile: str = "fast",
+                 page_wait_min: int = 0, page_wait_max: int = 0) -> dict | None:
     page = None
     capture = _Capture()
     record = None
+    scrolls_completed = 0
     try:
         control.check()
         url = scraper.build_detail_url(job)
         if not url:
             raise ValueError("岗位缺少详情链接")
+        # This extra delay belongs to each pending job, before opening its CDP
+        # connection or page. A gate/stop wakes it without creating new work.
+        page_wait = random.uniform(page_wait_min, page_wait_max)
+        if page_wait > 0:
+            control.wait(page_wait)
+        control.check()
         cdp = factory()
         # Register the connection before any operation that could fail.
         page = _OwnedConnection(cdp, control)
@@ -344,9 +427,10 @@ def _collect_one(job: dict, scraper: ModuleType, factory: Callable[[], Any],
         if navigation.get("result", {}).get("errorText"):
             raise RuntimeError(f"页面导航失败：{navigation['result']['errorText']}")
         _wait_for_page(page, sid, scraper, capture, control, timing)
-        for _ in range(SCROLL_COUNT):
+        for _ in range(scroll_count):
             control.check()
             page.eval_js(_SCROLL_JS, sid)
+            scrolls_completed += 1
             _wait_for_scroll(page, sid, scraper, capture, control, timing)
         control.check()
         fields = scraper.extract_detail_fields(capture.latest)
@@ -374,6 +458,10 @@ def _collect_one(job: dict, scraper: ModuleType, factory: Callable[[], Any],
             page.close()
             if record is not None and page.cleanup_errors:
                 record["cleanup_errors"] = page.cleanup_errors
+        if record is not None:
+            record.update(scroll_count=scroll_count, scrolls_completed=scrolls_completed,
+                          detail_speed_profile=speed_profile,
+                          page_wait_min=page_wait_min, page_wait_max=page_wait_max)
     return record
 
 
@@ -398,6 +486,9 @@ def _record_key(record: dict[str, Any]) -> str:
 def detail_completeness(record: dict[str, Any] | None) -> str:
     """Shared quality rule for legacy, single and dual JD checkpoints."""
     if not record or not str(record.get("jd") or "").strip():
+        return "missing"
+    if any(str(record.get(key) or "").strip().casefold() == "missing"
+           for key in ("status", "jd_status", "jd_completeness")):
         return "missing"
     states = " ".join(str(record.get(key) or "").casefold() for key in ("status", "jd_status", "jd_completeness"))
     if (record.get("complete") is False or record.get("jd_complete") is False
@@ -428,7 +519,7 @@ def _read_checkpoint(path: Path) -> list[dict[str, Any]]:
     try:
         if not path.exists():
             return []
-        value = json.loads(path.read_text(encoding="utf-8-sig"))
+        value = read_checkpoint_json(path)
     except (OSError, UnicodeError, ValueError):
         return []
     if isinstance(value, list):
@@ -446,24 +537,26 @@ def _side_output_path(path: Path, browser: str) -> Path:
 
 def _collect_details_single(list_data: dict | list, output_path: Path, *, scraper: ModuleType,
                             workers: int = DEFAULT_JD_WORKERS, speed_profile: str = "fast",
+                            scroll_count: int = SCROLL_COUNT,
                             cdp_factory: Callable[[], Any] | None = None,
                             control: StopState | None = None, timing: RenderTiming | None = None,
                             persist: Callable[[str, list], None] | None = None,
                             emit: Callable[[str], None] | None = None,
                             resume: bool = True,
                             browser: str = "chrome", port: int = CDP_PORT,
-                            profile_dir: str | Path | None = None) -> BatchResult:
+                            profile_dir: str | Path | None = None,
+                            page_wait_min: int = 0, page_wait_max: int = 0) -> BatchResult:
     """Run one already-selected batch; no screening, login flow, or cache policy."""
     if isinstance(workers, bool) or not isinstance(workers, int) or not 1 <= workers <= MAX_JD_WORKERS:
         raise ValueError(f"JD 页面并发必须为 1–{MAX_JD_WORKERS} 的整数")
-    if speed_profile not in _TIMINGS:
-        raise ValueError("详情速度档位必须为 fast 或 safe")
+    validate_stage_rules("fetch-jd", {"scroll_count": scroll_count, "detail_speed_profile": speed_profile,
+                                     "page_wait_min": page_wait_min, "page_wait_max": page_wait_max})
     jobs = list_data.get("jobs", []) if isinstance(list_data, dict) else list_data
     if not isinstance(jobs, list) or any(not isinstance(job, dict) for job in jobs):
         raise ValueError("输入必须为岗位列表或包含 jobs 列表的对象")
     control = control or StopState()
     timing = timing or _TIMINGS[speed_profile]
-    persist = persist or scraper._atomic_write_json
+    persist = persist or (lambda path, records: _write_checkpoint(path, records, control=control))
     emit = emit or (lambda message: print(message, flush=True))
     if cdp_factory is None:
         if jobs and not scraper.require_runtime_dependencies("requests", "websocket"):
@@ -506,7 +599,7 @@ def _collect_details_single(list_data: dict | list, output_path: Path, *, scrape
 
     if not resume or not Path(output_path).exists():
         persist(str(output_path), records())
-    emit(f"{browser} JD 页面并发 {workers}，每页固定滚动 {SCROLL_COUNT} 次，岗位 {len(jobs)} 个，已恢复 {len(completed)} 个")
+    emit(f"{browser} JD 页面并发 {workers}，每页滚动 {scroll_count} 次，速度档位 {speed_profile}，每页额外等待 {page_wait_min}–{page_wait_max} 秒，岗位 {len(jobs)} 个，已恢复 {len(completed)} 个")
     executor = ThreadPoolExecutor(max_workers=workers, thread_name_prefix="jd-page")
     try:
         while pending or next_index < len(jobs):
@@ -516,7 +609,8 @@ def _collect_details_single(list_data: dict | list, output_path: Path, *, scrape
                 while next_index < len(jobs) and next_index in completed and _record_is_complete(completed[next_index]):
                     next_index += 1
                 while len(pending) < workers and next_index < len(jobs) and not control.event.is_set():
-                    future = executor.submit(_collect_one, dict(jobs[next_index]), scraper, cdp_factory, control, timing)
+                    future = executor.submit(_collect_one, dict(jobs[next_index]), scraper, cdp_factory, control,
+                                             timing, scroll_count, speed_profile, page_wait_min, page_wait_max)
                     pending[future] = next_index
                     next_index += 1
                     while next_index < len(jobs) and next_index in completed and _record_is_complete(completed[next_index]):
@@ -558,7 +652,9 @@ def _collect_details_single(list_data: dict | list, output_path: Path, *, scrape
     emit(f"JD 并发结束：status={status}，已保存 {len(completed)}/{len(jobs)}")
     return BatchResult(records(), status, len(jobs), control.gate_message,
                        browser=browser, port=port,
-                       profile_dir=str(profile_dir) if profile_dir is not None else None)
+                       profile_dir=str(profile_dir) if profile_dir is not None else None,
+                       scroll_count=scroll_count, detail_speed_profile=speed_profile,
+                       page_wait_min=page_wait_min, page_wait_max=page_wait_max)
 
 
 class _ParentStopWatcher:
@@ -605,6 +701,24 @@ def _normalize_browser_configs(browser_configs: Any) -> dict[str, BrowserConfig]
     return result
 
 
+def validate_browser_configs(browser_mode: str, browser_configs: Any = None) -> dict[str, BrowserConfig]:
+    """Resolve and validate isolation before either browser can be launched."""
+    if browser_mode not in ("single", "dual"):
+        raise ValueError("browser_mode 必须为 single 或 dual")
+    defaults = default_browser_configs()
+    configs = _normalize_browser_configs(browser_configs)
+    configs = {name: BrowserConfig(name, configs[name].port,
+               configs[name].profile_dir or defaults[name].profile_dir) for name in _BROWSER_NAMES}
+    if browser_mode == "dual":
+        if configs["chrome"].port == configs["edge"].port:
+            raise ValueError("双浏览器必须使用独立 CDP 端口")
+        profiles = [os.path.normcase(str(Path(configs[name].profile_dir).expanduser().resolve()))
+                    for name in _BROWSER_NAMES]
+        if profiles[0] == profiles[1]:
+            raise ValueError("双浏览器必须使用独立 profile 目录")
+    return configs
+
+
 def _factory_for(name: str, config: BrowserConfig, scraper: ModuleType,
                  cdp_factory: Callable[[], Any] | None,
                  cdp_factories: Any) -> Callable[[], Any] | None:
@@ -626,13 +740,15 @@ def _factory_for(name: str, config: BrowserConfig, scraper: ModuleType,
 
 def collect_details(list_data: dict | list, output_path: Path, *, scraper: ModuleType,
                     workers: int = DEFAULT_JD_WORKERS, speed_profile: str = "fast",
+                    scroll_count: int = SCROLL_COUNT,
                     cdp_factory: Callable[[], Any] | None = None,
                     control: StopState | None = None, timing: RenderTiming | None = None,
                     persist: Callable[[str, list], None] | None = None,
                     emit: Callable[[str], None] | None = None,
                     browser_mode: str = DEFAULT_BROWSER_MODE,
                     browser_configs: Any = None, cdp_factories: Any = None,
-                    resume: bool = True, browser_readiness: dict[str, Any] | None = None) -> BatchResult:
+                    resume: bool = True, browser_readiness: dict[str, Any] | None = None,
+                    page_wait_min: int = 0, page_wait_max: int = 0) -> BatchResult:
     """Collect details on one browser or two isolated browser connections.
 
     Dual mode partitions the input deterministically (Chrome receives the
@@ -640,18 +756,17 @@ def collect_details(list_data: dict | list, output_path: Path, *, scraper: Modul
     side checkpoints after every completion. A gate on one side does not stop
     the other side; an outer stop still stops both sides.
     """
-    if browser_mode not in ("single", "dual"):
-        raise ValueError("browser_mode 必须为 single 或 dual")
-    if speed_profile not in _TIMINGS:
-        raise ValueError("详情速度档位必须为 fast 或 safe")
+    configs = validate_browser_configs(browser_mode, browser_configs)
+    validate_stage_rules("fetch-jd", {"scroll_count": scroll_count, "detail_speed_profile": speed_profile,
+                                     "page_wait_min": page_wait_min, "page_wait_max": page_wait_max})
     if browser_mode == "single":
-        config = _normalize_browser_configs(browser_configs)["chrome"]
+        config = configs["chrome"]
         return _collect_details_single(
             list_data, output_path, scraper=scraper, workers=workers,
-            speed_profile=speed_profile, cdp_factory=cdp_factory,
+            speed_profile=speed_profile, scroll_count=scroll_count, cdp_factory=cdp_factory,
             control=control, timing=timing, persist=persist, emit=emit,
             resume=resume, browser=config.name, port=config.port,
-            profile_dir=config.profile_dir,
+            profile_dir=config.profile_dir, page_wait_min=page_wait_min, page_wait_max=page_wait_max,
         )
 
     jobs = list_data.get("jobs", []) if isinstance(list_data, dict) else list_data
@@ -660,17 +775,11 @@ def collect_details(list_data: dict | list, output_path: Path, *, scraper: Modul
     if jobs and cdp_factories is None and cdp_factory is None:
         if not scraper.require_runtime_dependencies("requests", "websocket"):
             raise RuntimeError("缺少 CDP 运行依赖")
-    configs = _normalize_browser_configs(browser_configs)
-    if configs["chrome"].port == configs["edge"].port:
-        raise ValueError("双浏览器必须使用独立 CDP 端口")
-    chrome_profile, edge_profile = (configs[name].profile_dir for name in _BROWSER_NAMES)
-    if chrome_profile and edge_profile and os.path.normcase(os.path.abspath(chrome_profile)) == os.path.normcase(os.path.abspath(edge_profile)):
-        raise ValueError("双浏览器必须使用独立 profile 目录")
     parent = control or StopState()
     timing = timing or _TIMINGS.get(speed_profile)
     if timing is None:
         raise ValueError("详情速度档位必须为 fast 或 safe")
-    persist = persist or scraper._atomic_write_json
+    persist = persist or (lambda path, records: _write_checkpoint(path, records, control=parent))
     emit = emit or (lambda message: print(message, flush=True))
     split = (len(jobs) + 1) // 2
     groups = {"chrome": jobs[:split], "edge": jobs[split:]}
@@ -714,10 +823,10 @@ def collect_details(list_data: dict | list, output_path: Path, *, scraper: Modul
                     # thread after this side future completes.
                     side_dirty[0] = True
                     snapshot = list(side_records[name])
-                scraper._atomic_write_json(str(side_path), snapshot)
+                _write_checkpoint(side_path, snapshot, control=side_control)
 
             initial = list(side_records[name])
-            scraper._atomic_write_json(str(side_path), initial)
+            _write_checkpoint(side_path, initial, control=side_control)
             readiness = (browser_readiness or {}).get(name, True)
             ready = readiness.get("ready", False) if isinstance(readiness, dict) else readiness is True
             unfinished = [job for job in groups[name] if not _record_is_complete(recovered.get(_job_key(job), {}))]
@@ -731,12 +840,16 @@ def collect_details(list_data: dict | list, output_path: Path, *, scraper: Modul
                 side_persist(str(side_path), list(saved.values()))
                 emit(message)
                 return BatchResult(list(saved.values()), "paused", len(groups[name]), message,
-                                   browser=name, port=config.port, profile_dir=config.profile_dir)
+                                   browser=name, port=config.port, profile_dir=config.profile_dir,
+                                   scroll_count=scroll_count, detail_speed_profile=speed_profile,
+                                   page_wait_min=page_wait_min, page_wait_max=page_wait_max)
             result = _collect_details_single(
                 {"jobs": groups[name]}, side_path, scraper=scraper, workers=workers,
-                speed_profile=speed_profile, cdp_factory=_factory_for(name, config, scraper, cdp_factory, cdp_factories),
+                speed_profile=speed_profile, scroll_count=scroll_count,
+                cdp_factory=_factory_for(name, config, scraper, cdp_factory, cdp_factories),
                 control=side_control, timing=timing, persist=side_persist, emit=emit,
                 resume=True, browser=name, port=config.port, profile_dir=config.profile_dir,
+                page_wait_min=page_wait_min, page_wait_max=page_wait_max,
             )
             with side_lock:
                 side_records[name] = result.records
@@ -794,20 +907,27 @@ def collect_details(list_data: dict | list, output_path: Path, *, scraper: Modul
     browser_payload = {
         name: {"records": result.records, "status": result.status, "total": result.total,
                "gate_message": result.gate_message, "port": result.port,
-               "profile_dir": result.profile_dir}
+               "profile_dir": result.profile_dir, "scroll_count": result.scroll_count,
+               "detail_speed_profile": result.detail_speed_profile,
+               "page_wait_min": result.page_wait_min, "page_wait_max": result.page_wait_max}
         for name, result in results.items()
     }
     return BatchResult(all_records, status, len(jobs), gate,
-                       browser="dual", browser_results=browser_payload)
+                       browser="dual", browser_results=browser_payload,
+                       scroll_count=scroll_count, detail_speed_profile=speed_profile,
+                       page_wait_min=page_wait_min, page_wait_max=page_wait_max)
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="使用已准备好的 Chrome/Edge 并发补抓 JD，每页固定三次滚动")
+    parser = argparse.ArgumentParser(description="使用已准备好的 Chrome/Edge 并发补抓 JD")
     parser.add_argument("--scraper-root", type=Path, required=True)
     parser.add_argument("--input", type=Path, required=True)
     parser.add_argument("--detail-output", type=Path, required=True)
     parser.add_argument("--workers", type=int, default=DEFAULT_JD_WORKERS)
     parser.add_argument("--detail-speed-profile", choices=tuple(_TIMINGS), default="fast")
+    parser.add_argument("--scroll-count", type=int, default=SCROLL_COUNT, help="每页实际滚动次数，1–20，默认 3")
+    parser.add_argument("--page-wait-min", type=int, default=0, help="每页额外等待下限（秒），0–30，默认 0")
+    parser.add_argument("--page-wait-max", type=int, default=0, help="每页额外等待上限（秒），0–30，默认 0")
     parser.add_argument("--browser-mode", choices=("single", "dual"), default=DEFAULT_BROWSER_MODE)
     parser.add_argument("--chrome-port", type=int, default=CDP_PORT)
     parser.add_argument("--edge-port", type=int, default=EDGE_CDP_PORT)
@@ -815,8 +935,16 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--edge-profile-dir", type=Path, default=None)
     parser.add_argument("--browser-readiness-file", type=Path, default=None)
     args = parser.parse_args(argv)
+    if not 1 <= args.scroll_count <= 20:
+        parser.error("--scroll-count 须为 1–20")
+    try:
+        validate_stage_rules("fetch-jd", {"page_wait_min": args.page_wait_min, "page_wait_max": args.page_wait_max})
+    except ValueError as exc:
+        parser.error(str(exc))
     control = StopState()
     previous_handlers = {}
+    operation = "load-upstream"
+    error_path = args.scraper_root / "scripts" / "boss_cdp_raw.py"
 
     def stop_on_signal(_signum, _frame) -> None:
         control.request_stop()
@@ -828,12 +956,12 @@ def main(argv: list[str] | None = None) -> int:
                 if signum is not None:
                     previous_handlers[signum] = signal.signal(signum, stop_on_signal)
         scraper = load_scraper(args.scraper_root)
-        with args.input.open("r", encoding="utf-8-sig") as stream:
-            data = json.load(stream)
+        operation, error_path = "read-input", args.input
+        data = read_checkpoint_json(args.input)
         readiness = None
         if args.browser_readiness_file is not None:
-            with args.browser_readiness_file.open("r", encoding="utf-8-sig") as stream:
-                readiness = json.load(stream)
+            operation, error_path = "read-readiness", args.browser_readiness_file
+            readiness = read_checkpoint_json(args.browser_readiness_file)
             if not isinstance(readiness, dict) or set(readiness) != set(_BROWSER_NAMES):
                 raise ValueError("浏览器预检结果须包含 chrome 和 edge")
             if any(not isinstance(value, dict) or type(value.get("ready")) is not bool for value in readiness.values()):
@@ -843,14 +971,24 @@ def main(argv: list[str] | None = None) -> int:
                                           args.chrome_profile_dir or configs["chrome"].profile_dir)
         configs["edge"] = BrowserConfig("edge", args.edge_port,
                                         args.edge_profile_dir or configs["edge"].profile_dir)
+        operation, error_path = "collect-details", None
         return collect_details(
             data, args.detail_output, scraper=scraper, workers=args.workers,
-            speed_profile=args.detail_speed_profile, control=control,
+            speed_profile=args.detail_speed_profile, scroll_count=args.scroll_count, control=control,
+            page_wait_min=args.page_wait_min, page_wait_max=args.page_wait_max,
             browser_mode=args.browser_mode, browser_configs=configs, browser_readiness=readiness,
         ).exit_code
     except KeyboardInterrupt:
         control.request_stop()
         return INTERRUPTED_EXIT_CODE
+    except CheckpointWriteError as exc:
+        print("JD 检查点写入失败：" + _os_failure_diagnostic(exc.operation, exc.checkpoint_path, exc)
+              + "；已保留可用检查点，解除文件占用或检查目录权限后重试。", file=sys.stderr, flush=True)
+        return 1
+    except OSError as exc:
+        print("JD 并发失败：" + _os_failure_diagnostic(operation, error_path, exc)
+              + "；检查输入和上游工具后重试。", file=sys.stderr, flush=True)
+        return 1
     except Exception as exc:
         print(f"JD 并发失败（{type(exc).__name__}）；检查输入和上游工具后重试。", file=sys.stderr, flush=True)
         return 1

@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import argparse
 import builtins
+from collections import Counter
 from contextlib import contextmanager
 import json
 import os
@@ -348,6 +349,60 @@ def payload_job_count(path: Path) -> int | None:
         return None
     jobs = payload.get("jobs") if isinstance(payload, dict) else None
     return len(jobs) if isinstance(jobs, list) else None
+
+
+def refresh_collection_checkpoint(output_path: Path, checkpoint_path: Path) -> int | None:
+    """Retain every valid saved row before another attempt can replace raw.
+
+    The latest raw rows keep their fields and order. Older checkpoint rows are
+    added only when missing, using the upstream job identity where available.
+    Maximum multiplicity preserves raw-row accounting without adding another
+    copy on every resume. Deduplication across combinations remains downstream.
+    An invalid raw file never replaces a valid checkpoint.
+    """
+    try:
+        payload = read_json(output_path)
+    except (OSError, UnicodeError, ValueError, TypeError):
+        return None
+    if not isinstance(payload, dict) or not isinstance(payload.get("jobs"), list):
+        return None
+    try:
+        previous = read_json(checkpoint_path)
+    except (OSError, UnicodeError, ValueError, TypeError):
+        previous = None
+    old_jobs = previous.get("jobs") if isinstance(previous, dict) else None
+    if not isinstance(old_jobs, list):
+        # Keep the initial raw snapshot byte-for-byte, but publish it atomically.
+        checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = checkpoint_path.with_name(checkpoint_path.name + ".tmp")
+        shutil.copy2(output_path, temporary)
+        os.replace(temporary, checkpoint_path)
+        return len(payload["jobs"])
+
+    def identity(row: Any) -> tuple[str, str]:
+        if isinstance(row, dict):
+            for field in ("job_id", "encrypt_job_id", "encryptJobId", "id", "job_link", "link"):
+                value = row.get(field)
+                if isinstance(value, (str, int)) and not isinstance(value, bool) and str(value).strip():
+                    return field, str(value).strip()
+        return "row", json.dumps(row, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+    jobs = list(payload["jobs"])
+    current_counts = Counter(identity(row) for row in jobs)
+    previous_counts: Counter[tuple[str, str]] = Counter()
+    for row in old_jobs:
+        key = identity(row)
+        previous_counts[key] += 1
+        if previous_counts[key] > current_counts[key]:
+            jobs.append(row)
+    if jobs != payload["jobs"]:
+        payload = {**payload, "jobs": jobs, "total": len(jobs)}
+        # Publish raw first: a forced exit between the two replaces is recovered
+        # by the same union before the next attempt is launched.
+        write_json_atomic(output_path, payload)
+    if previous != payload:
+        write_json_atomic(checkpoint_path, payload)
+    return len(jobs)
 
 
 def security_detected(text: str) -> bool:
@@ -747,9 +802,6 @@ def invoke_spec(
         "--output",
         str(output_path),
     ]
-    if checkpoint_path.is_file():
-        command.extend(("--merge", str(checkpoint_path)))
-
     started = now_iso()
     print(
         f"RUN {combination} ({started}), pages={pages}, "
@@ -767,7 +819,8 @@ def invoke_spec(
         output_lines: list[str] = []
         try:
             attempt_command = list(command)
-            if checkpoint_path.is_file() and "--merge" not in attempt_command:
+            refresh_collection_checkpoint(output_path, checkpoint_path)
+            if valid_payload(checkpoint_path) and "--merge" not in attempt_command:
                 attempt_command.extend(("--merge", str(checkpoint_path)))
             process = subprocess.Popen(
                 attempt_command,
@@ -810,17 +863,17 @@ def invoke_spec(
         security = security_detected(output)
         if security:
             mark_browser_gate_paused(gate_stop_path)
+        attempt_job_count = payload_job_count(output_path)
+        if output_path.is_file() and (checkpoint_path.exists() or security or exit_code != 0):
+            refresh_collection_checkpoint(output_path, checkpoint_path)
         job_count = stamp_payload(output_path, spec) if output_path.is_file() else None
         valid = job_count is not None
-        empty_failure = empty_result_failure_reason(output) if job_count == 0 else None
-        if (security or exit_code != 0) and valid and not checkpoint_path.exists():
-            checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(output_path, checkpoint_path)
+        empty_failure = empty_result_failure_reason(output) if attempt_job_count == 0 else None
         status = (
             "paused"
-            if security or exit_code != 0
+            if security or exit_code == 130
             else "failed"
-            if not valid or empty_failure
+            if exit_code != 0 or not valid or empty_failure
             else "no_data"
             if job_count == 0
             else "success"
@@ -842,8 +895,9 @@ def invoke_spec(
             "started_at": started,
             "finished_at": now_iso(),
             "security_or_login_gate": security,
-            "failure_reason": empty_failure if status == "failed" else None,
-            "retryable": status == "failed" and empty_failure is not None,
+            "failure_reason": (empty_failure or (f"采集器异常退出（退出码 {exit_code}）" if exit_code != 0 else None))
+                              if status == "failed" else None,
+            "retryable": status == "failed" and (empty_failure is not None or exit_code != 0),
             "gate_wait_count": gate_wait_count,
             "last_gate_at": last_gate_at,
             "browser": browser,
@@ -1052,7 +1106,7 @@ def main(argv: list[str] | None = None) -> int:
     from collection_sources import assert_source_specs_compatible
 
     try:
-        assert_source_specs_compatible(root, all_specs)
+        assert_source_specs_compatible(root, all_specs, config=config)
     except ValueError as exc:
         print(f"采集配置冲突：{exc}", file=sys.stderr, flush=True)
         return 20

@@ -44,26 +44,38 @@ python desktop_app.py --legacy-workbench --root "D:\岗位数据\采集源"
 
 ## 投递 JSON 导出
 
-只读取已经完成并确认 `import / shortlist / fetch-jd / llm` 的具名任务。不会运行报告、补抓 JD、请求模型或执行投递。导出以 AI 阶段当前最终保留名单为准，人工决定优先；目标 ID / 链接缺失、无效或冲突，以及无效复核记录会列入 `blocked_jobs`。
+只读取已经完成并确认 `import / shortlist / fetch-jd / llm` 的具名任务。不会运行报告、补抓 JD、请求模型或执行投递。导出以当前最终保留名单为准，不再次验证 AI 判断、记录或签名；已有 AI 信息仅作记录，`ai_review.validation="not_checked"`。目标 ID / 链接缺失、无效、冲突或重复仍列入 `blocked_jobs`。
 
 ```powershell
 python delivery_export.py --task "D:\岗位数据\审核任务\task-…"
 
 # 安装态等效入口；--output-dir 指定保存父目录
 boss-architecture-export --task "D:\岗位数据\审核任务\task-…" --output-dir "D:\岗位数据\delivery-exports"
+
+# 仅导出指定字段；不传 --fields 时导出完整 JSON
+boss-architecture-export --task "D:\岗位数据\审核任务\task-…" --fields jobs.title jobs.company jobs.ai_review.reason
 ```
 
 | 参数 | 行为 |
 | --- | --- |
 | `--task PATH` | 必填，具名审核任务目录；不能传原始源、CLI 运行或旧报告目录 |
 | `--output-dir PATH` | 可选，保存父目录；默认 `<任务>/delivery-exports`，每次在父目录下创建唯一子目录 |
+| `--fields FIELD [FIELD ...]` | 可选，仅导出指定叶子字段，使用点分层级（如 `jobs.title`、`jobs.ai_review.reason`、`summary.ready_count`）；已知但当前无值的字段自动省略，省略参数时导出全部有值字段 |
 | `--help` | 显示帮助，不读取岗位或请求服务 |
 
-输出为 `<父目录>/<时间戳>-<uuid>/delivery_jobs.json`。文件采用白名单与标准库校验后原子发布，发布时必须仍为所捕获的确认名单；冲突时重新预览 / 重试。既有导出不覆盖，也不修改任务状态或人工决定。JSON 是审核快照，不能据此认定已经投递。
+输出为 `<父目录>/<时间戳>-<uuid>/<前三个字段中文名>.json`，CLI 成功时打印实际路径。文件名取字段列表顺序中前三个已选且有值叶子字段的中文名称，用下划线拼接；不足三项使用实际项数。例如选择 `jobs.title jobs.company jobs.city jobs.salary`，当前城市无值时文件名为 `岗位名称_公司_薪资.json`。完整 JSON 名为 `格式版本_导出ID_导出时间.json`。文件采用白名单与标准库校验后原子发布，发布时必须仍为所捕获的确认名单；冲突时重新预览 / 重试。既有导出不覆盖，也不修改任务状态或人工决定。JSON 是审核快照，不能据此认定已经投递。
 
-根字段固定为 `schema_version`（字符串 `"1.0"`）、`export_id`、`generated_at`、`source_task`、`summary`、`jobs`、`blocked_jobs`。`summary.selected_count` 等于 `ready_count + blocked_count`，也分别对应两份数组长度。可选值为 `null`，未知字段不透传；不包含原始模型响应、凭据、Cookie、日志或本机路径。字段契约见 [JSON Schema](../schemas/delivery_jobs.v1.schema.json)。安装后可通过 `project_resources.resource_path("delivery_jobs.v1.schema.json")` 获取经过包清单和 SHA-256 校验的同一 Schema。
+完整 JSON 根字段包含 `schema_version`（字符串 `"1.0"`）、`export_id`、`generated_at`、`source_task`、`summary`，`jobs` / `blocked_jobs` 仅在非空时写入。`summary.selected_count` 等于 `ready_count + blocked_count`，也分别对应两份数组长度（缺省数组按零项处理）。两种导出均递归省略 `null`、空白文本、空数组、空对象和清理后为空的父容器，保留有效的 `0`、`false` 与非空文本；不包含原始模型响应、凭据、Cookie、日志或本机路径。完整字段契约见 [JSON Schema](../schemas/delivery_jobs.v1.schema.json)，仍兼容历史稠密完整文件。安装后可通过 `project_resources.resource_path("delivery_jobs.v1.schema.json")` 获取经过包清单和 SHA-256 校验的同一 Schema。
 
-每条记录的 `job_id` 是任务内身份，`boss_job_id` 是经真实岗位 ID / BOSS 详情链接核对的目标身份，二者不能互换。`job_key` 在同一任务的历次导出中稳定，可供外部脚本保存进度和去重；跨任务的同一目标可进一步按 `boss_job_id` 去重。地区缺失保留为 `null`，不会阻止有有效目标身份的岗位导出。
+指定字段导出先校验完整数据，再与当前实际有值字段取交集，保留必要层级；不强制补入版本、ID 或摘要。例如 `--fields jobs.title jobs.company` 输出 `{"jobs":[{"title":"…","company":"…"}]}`。未知字段、仅有父级名（如 `jobs`）和空选择会被拒绝；已知但无值的字段自动略过，若最终没有任何可导出内容则不生成文件。桌面“选择导出字段…”只展示当前 02 数据中有值的选项，不添加不存在或全部为空的字段和空岗位组；至少一条记录有值即可出现，`0` / `false` 也有效。刷新和切换任务同步更新目录，父级复选框批量选择当前可用叶子。下方完整格式读取示例适用于完整 JSON；读取指定信息时按实际选择的字段处理。
+
+每条记录的 `job_id` 是任务内身份，`boss_job_id` 是经真实岗位 ID / BOSS 详情链接核对的目标身份，二者不能互换。`job_key` 在同一任务的历次导出中稳定，可供外部脚本保存进度和去重；跨任务的同一目标可进一步按 `boss_job_id` 去重。地区缺失时省略，不会阻止有有效目标身份的岗位导出。
+
+公司名称输出为 `company`，可通过 `--fields jobs.company` 单独导出。01 新采集独立保存公司名称；旧采集器曾将 API 的 `brandName` 写入 `boss_name`，已知 API 记录可在本地恢复名称，无需重跑采集或 AI。DOM 或未知来源的招聘者姓名不会当作公司名，确实未保存名称时保持缺失。
+
+招聘经验输出为 `experience`，例如 `"1-3年"`、`"经验不限"`、`"在校/应届"`。使用 `--fields jobs.experience` 可生成仅含经验要求的 `经验要求.json`。显式岗位经验字段优先；旧数据只从完整、明确且无冲突的经验标签恢复，不使用检索经验筛选、学历标签或 JD 推算。缺失时省略，不填零年；旧任务读取和导出不会改写检查点或确认名单。
+
+已有公司信息使用原字段导出：`encrypt_brand_id`（公司 ID）、`company_link`（公司详情链接）、`company_industry`（行业）、`company_scale`（规模）、`company_stage`（融资阶段）。完整 JSON 包含其中有值的字段，也可通过 `--fields jobs.encrypt_brand_id jobs.company_link jobs.company_industry jobs.company_scale jobs.company_stage` 单独导出。公司 ID 和公司链接仅作公司信息，不能替代岗位定位。
 
 `navigation` 保留已存在的 `lid`、`ka`、`from`、`security_id`、`encrypt_boss_id` 导航值和带允许查询参数的来源链接 `original_job_url`。BOSS 的 `securityId` 是详情页定位提示，`encrypt_boss_id` 是招聘者导航提示，均不充当岗位 ID；未知查询参数、登录凭据和 Cookie 不透传。机器可读阻止原因位于每个 `blocked_jobs` 记录的 `blocked_reasons`。
 
@@ -73,12 +85,12 @@ boss-architecture-export --task "D:\岗位数据\审核任务\task-…" --output
 import json
 from pathlib import Path
 
-data = json.loads(Path("delivery_jobs.json").read_text(encoding="utf-8"))
+data = json.loads(Path("格式版本_导出ID_导出时间.json").read_text(encoding="utf-8"))
 if data["schema_version"] != "1.0":
     raise ValueError("不支持的导出版本")
-for job in data["jobs"]:
+for job in data.get("jobs", []):
     print(json.dumps(job, ensure_ascii=False))
-print("待修正：", len(data["blocked_jobs"]))
+print("待修正：", len(data.get("blocked_jobs", [])))
 ```
 
 下游只消费 `jobs`，不得把 `blocked_jobs` 自动当可投岗位。修正任务取舍或证据后，应重新完成受影响审核并确认，生成新快照；历史文件保留原内容。
@@ -192,7 +204,10 @@ python process_architecture.py --root "D:\岗位数据\采集源" --output-root 
 | `--chrome-port PORT` / `--edge-port PORT` | 双浏览器 CDP 端口，默认 9222 / 9223，不得共用 |
 | `--chrome-profile-dir PATH` / `--edge-profile-dir PATH` | 分别指定两个浏览器 profile；不传时使用已准备的默认 profile |
 | `--batch-size N` | CLI 默认 10，范围 1–100；GUI 默认 30，不是并发数 |
-| `--detail-speed-profile fast\|safe` | `fast`，控制页面加载 / 滚动等待；每页仍滚动 3 次 |
+| `--detail-speed-profile fast\|safe` | `fast`，控制页面加载 / 滚动等待 |
+| `--jd-scroll-count N` | JD 每页滚动次数，默认 3，范围 1–20；已有完整 JD 不因修改次数而自动重抓 |
+| `--jd-page-wait-min N` / `--jd-page-wait-max N` | 每个 JD 页面打开前额外随机等待的上下限，均为 0–30 秒且下限不大于上限；默认 0 / 0，相同值表示固定等待，支持暂停和停止 |
+| `--jd-page-wait-min SECONDS`、`--jd-page-wait-max SECONDS` | JD 每页打开前的额外随机等待；整数，`0 ≤ min ≤ max ≤ 30`，默认 0 / 0；相同值为固定等待，已完整 JD 不再等待 |
 | `--scraper-root PATH`、`--python PATH` | JD 上游目录及其解释器；目录也可用 `BOSS_SCRAPER_ROOT` |
 | `--timeout N`、`--max-retries N` | 请求超时默认 120 秒，有限重试默认 3 |
 | `--codex-home PATH` | 显式指定后改用该目录的 Codex `config.toml` / `auth.json`，不读取项目 URL 或 Credential Manager 密钥；不指定时 AI 使用本项目模型配置 |

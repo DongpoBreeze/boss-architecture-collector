@@ -47,10 +47,11 @@ def _resource_payloads() -> dict[str, bytes]:
                     raise ValueError("default collection configuration has an invalid schema")
             elif name == "delivery_jobs.v1.schema.json":
                 schema = json.loads(text)
-                required = {
+                properties = {
                     "schema_version", "export_id", "generated_at", "source_task",
                     "summary", "jobs", "blocked_jobs",
                 }
+                required = properties - {"jobs", "blocked_jobs"}
                 if (
                     not isinstance(schema, dict)
                     or schema.get("$schema") != "https://json-schema.org/draft/2020-12/schema"
@@ -60,7 +61,7 @@ def _resource_payloads() -> dict[str, bytes]:
                     or not all(isinstance(key, str) for key in schema["required"])
                     or set(schema["required"]) != required
                     or not isinstance(schema.get("properties"), dict)
-                    or set(schema["properties"]) != required
+                    or set(schema["properties"]) != properties
                     or not isinstance(schema["properties"].get("schema_version"), dict)
                     or schema["properties"]["schema_version"].get("const") != "1.0"
                     or any(

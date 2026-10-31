@@ -25,9 +25,11 @@ from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 from typing import Any, Callable, Iterator
 
+import checkpoint_io
 from desktop_data import _redact, _redact_text
 from screening_policy import AI_STAGE_PROJECTION, AI_STAGE_RESULT_FIELDS, SEMANTIC_RESULT_FIELDS
 import review_rules
+import stage_rules
 from llm_client import SIMPLE_REVIEW_FORMAT, JsonSchemaValidationError, simple_review_payload
 
 
@@ -488,10 +490,11 @@ class ReviewTask:
     """A fixed source/range and independently run, manually confirmed stages."""
 
     def __init__(self, path: Path, manifest: dict, *, read_only: bool = False,
-                 review_only: bool = False):
+                 review_only: bool = False, preserve_selection: bool = False):
         self._path = path
         self._read_only = read_only
         self._review_only = review_only
+        self._preserve_selection = preserve_selection
         if isinstance(manifest, dict) and isinstance(manifest.get("stages"), dict):
             for info in manifest["stages"].values():
                 if isinstance(info, dict) and "redo_count" not in info:
@@ -505,8 +508,38 @@ class ReviewTask:
         self._running_stage: str | None = None
         self._run_release_deferred = False
         self._ai_projection_cache: tuple | None = None
-        self._upgrade_pending_selection(manifest)
+        if preserve_selection:
+            self._stored_selection_defaults(manifest)
+        else:
+            self._upgrade_pending_selection(manifest)
         self._validate_review(manifest) if review_only else self._validate(manifest)
+
+    @staticmethod
+    def _stored_selection_defaults(value: dict) -> None:
+        """Fill additive legacy fields from stored lists, without reading AI.
+
+        Delivery treats the persisted confirmed partition as authoritative.
+        Missing newer fields can be reconstructed from that partition, but
+        malformed existing fields remain untouched for validation to reject.
+        """
+        stages = value.get("stages") if isinstance(value, dict) else None
+        if not isinstance(stages, dict):
+            return
+        for stage, info in stages.items():
+            if not isinstance(info, dict):
+                continue
+            result, keep, excluded = (info.get(field) for field in ("result_ids", "keep_ids", "excluded_ids"))
+            valid_lists = all(isinstance(ids, list) and all(isinstance(key, str) for key in ids)
+                              for ids in (result, keep, excluded))
+            if "pending_ids" not in info and valid_lists:
+                decided = set(keep) | set(excluded)
+                info["pending_ids"] = [key for key in result if key not in decided]
+            if "recommended_exclude_ids" not in info:
+                manual = info.get("manual_choices")
+                if stage == "llm" and valid_lists and isinstance(manual, dict):
+                    info["recommended_exclude_ids"] = [key for key in excluded if key not in manual]
+                elif stage != "llm":
+                    info["recommended_exclude_ids"] = []
 
     def _upgrade_pending_selection(self, value: dict) -> None:
         """Project older AI selections in memory; never rewrite old artifacts.
@@ -625,6 +658,7 @@ class ReviewTask:
             "source_inventory": inventory, "created_at": _now(), "updated_at": _now(),
             "stages": {stage: _stage_template() for stage in STAGES},
             "baseline_ids": None, "import_baseline_file": None, "revision": 0,
+            "stage_rules": {},
         }
         manifest["scope_signature"] = _scope_signature(manifest)
         try:
@@ -667,12 +701,15 @@ class ReviewTask:
         return task
 
     @classmethod
-    def open_readonly(cls, path: Path, *, review_only: bool = True) -> ReviewTask:
+    def open_readonly(cls, path: Path, *, review_only: bool = True,
+                      preserve_selection: bool = False) -> ReviewTask:
         """Open for inspection without recovery writes or browsing raw data.
 
         Delivery readers deliberately validate only the four review stages.
         Historical report artifacts are outside that contract. The original
         five-key manifest remains intact and this instance rejects all edits.
+        preserve_selection also bypasses AI recommendation migration, so an
+        export reader observes the persisted final partition and confirmation.
         """
         path = _absolute(path)
         if path.name == _MANIFEST and not path.is_dir():
@@ -680,7 +717,8 @@ class ReviewTask:
         _task_location(path)
         if not path.is_dir():
             raise TaskStateError("请选择已有任务目录或 task_manifest.json。")
-        return cls(path, _read_json(path / _MANIFEST), read_only=True, review_only=review_only)
+        return cls(path, _read_json(path / _MANIFEST), read_only=True, review_only=review_only,
+                   preserve_selection=preserve_selection)
 
     @property
     def path(self) -> Path:
@@ -703,9 +741,11 @@ class ReviewTask:
         path = self.path.joinpath(*PurePosixPath(relative).parts)
         _no_links(path)
         try:
-            path.resolve().relative_to(self.path.resolve())
-        except (OSError, ValueError, RuntimeError):
+            checkpoint_io.confined_path(path, self.path)
+        except checkpoint_io.PathBoundaryError:
             raise TaskStateError("任务结果路径不能指向任务目录外部。") from None
+        except checkpoint_io.PathCheckError:
+            raise TaskStateError("任务结果路径无法安全解析或检查，请稍后重试。") from None
         return path
 
     def _runtime_path(self, stage: str, relative: str) -> Path:
@@ -718,9 +758,11 @@ class ReviewTask:
         path = self.path.joinpath(*PurePosixPath(relative).parts)
         _task_location(path)
         try:
-            path.resolve().relative_to(self.path.resolve())
-        except (OSError, ValueError, RuntimeError):
+            checkpoint_io.confined_path(path, self.path)
+        except checkpoint_io.PathBoundaryError:
             raise TaskStateError("任务运行目录不能指向任务目录外部。") from None
+        except checkpoint_io.PathCheckError:
+            raise TaskStateError("任务运行目录无法安全解析或检查，请稍后重试。") from None
         return path
 
     def _validate(self, value: dict) -> None:
@@ -751,6 +793,14 @@ class ReviewTask:
                 or not isinstance(rules.get("text"), str) or not rules["text"].strip()
                 or not isinstance(rules.get("updated_at"), str) or not rules["updated_at"].strip()):
             raise TaskStateError("任务 AI 复核规则损坏。")
+        configured = value.get("stage_rules", {})
+        if not isinstance(configured, dict) or any(stage not in stage_rules.RULE_STAGES for stage in configured):
+            raise TaskStateError("任务阶段规则损坏。")
+        try:
+            for stage, config in configured.items():
+                stage_rules.validate_stage_rules(stage, config)
+        except (TypeError, ValueError):
+            raise TaskStateError("任务阶段规则损坏。") from None
         source_paths = set()
         for record in value["source_inventory"]:
             if (not isinstance(record, dict) or not isinstance(record.get("path"), str)
@@ -863,7 +913,7 @@ class ReviewTask:
         checked = {**value, "stages": {**value["stages"], "report": _stage_template()}}
         self._validate(checked)
 
-    def _load(self, *, review_only: bool = False) -> dict:
+    def _load(self, *, review_only: bool = False, preserve_selection: bool = False) -> dict:
         value = _read_json(self.path / _MANIFEST)
         # Tasks created before the independent stage-redo feature predate the
         # per-stage counter.  Normalize that additive field in memory so old
@@ -874,7 +924,10 @@ class ReviewTask:
                     info["redo_count"] = 0
                 if isinstance(info, dict) and "reset_pending" not in info:
                     info["reset_pending"] = False
-        self._upgrade_pending_selection(value)
+        if preserve_selection or self._preserve_selection:
+            self._stored_selection_defaults(value)
+        else:
+            self._upgrade_pending_selection(value)
         self._validate_review(value) if review_only or self._review_only else self._validate(value)
         self._manifest = value
         return value
@@ -912,17 +965,20 @@ class ReviewTask:
     def snapshot(self) -> dict:
         return self.refresh()
 
-    def review_snapshot(self) -> dict:
+    def review_snapshot(self, *, preserve_selection: bool = False) -> dict:
         """Read a versioned first-four-stage snapshot, without writing files.
 
         The token covers selection intent and current input/result identities
         and file versions. It excludes report state, report artifacts and raw
         source files. Callers reading checkpoint bodies must compare this
         token again after those reads; publication can use review_read_lease.
+        Delivery passes preserve_selection to read the stored confirmed lists
+        without migrating AI recommendations or revoking their confirmation.
         """
         with self._thread_lock:
             before = _file_version(self.path / _MANIFEST)
-            value = self._load(review_only=True)
+            preserve_selection = preserve_selection or self._preserve_selection
+            value = self._load(review_only=True, preserve_selection=preserve_selection)
             references = {(stage, value["stages"][stage][field])
                           for stage in REVIEW_STAGES
                           for field in ("input_file", "result_file", "result_input_file")
@@ -942,10 +998,12 @@ class ReviewTask:
                 except TaskStateError:
                     prompt_version = ("unavailable",)
             descriptor = {
+                "selection_policy": "persisted" if preserve_selection else "projected",
                 "task_id": value["task_id"], "scope": value["scope_signature"],
                 "name": value["name"], "created_at": value["created_at"],
                 "baseline_ids": value["baseline_ids"], "baseline_file": value["import_baseline_file"],
                 "review_rules": value.get("review_rules"),
+                "stage_rules": value.get("stage_rules", {}),
                 "stages": {stage: stage_selection_version(value["stages"][stage]) for stage in REVIEW_STAGES},
                 "invalidations": {stage: value["stages"][stage].get("invalidated_by") for stage in REVIEW_STAGES},
                 "files": versions, "runtime": runtime, "prompt": prompt_reference,
@@ -957,7 +1015,8 @@ class ReviewTask:
                     "snapshot_token": hashlib.sha256(_encoded(descriptor)).hexdigest()}
 
     @contextmanager
-    def review_read_lease(self, *, expected_snapshot: str | None = None) -> Iterator[dict]:
+    def review_read_lease(self, *, expected_snapshot: str | None = None,
+                          preserve_selection: bool = False) -> Iterator[dict]:
         """Guard a read/publication against concurrent task selection edits.
 
         This shares the writer's OS lease but never commits a manifest. Only
@@ -968,7 +1027,7 @@ class ReviewTask:
             if lease is None:
                 raise TaskStateError("任务正在更新，请刷新后重新导出。")
             try:
-                snapshot = self.review_snapshot()
+                snapshot = self.review_snapshot(preserve_selection=preserve_selection)
                 if expected_snapshot is not None and snapshot["snapshot_token"] != expected_snapshot:
                     raise TaskStateError("审核名单或结果已变化，请刷新预览后重新导出。")
                 yield snapshot
@@ -988,6 +1047,45 @@ class ReviewTask:
                 return review_rules.default_review_rules()
             except (OSError, UnicodeError, ValueError):
                 raise TaskStateError("默认 AI 复核规则不可读取，请检查项目提示词文件。") from None
+
+    def get_stage_rules(self, stage: str) -> dict:
+        """Read normalized local parameters, without executing the stage."""
+        try:
+            default = stage_rules.default_stage_rules(stage)
+        except (TypeError, ValueError):
+            raise TaskStateError("此步骤没有可编辑的阶段参数。") from None
+        with self._thread_lock:
+            saved = self._load().get("stage_rules", {}).get(stage, default)
+            return stage_rules.validate_stage_rules(stage, saved)
+
+    def set_stage_rules(self, stage: str, rules: dict | None) -> None:
+        """Commit one effective rule change and stale its existing conclusions.
+
+        All results, inputs and manual choices remain available for audit.
+        Equivalent saves (including a default restore) never undo confirmation.
+        """
+        try:
+            default = stage_rules.default_stage_rules(stage)
+            normalized = default if rules is None else stage_rules.validate_stage_rules(stage, rules)
+        except (TypeError, ValueError) as error:
+            raise TaskStateError(str(error)) from None
+        with self._edit() as value:
+            self._no_running(value)
+            configured = value.get("stage_rules", {})
+            previous = stage_rules.validate_stage_rules(stage, configured.get(stage, default))
+            if previous == normalized:
+                return
+            configured = copy.deepcopy(configured)
+            if normalized == default:
+                configured.pop(stage, None)
+            else:
+                configured[stage] = normalized
+            value["stage_rules"] = configured
+            for affected in STAGES[STAGES.index(stage):]:
+                info = value["stages"][affected]
+                info.update(confirmed=False, confirmed_revision=None, confirmed_at=None)
+                if info["attempt"] or info["result_file"] is not None or info["status"] != "pending":
+                    info.update(status="stale", invalidated_by=f"stage_rules:{stage}")
 
     def set_review_rules(self, rules: str | None) -> None:
         """Atomically change rules and invalidate only AI/report conclusions.
@@ -1187,9 +1285,11 @@ class ReviewTask:
                 raise TaskStateError("阶段运行目录名称不符合清理白名单；为避免误删，已拒绝重做。")
             _task_location(candidate)
             try:
-                candidate.resolve().relative_to(self.path.resolve())
-            except (OSError, ValueError, RuntimeError):
+                checkpoint_io.confined_path(candidate, self.path)
+            except checkpoint_io.PathBoundaryError:
                 raise TaskStateError("重做清理目录不能指向任务目录外部。") from None
+            except checkpoint_io.PathCheckError:
+                raise TaskStateError("重做清理目录无法安全解析或检查，未清理；请稍后重试。") from None
             if candidate.exists():
                 for _file in _walk_ordinary(candidate):
                     pass
@@ -1437,7 +1537,11 @@ class ReviewTask:
                 base = {job_id(job): job for job in self._input_jobs(value, stage, required=True)}
             order = expected if expected is not None else list(output_by_id)
             merged = [_merge_job(base.get(key, {}), output_by_id[key]) for key in order]
-            if stage in {"import", "report"}:
+            if stage == "import":
+                recommended = [key for key in order
+                               if type(output_by_id[key].get("import_rule_keep")) is not bool
+                               or output_by_id[key]["import_rule_keep"]]
+            elif stage == "report":
                 recommended = list(order)
             elif stage == "shortlist":
                 recommended = [key for key in order if output_by_id[key].get("list_pass") is True]
@@ -1566,10 +1670,13 @@ class ReviewTask:
                 info["manual_choices"].update({key: keep for key in job_ids})
             self._selection_changed(value, stage, before, manual_before)
 
-    def apply_recommendations(self, stage: str) -> None:
+    def apply_recommendations(self, stage: str, *, expected_stage: dict | None = None) -> None:
         stage = self._stage(stage)
+        expected_version = stage_selection_version(expected_stage) if expected_stage is not None else None
         with self._edit() as value:
             info = self._editable(value, stage)
+            if expected_version is not None and stage_selection_version(info) != expected_version:
+                raise TaskStateError("审核名单或结果已被其他窗口修改，请刷新并重新审核后重试。")
             before = (list(info["keep_ids"]), list(info["excluded_ids"]), list(info["pending_ids"]))
             manual_before = dict(info["manual_choices"])
             info["manual_choices"] = {}

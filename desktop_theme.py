@@ -110,6 +110,12 @@ def configure_styles(root: tk.Tk, palette: Mapping[str, str] | None = None) -> N
     style.configure("Danger.TButton", foreground=p["red"])
     style.map("Danger.TButton", foreground=[("disabled", p["disabled_text"]), ("!disabled", p["red"])])
     style.configure("Small.TButton", padding=(9, 5), font=("Microsoft YaHei UI", 9))
+    # Current workspaces use one density. Keep legacy style names untouched.
+    style.configure("Workspace.TButton", padding=(6, 3), font=("Microsoft YaHei UI", 9))
+    style.configure("Workspace.Primary.TButton", padding=(10, 5), font=("Microsoft YaHei UI", 9, "bold"))
+    style.configure("Workspace.TEntry", padding=4, font=("Microsoft YaHei UI", 9))
+    style.configure("Workspace.TCombobox", padding=3, font=("Microsoft YaHei UI", 9))
+    style.configure("Workspace.TSpinbox", padding=3, font=("Microsoft YaHei UI", 9))
     style.configure("Theme.TButton", background=p["accent_soft"], foreground=p["accent"],
                     padding=(10, 7), font=("Microsoft YaHei UI", 9, "bold"))
     style.map("Theme.TButton", foreground=[("disabled", p["disabled_text"]), ("!disabled", p["accent"])])
