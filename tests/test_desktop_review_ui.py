@@ -905,17 +905,17 @@ class ReviewTkTests(unittest.TestCase):
         self.assertEqual(self.browser.call_args.kwargs["browser_mode"], "dual")
         self.assertEqual(self.calls, [])
 
-    def test_stage_descriptions_replace_static_rule_views(self):
+    def test_idle_stages_hide_static_guidance_and_keep_rule_controls(self):
         app = self.app
         self.assertFalse(app.settings_frame.winfo_manager())
         self.assertFalse(hasattr(app, "rules_button"))
         detail_tabs = [app.detail_notebook.tab(tab_id, "text") for tab_id in app.detail_notebook.tabs()]
         self.assertNotIn("当前规则", detail_tabs)
         self.assertNotIn("完整规则", detail_tabs)
-        for stage in ("shortlist", "fetch-jd", "llm"):
+        for stage in ui.REVIEW_STAGES:
             app._select_stage(stage)
-            self.assertEqual(app.stage_description.get(), ui.STAGE_DESCRIPTIONS[stage])
-            self.assertNotIn("当前规则：", app.stage_description.get())
+            self.assertFalse(app.notice_label.winfo_manager())
+            self.assertFalse(app.description_label.winfo_manager())
             self.assertNotIn("当前执行规则：", app.detail_text.get("1.0", "end-1c"))
             self.assertNotIn(ui.default_review_rules(), app.detail_text.get("1.0", "end-1c"))
             self.assertEqual(bool(app.jd_settings_frame.winfo_manager()), stage == "fetch-jd")
@@ -924,7 +924,7 @@ class ReviewTkTests(unittest.TestCase):
         self.assertEqual(app.edit_rules_button.cget("text"), "修改本步规则")
         self.assertTrue(app.edit_rules_button.winfo_manager())
         self.assertIn("每页滚动3次", app.jd_mode_label.cget("text"))
-        self.assertIn("仅补正文不筛选", app.jd_mode_label.cget("text"))
+        self.assertIn("每页等待", app.jd_mode_label.cget("text"))
         self.assertIn("AI 并发（每岗独立）", [str(widget.cget("text"))
                                          for widget in app.llm_settings_frame.winfo_children()
                                          if isinstance(widget, ui.ttk.Label)])

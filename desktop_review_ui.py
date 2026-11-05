@@ -54,7 +54,7 @@ from review_cache import REVIEW_CACHE_VERSION, matching_reviews, review_input_si
 from stage_rules import default_stage_rules, stage_rule_fields, validate_stage_rules
 from screening_policy import (
     AI_DEFAULT_MODEL, AI_DEFAULT_REASONING_EFFORT, AI_DEFAULT_WORKERS,
-    JD_DEFAULT_WORKERS, JD_SCROLL_COUNT, LIST_QUEUE_LABELS, MAX_WORKERS,
+    JD_DEFAULT_WORKERS, LIST_QUEUE_LABELS, MAX_WORKERS,
     AI_STAGE_RESULT_FIELDS,
 )
 
@@ -82,13 +82,6 @@ STATUS_LABELS = {
     "pending": "尚未运行", "running": "正在运行", "completed": "完成 · 等待确认",
     "paused": "已暂停，可继续", "stopped": "已停止，可继续", "waiting": "等待人工处理",
     "failed": "运行失败，可重试", "stale": "上游已修改 · 待更新",
-}
-STAGE_DESCRIPTIONS = {
-    "import": "从唯一绑定的 raw/current 与 raw/target 导入、去重、抽样，保留全部检索来源。",
-    "shortlist": "列表方向队列不等于最终可投；当前规则摘要说明建议保留范围，人工确认后才补 JD。",
-    "fetch-jd": "只为上一步确认的岗位补抓 JD；复用本任务检查点，登录或安全验证时停住。",
-    "llm": "只复核已确认名单；AI明确判断符合才建议保留、明确不符合才建议剔除。失败、未运行、JD不完整或信息不足均进入待核实，不自动归入保留或剔除。模型设置仅作用于本项目。",
-    "report": "生成全部导入岗位的追踪报告；人工确认剔除项明确排除出可投池。完成后可点击“打开报告”查看 Markdown，无需先确认报告完成。",
 }
 REVIEW_STAGES = STAGES[:-1]
 MAX_LOG_CHARS = 250_000
@@ -1125,7 +1118,7 @@ class ReviewDesktopApp:
         self.colors = palette_for(self.theme.get())
         self.theme_button_text = StringVar(root, "夜间模式")
         self.workspace = StringVar(root, "review")
-        self.workspace_description = StringVar(root, "四步审核并确认最终保留；投递数据在 03 显式导出。")
+        self.workspace_description = StringVar(root)
         self.source_root = StringVar(root, str(getattr(args, "root", None) or p.get("data_root", "")))
         self.task_name = StringVar(root, "架构方向-上海")
         self.task_parent = StringVar(root, str(getattr(args, "task_parent", None) or default_state_root() / "job-result" / "review-tasks"))
@@ -1161,7 +1154,7 @@ class ReviewDesktopApp:
         self.list_queue_filter = StringVar(root, ALL_LIST_QUEUES)
         self.list_queue_hint = StringVar(root, "")
         self.jd_completeness_filter = StringVar(root, "全部正文")
-        self.notice = StringVar(root, "选择包含 raw/current、raw/target 的完整数据根并新建任务，或显式打开已有任务。启动和切换步骤不会执行任务。")
+        self.notice = StringVar(root)
         self.status_text = StringVar(root, "尚未绑定任务")
         self.stage_title = StringVar(root)
         self.stage_description = StringVar(root)
@@ -1179,7 +1172,7 @@ class ReviewDesktopApp:
         self._comboboxes: list[ttk.Combobox] = []
         self._setting_controls: list[tuple[Any, str]] = []
 
-        root.title("BOSS 岗位工作台 · 采集 / 后处理 / 投递导出")
+        root.title("BOSS 岗位工作台")
         width = min(1380, max(1024, root.winfo_screenwidth() - 100))
         height = min(900, max(700, root.winfo_screenheight() - 110))
         root.geometry(f"{width}x{height}")
@@ -1222,7 +1215,9 @@ class ReviewDesktopApp:
         header.grid(row=0, column=0, sticky="ew")
         header.columnconfigure(0, weight=1)
         ttk.Label(header, text="BOSS 岗位工作台", style="Review.Title.TLabel").grid(row=0, column=0, sticky="w")
-        ttk.Label(header, textvariable=self.workspace_description, style="Muted.TLabel").grid(row=1, column=0, sticky="w")
+        self.workspace_description_label = ttk.Label(header, textvariable=self.workspace_description, style="Muted.TLabel")
+        self.workspace_description_label.grid(row=1, column=0, sticky="w")
+        self.workspace_description_label.grid_remove()
         actions = ttk.Frame(header)
         actions.grid(row=0, column=1, rowspan=2, sticky="e")
         self.collector_button = ttk.Button(actions, text="01  岗位采集", style="Workspace.TButton", command=self._open_collector)
@@ -1261,7 +1256,6 @@ class ReviewDesktopApp:
         self.sample_mode_box.bind("<<ComboboxSelected>>", lambda _event: self._sample_mode_changed(focus=True))
         self.sample_entry = ttk.Entry(quantity, textvariable=self.sample_size, width=9)
         self.sample_entry.pack(side="left", padx=5)
-        ttk.Label(quantity, text="个去重岗位；自定义请输入正整数，创建后范围固定", style="Muted.TLabel").pack(side="left", padx=5)
         ttk.Label(self.setup_frame, text="任务保存位置").grid(row=3, column=0, sticky="w", padx=(0, 10))
         self.parent_entry = ttk.Entry(self.setup_frame, textvariable=self.task_parent)
         self.parent_entry.grid(row=3, column=1, sticky="ew", padx=(0, 8))
@@ -1273,7 +1267,6 @@ class ReviewDesktopApp:
         self.create_button.pack(side="left", padx=(0, 8))
         self.open_button = ttk.Button(setup_actions, text="打开已有任务…", command=self._choose_task)
         self.open_button.pack(side="left")
-        ttk.Label(setup_actions, text="只读原始文件 · 不按日期另找数据 · 不自动开始", style="Muted.TLabel").pack(side="left", padx=15)
         self._setup_controls = [self.source_entry, self.choose_source_button, self.name_entry,
                                 self.sample_mode_box, self.sample_entry, self.parent_entry, self.choose_parent_button,
                                 self.city_box, self.track_box, self.create_button, self.open_button]
@@ -1307,6 +1300,7 @@ class ReviewDesktopApp:
         self.notice_label = tk.Label(self.root, textvariable=self.notice, anchor="w", justify="left",
                                      padx=12, pady=5, wraplength=940, font=("Microsoft YaHei UI", 9))
         self.notice_label.grid(row=3, column=0, sticky="ew", padx=18, pady=(0, 5))
+        self.notice_label.grid_remove()
         self.root.bind("<Configure>", self._resize_notice, add="+")
 
         self.main_pane = ttk.Panedwindow(self.root, orient="vertical")
@@ -1322,13 +1316,9 @@ class ReviewDesktopApp:
         ttk.Label(work_heading, textvariable=self.stage_title, style="Section.TLabel").grid(row=0, column=0, sticky="w")
         self.status_badge = tk.Label(work_heading, textvariable=self.status_text, padx=8, pady=3, font=("Microsoft YaHei UI", 9))
         self.status_badge.grid(row=0, column=1, sticky="e")
-        description = ttk.Frame(work, style="Card.TFrame")
-        description.grid(row=1, column=0, sticky="ew", pady=(3, 3))
-        description.columnconfigure(0, weight=1)
-        self.description_label = ttk.Label(description, textvariable=self.stage_description, style="Hint.TLabel", wraplength=820)
-        self.description_label.grid(row=0, column=0, sticky="ew")
-        self.reset_button = ttk.Button(description, text="重置本阶段", style="Workspace.TButton", command=self._reset_stage)
-        self.reset_button.grid(row=0, column=1, sticky="ne", padx=(8, 0))
+        self.description_label = ttk.Label(work, textvariable=self.stage_description, style="Hint.TLabel", wraplength=820)
+        self.description_label.grid(row=1, column=0, sticky="ew", pady=(3, 3))
+        self.description_label.grid_remove()
         controls = ttk.Frame(work, style="Card.TFrame")
         controls.grid(row=2, column=0, sticky="ew", pady=(0, 3))
         self.run_button = ttk.Button(controls, text="运行本步", style="Workspace.Primary.TButton", command=self._run_stage)
@@ -1342,6 +1332,8 @@ class ReviewDesktopApp:
         self.settings_button.pack(side="right")
         self.refresh_button = ttk.Button(controls, text="刷新", style="Workspace.TButton", command=self._refresh_task)
         self.refresh_button.pack(side="right", padx=5)
+        self.reset_button = ttk.Button(controls, text="重置本阶段", style="Workspace.TButton", command=self._reset_stage)
+        self.reset_button.pack(side="right", padx=5)
         self.edit_rules_button = ttk.Button(controls, text="修改本步规则", style="Workspace.TButton",
                                             command=self._edit_stage_rules)
 
@@ -1366,8 +1358,7 @@ class ReviewDesktopApp:
         self.prepare_browser_button.pack(side="left", padx=(12, 0))
         jd_browser_line = ttk.Frame(self.jd_settings_frame, style="Card.TFrame")
         jd_browser_line.pack(fill="x", pady=(1, 0))
-        self.jd_mode_label = ttk.Label(jd_browser_line,
-                                      text=f"每页滚动{JD_SCROLL_COUNT}次 / 本步仅补正文不筛选", style="Hint.TLabel")
+        self.jd_mode_label = ttk.Label(jd_browser_line, style="Hint.TLabel")
         self.jd_mode_label.pack(side="left", padx=(0, 12))
         self.chrome_status_label = ttk.Label(jd_browser_line, textvariable=self.chrome_status_text, style="Hint.TLabel")
         self.chrome_status_label.pack(side="left", padx=(0, 20))
@@ -1398,7 +1389,6 @@ class ReviewDesktopApp:
         self.batch_spin = ttk.Spinbox(settings_line, textvariable=self.batch_size, from_=1, to=100, width=4,
                                      command=self._remember_execution_settings)
         self.batch_spin.pack(side="left")
-        ttk.Label(settings_line, text="仅用于检查点分组，与页面 / AI 请求并发独立", style="Hint.TLabel").pack(side="left", padx=(12, 0))
         ttk.Label(self.settings_frame, text="上游采集工具", style="Hint.TLabel").grid(row=1, column=0, sticky="w", padx=(0, 8))
         self.scraper_entry = ttk.Entry(self.settings_frame, textvariable=self.scraper_root)
         self.scraper_entry.grid(row=1, column=1, sticky="ew")
@@ -1414,8 +1404,6 @@ class ReviewDesktopApp:
         ttk.Label(browser_line, text="Edge CDP 端口", style="Hint.TLabel").pack(side="left", padx=(0, 4))
         self.edge_port_entry = ttk.Entry(browser_line, textvariable=self.edge_port, width=7)
         self.edge_port_entry.pack(side="left", padx=(0, 10))
-        self.browser_status_hint = ttk.Label(browser_line, text="端口仅用于连接已准备的 CDP；不会读取 Cookie", style="Hint.TLabel")
-        self.browser_status_hint.pack(side="left", padx=(4, 0))
 
         profile_line = ttk.Frame(self.settings_frame, style="Card.TFrame")
         profile_line.grid(row=3, column=0, columnspan=3, sticky="ew", pady=(4, 0))
@@ -1560,7 +1548,7 @@ class ReviewDesktopApp:
         log_panel.rowconfigure(1, weight=1)
         log_tools = ttk.Frame(log_panel, style="Card.TFrame")
         log_tools.grid(row=0, column=0, sticky="ew", pady=(0, 3))
-        ttk.Label(log_tools, text="真实运行日志", style="Section.TLabel").pack(side="left")
+        ttk.Label(log_tools, text="运行日志", style="Section.TLabel").pack(side="left")
         self.log_button = ttk.Button(log_tools, text="日志文件", style="Workspace.TButton", command=lambda: self._open_location("log"))
         self.log_button.pack(side="right", padx=(4, 0))
         self.markdown_button = ttk.Button(log_tools, text="报告 Markdown", style="Workspace.TButton", command=lambda: self._open_location("markdown"))
@@ -1598,26 +1586,31 @@ class ReviewDesktopApp:
     def _apply_workspace_visibility(self) -> None:
         workspace = self.workspace.get()
         collecting, delivering = workspace == "collection", workspace == "delivery"
+        workspace_message = ""
         if collecting or delivering:
-            for widget in (self.setup_frame, self.binding_frame, self.stage_navigation,
-                           self.notice_label, self.main_pane):
+            for widget in (self.setup_frame, self.binding_frame, self.stage_navigation, self.main_pane):
                 widget.grid_remove()
             if collecting:
                 self.delivery_page.grid_remove()
                 self.collection_page.grid(row=1, column=0, rowspan=4, sticky="nsew", padx=18, pady=(4, 12))
-                self.workspace_description.set("其他页面正在处理，采集暂不可启动；可切回查看进度。" if self._busy or self._delivery_busy else
-                                               "只采集原始列表；完成后由你决定是否新建后处理任务。")
+                if self._busy or self._delivery_busy:
+                    workspace_message = "其他页面正在处理，采集暂不可启动。"
             else:
                 self.collection_page.grid_remove()
                 self.delivery_page.grid(row=1, column=0, rowspan=4, sticky="nsew", padx=18, pady=(4, 12))
-                self.workspace_description.set("导出最终确认保留的岗位；预览、切换与打开任务均不自动发布文件。")
         else:
             self.collection_page.grid_remove()
             self.delivery_page.grid_remove()
-            for widget in (self.stage_navigation, self.notice_label, self.main_pane):
+            for widget in (self.stage_navigation, self.main_pane):
                 widget.grid()
-            self.workspace_description.set("其他页面正在处理，后处理暂不可启动；可切回查看进度。" if self._collection_busy or self._delivery_busy else
-                                           "四步审核并确认最终保留；投递数据在 03 显式导出。")
+            if self._collection_busy or self._delivery_busy:
+                workspace_message = "其他页面正在处理，审核暂不可启动。"
+        self.workspace_description.set(workspace_message)
+        if workspace_message:
+            self.workspace_description_label.grid()
+        else:
+            self.workspace_description_label.grid_remove()
+        self._paint_notice()
         self.collector_button.configure(style="Theme.TButton" if collecting else "Workspace.TButton")
         self.review_button.configure(style="Theme.TButton" if workspace == "review" else "Workspace.TButton")
         self.delivery_button.configure(style="Theme.TButton" if delivering else "Workspace.TButton")
@@ -1861,15 +1854,11 @@ class ReviewDesktopApp:
         api_key_entry = ttk.Entry(body, textvariable=api_key, show="•", width=48)
         api_key_entry.grid(row=6, column=1, columnspan=2, sticky="ew", pady=5)
         ttk.Label(
-            body, text="留空会保留现有密钥；输入新密钥将覆盖。已保存密钥不会被读取或回显。",
+            body, text="留空保留现有密钥。新密钥保存到 Windows 凭据管理器。",
             style="Hint.TLabel", wraplength=480, justify="left",
         ).grid(row=7, column=1, columnspan=2, sticky="w", pady=(0, 7))
         ttk.Label(
-            body, text="配置仅保存在本机，API Key 使用 Windows Credential Manager。保存后用于后续 AI 复核。",
-            style="Hint.TLabel", wraplength=480, justify="left",
-        ).grid(row=8, column=0, columnspan=3, sticky="w", pady=(4, 7))
-        ttk.Label(
-            body, text="连接与强度验证各发送一次短请求，可能产生少量 API 用量。验证成功仅表示服务接受参数并完整返回，不能证明内部思考预算。读取模型只查询列表。",
+            body, text="测试连接和验证思考强度会发送 API 请求，可能产生费用。",
             style="Hint.TLabel", wraplength=540, justify="left",
         ).grid(row=9, column=0, columnspan=3, sticky="w", pady=(0, 7))
         ttk.Label(body, textvariable=status, style="Warning.TLabel", wraplength=480, justify="left").grid(
@@ -2169,7 +2158,7 @@ class ReviewDesktopApp:
                     return
 
         self._refresh_model_config_label()
-        self.notice.set("模型配置已保存；后续 AI 语义复核将使用新配置，历史报告不会自动重写。")
+        self._notify("模型配置已保存，后续 AI 语义复核将使用新配置。")
         self._close_model_configuration(dialog)
 
     def _browser_mode_value(self) -> str:
@@ -2309,8 +2298,12 @@ class ReviewDesktopApp:
         self._set_theme("light" if self.theme.get() == "dark" else "dark")
 
     def _paint_notice(self) -> None:
+        if self.workspace.get() != "review" or not self.notice.get():
+            self.notice_label.grid_remove()
+            return
         role = "amber" if self._notice_kind == "warning" else "accent"
         self.notice_label.configure(background=self.colors[f"{role}_soft"], foreground=self.colors[role])
+        self.notice_label.grid()
 
     def _paint_badge(self) -> None:
         info = self._stage_info()
@@ -2359,7 +2352,7 @@ class ReviewDesktopApp:
         body.rowconfigure(2, weight=1)
         heading = ttk.Label(body, text=f"修改{STAGE_LABELS[stage]}的参数、词表与开关", style="Section.TLabel")
         heading.grid(row=0, column=0, sticky="w")
-        explanation = ttk.Label(body, text="只保存到当前任务。保存不会运行本步；修改已完成步骤的规则会使本步及后续结果失效，需手动运行并重新确认。词表可每行一词，或用逗号、分号分隔；空词表表示不添加限制。",
+        explanation = ttk.Label(body, text="修改规则后，已完成的本步及后续结果需重新运行并确认。词表可每行一词，或用逗号、分号分隔。",
                                 style="Hint.TLabel", justify="left", wraplength=width - 60)
         explanation.grid(row=1, column=0, sticky="ew", pady=(6, 10))
         area = ttk.Frame(body)
@@ -2556,8 +2549,7 @@ class ReviewDesktopApp:
         body.rowconfigure(2, weight=1)
         ttk.Label(body, text="修改 AI 对岗位工作内容的判断规则", style="Section.TLabel").grid(
             row=0, column=0, sticky="w")
-        explanation = ttk.Label(body, text=("只保存到当前任务。保存不会请求模型；规则变化会使本步及后续结果失效，需手动运行并重新确认。"
-                                           "AI 接收完整职位职责与任职要求，只返回判断和理由。恢复默认只修改草稿，保存后才生效。"),
+        explanation = ttk.Label(body, text="修改规则后，需重新运行 AI 复核并确认名单。",
                                 style="Hint.TLabel", wraplength=width - 60, justify="left")
         explanation.grid(row=1, column=0, sticky="ew", pady=(6, 10))
         area = ttk.Frame(body)
@@ -2790,8 +2782,12 @@ class ReviewDesktopApp:
             self._enabled(button, not self._busy and not self._closing and not locked)
         self.stage_title.set(f"{STAGES.index(key) + 1}. {STAGE_LABELS[key]}")
         issues = info.get("issues") or []
-        self.stage_description.set(STAGE_DESCRIPTIONS[key] + ("\n注意：" + _safe(issues[0]) if issues else ""))
-        self.description_label.configure(foreground=self.colors["amber"] if issues else self.colors["muted"])
+        self.stage_description.set("注意：" + _safe(issues[0]) if issues else "")
+        if issues:
+            self.description_label.configure(foreground=self.colors["amber"])
+            self.description_label.grid()
+        else:
+            self.description_label.grid_remove()
         if key in REVIEW_STAGES:
             self.edit_rules_button.pack(side="right", padx=5)
         else:
@@ -2832,7 +2828,7 @@ class ReviewDesktopApp:
         jd_rules = self._saved_stage_rules.get("fetch-jd", default_stage_rules("fetch-jd"))
         self.jd_mode_label.configure(text=(
             f"每页滚动{jd_rules['scroll_count']}次 / {jd_rules['detail_speed_profile']} / "
-            f"每页等待 {jd_rules.get('page_wait_min', 0)}–{jd_rules.get('page_wait_max', 0)} 秒 / 本步仅补正文不筛选"
+            f"每页等待 {jd_rules.get('page_wait_min', 0)}–{jd_rules.get('page_wait_max', 0)} 秒"
         ))
         progress = info.get("progress") or {}
         done, total = progress.get("done"), progress.get("total")
@@ -3097,7 +3093,7 @@ class ReviewDesktopApp:
             evidence = "输入预览：尚未运行列表初筛，没有本步方向队列。\n\n" + _evidence_text(job, stage="input")
         else:
             detail_job = report_decision(job) if job and self.stage.get() == "report" else job
-            evidence = _evidence_text(detail_job, stage=self.stage.get()) if job else "依据、风险与人工审计将在这里显示。"
+            evidence = _evidence_text(detail_job, stage=self.stage.get()) if job else ""
         if job and self.stage.get() in REVIEW_STAGES and self.stage.get() not in self._previews:
             info = self._stage_info()
             identity = job_id(job)
@@ -3107,7 +3103,7 @@ class ReviewDesktopApp:
                          "保留" if self._kept(job) else "剔除")
             origin = "人工决定" if type(manual) is bool else "尚未人工处理" if selection == pending_label else "本步建议"
             confirmation = "已确认" if info.get("confirmed") else "待确认"
-            evidence = f"当前名单：{selection} · {origin} · {confirmation}\n人工决定只改变本任务名单；原始数据、建议与技术状态保留。\n\n" + evidence
+            evidence = f"当前名单：{selection} · {origin} · {confirmation}\n\n" + evidence
         if job and self.stage.get() == "report":
             evidence = self._row_reason(job) + "\n\n" + evidence
         self._replace_text(self.detail_text, evidence)
@@ -3210,7 +3206,7 @@ class ReviewDesktopApp:
         elif stage == "report" and _report_ready(self.manifest) and "markdown" in self._artifacts:
             notice = "报告已生成，可点击下方“打开报告”查看 Markdown；查看不改变确认状态，也不会重新执行处理。"
         else:
-            notice = f"正在查看「{STAGE_LABELS[stage]}」。尚未自动执行；点击运行本步才开始。"
+            notice = ""
         self._notify(notice, warning=stale)
         self._render()
 

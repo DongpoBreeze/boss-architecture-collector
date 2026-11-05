@@ -115,7 +115,6 @@ class WorkspaceMixin:
         header.grid(row=0, column=0, sticky="ew", pady=(0, 12))
         header.columnconfigure(0, weight=1)
         ttk.Label(header, text="BOSS 岗位工作台", style="Title.TLabel").grid(row=0, column=0, sticky="w")
-        ttk.Label(header, text="采集 · 整理 · 语义复核 · 证据追溯", style="Muted.TLabel").grid(row=1, column=0, sticky="w", pady=(3, 0))
         self.status_badge = self._theme_widget(tk.Label(header, textvariable=self.status_text, padx=14, pady=9, anchor="e", justify="right", wraplength=420, font=("Microsoft YaHei UI", 10, "bold")), background="accent_soft", foreground="accent")
         self.status_badge.grid(row=0, column=1, rowspan=2, sticky="e")
         self.theme_button = ttk.Button(header, textvariable=self.theme_button_text, style="Theme.TButton", command=self._toggle_theme)
@@ -150,7 +149,6 @@ class WorkspaceMixin:
         footer.grid(row=3, column=0, sticky="ew", pady=(9, 0))
         footer.columnconfigure(0, weight=1)
         ttk.Label(footer, textvariable=self.output_directory, style="Muted.TLabel", wraplength=1060).grid(row=0, column=0, sticky="w")
-        ttk.Label(footer, text="只采集与分析 · 不自动投递", style="Muted.TLabel").grid(row=0, column=1, sticky="e", padx=(12, 0))
         self.stage.trace_add("write", lambda *_: self._update_stage_hint())
         self.result_search.trace_add("write", lambda *_: self._debounce_filters())
         for variable in (self.result_class, self.result_city, self.result_jd, self.result_model):
@@ -277,7 +275,6 @@ class WorkspaceMixin:
         line.pack(fill="x", pady=(0, 10))
         self._register_setting(ttk.Entry(line, textvariable=self.data_root, width=18)).pack(side="left", fill="x", expand=True)
         self._register_setting(ttk.Button(line, text="选择", style="Small.TButton", command=self._choose_root)).pack(side="right", padx=(6, 0))
-        ttk.Label(source, text="只选这里一次，程序自动识别 raw、JD、模型结果", style="Hint.TLabel", wraplength=300).pack(anchor="w", pady=(0, 10))
         row = ttk.Frame(source, style="Card.TFrame")
         row.pack(fill="x")
         for column, title, variable, values in ((0, "城市", self.city, cities), (1, "岗位轨道", self.track, tracks)):
@@ -305,7 +302,6 @@ class WorkspaceMixin:
         self.history_values = choices
         self.history_box = self._register_setting(ttk.Combobox(task, textvariable=self.resume_run, values=choices, state="readonly", width=25), "readonly")
         self.history_box.pack(fill="x")
-        ttk.Label(task, text="推荐自动选择：按本次范围识别已有列表、JD 与模型结果。新建运行或指定历史目录是高级选项。", style="Hint.TLabel", wraplength=300).pack(anchor="w", pady=(7, 7))
         routing = ttk.Frame(task, style="Card.TFrame")
         routing.pack(fill="x")
         routing.columnconfigure(0, weight=1)

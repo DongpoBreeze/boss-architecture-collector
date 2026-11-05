@@ -156,7 +156,7 @@ def build_collection_preview(config: dict[str, Any], selection: CollectionSelect
                                      "超出本次上限" if combination in checked else "未勾选"))
     return {"config": config, "plan_rows": rows, "all_checked": checked,
             "execution_specs": execute, "estimate": len(execute), "selected_count": len(chosen),
-            "full": len(visible), "editor_values": plans.plan_editor_values(config)}
+            "full": len(visible)}
 
 
 def _reparse(path: Path) -> bool:
@@ -734,18 +734,16 @@ class CollectionPage(ttk.Frame):
         self.page_wait_max = _PageStringVar(self, f"{collector.DEFAULT_PAGE_WAIT_MAX:g}")
         self.browser_workers = _PageStringVar(self, str(DEFAULT_BROWSER_WORKERS))
         self.config_text = _PageStringVar(self, f"方案：{self.config_path}")
-        self.scope_help = _PageStringVar(self, "检索分组是两套关键词与经验配置，不是岗位最终分层；正在读取当前方案的实际范围。")
         self.plan_search = _PageStringVar(self, "")
-        self.plan_detail = _PageStringVar(self, "点击勾选列或选中后按空格；下表是检索计划，不是已采集的岗位。")
-        self.estimate_text = _PageStringVar(self, "预计组合：正在只读计算（不代表已完成进度）…")
-        self.status_text = _PageStringVar(self, "待开始；打开本页不会启动浏览器、联网或执行后处理。")
-        self.progress_text = _PageStringVar(self, "落盘进度：未知；尚未读取采集清单。")
+        self.estimate_text = _PageStringVar(self, "正在加载检索计划…")
+        self.status_text = _PageStringVar(self, "待开始")
+        self.progress_text = _PageStringVar(self, "正在读取采集进度…")
         self.stats_text = _PageStringVar(self, "成功 —　无数据 —　失败 —　暂停 —　原始条目（可重复）—")
         self.position_text = _PageStringVar(self, "当前组合 / 页：未运行")
         self._variables = (self.collection_root, self.scraper_root, self.city, self.track, self.track_label, self.limit, self.pages, self.browser_mode,
                            self.page_wait_min, self.page_wait_max, self.browser_workers,
                            self.config_text, self.estimate_text, self.status_text, self.progress_text,
-                           self.stats_text, self.position_text, self.scope_help, self.plan_search, self.plan_detail)
+                           self.stats_text, self.position_text, self.plan_search)
         self._snapshot: dict[str, Any] | None = None
         self._build_ui()
         self.apply_theme(self.palette)
@@ -788,9 +786,6 @@ class CollectionPage(ttk.Frame):
         self.content.rowconfigure(4, weight=1, minsize=165)
         self.canvas.bind("<Configure>", self._resize_content, add="+")
         self.content.bind("<Configure>", self._resize_content, add="+")
-        ttk.Label(self.content,
-                  text="独立采集原始岗位列表；不会自动筛选、补 JD、调用模型或生成报告。登录 / 安全验证须在各侧专用浏览器中人工完成。",
-                  style="Muted.TLabel", wraplength=940).grid(row=0, column=0, sticky="ew", pady=(0, 4))
         settings = ttk.Frame(self.content, style="Card.TFrame", padding=(10, 3))
         settings.grid(row=1, column=0, sticky="ew")
         settings.columnconfigure(1, weight=1)
@@ -825,9 +820,6 @@ class CollectionPage(ttk.Frame):
         ttk.Label(filters, text="每组页数", style="Card.TLabel").pack(side="left")
         self.pages_spin = ttk.Spinbox(filters, textvariable=self.pages, from_=1, to=10, width=5, style="Workspace.TSpinbox")
         self.pages_spin.pack(side="left", padx=(6, 5))
-        ttk.Label(filters, text="1–10 页，仅列表", style="Hint.TLabel").pack(side="left")
-        self.scope_help_label = ttk.Label(settings, textvariable=self.scope_help, style="Hint.TLabel", wraplength=900)
-        self.scope_help_label.grid(row=2, column=0, columnspan=3, sticky="ew", pady=(2, 0))
         runtime = ttk.Frame(settings, style="Card.TFrame")
         runtime.grid(row=3, column=0, columnspan=3, sticky="ew", pady=(2, 0))
         ttk.Label(runtime, text="翻页等待（秒）最短", style="Card.TLabel").pack(side="left")
@@ -840,8 +832,6 @@ class CollectionPage(ttk.Frame):
         self.browser_workers_spin = ttk.Spinbox(runtime, textvariable=self.browser_workers, from_=1, to=MAX_BROWSER_WORKERS, width=4,
                                               style="Workspace.TSpinbox")
         self.browser_workers_spin.pack(side="left", padx=(5, 8))
-        self.limit_help_label = ttk.Label(runtime, text="1–8 槽；上限先于分片，完成组跳过", style="Hint.TLabel")
-        self.limit_help_label.pack(side="left")
         plan_actions = ttk.Frame(settings, style="Card.TFrame")
         plan_actions.grid(row=4, column=0, columnspan=3, sticky="ew", pady=(4, 2))
         self.edit_plan_button = ttk.Button(plan_actions, text="编辑检索条件…", style="Workspace.TButton", command=self.open_plan_editor)
@@ -907,7 +897,6 @@ class CollectionPage(ttk.Frame):
         self.plan_search_entry = ttk.Entry(plan_toolbar, textvariable=self.plan_search, width=22, style="Workspace.TEntry")
         bind_search(self.plan_search_entry, self.plan_search)
         self.plan_search_entry.pack(side="left", padx=6)
-        ttk.Label(plan_toolbar, text="勾选后再应用本次上限", style="Muted.TLabel").pack(side="left")
         plan_columns = ("checked", "index", "group", "city", "keyword", "salary", "experience", "degree", "pages", "execution")
         self.plan_table = ttk.Treeview(self.plan_frame, columns=plan_columns, show="headings", height=3, selectmode="extended",
                                      style="Collection.Treeview")
@@ -924,9 +913,6 @@ class CollectionPage(ttk.Frame):
         self.plan_table.configure(yscrollcommand=plan_scroll.set, xscrollcommand=plan_xscroll.set)
         self.plan_table.bind("<Button-1>", self._plan_click, add="+")
         self.plan_table.bind("<space>", self._plan_space, add="+")
-        self.plan_table.bind("<<TreeviewSelect>>", self._plan_selected, add="+")
-        ttk.Label(self.plan_frame, textvariable=self.plan_detail, style="Muted.TLabel", wraplength=930).grid(
-            row=3, column=0, columnspan=2, sticky="ew")
         self.notebook.add(self.plan_frame, text="检索组合预览")
         log_frame = ttk.Frame(self.notebook)
         self.log_frame = log_frame
@@ -1007,8 +993,7 @@ class CollectionPage(ttk.Frame):
             self.canvas.itemconfigure(self._canvas_window, width=width, height=height)
             self.canvas.configure(scrollregion=(0, 0, width, height))
             wrap = max(280, width - 25)
-            for label in (self.status_label, self.progress_label, self.stats_label, self.position_label,
-                          self.estimate_label, self.scope_help_label, self.limit_help_label):
+            for label in (self.status_label, self.progress_label, self.stats_label, self.position_label, self.estimate_label):
                 label.configure(wraplength=wrap)
             if signature != self._layout_signature:
                 self._layout_signature = signature
@@ -1105,8 +1090,8 @@ class CollectionPage(ttk.Frame):
 
     def _inputs_changed(self, *_args: object) -> None:
         self._preview_id += 1
-        self._clear_progress("输入已变化，正在只读刷新；当前来源统计未知。")
-        self.estimate_text.set("检索计划正在只读刷新；不会启动采集。")
+        self._clear_progress("正在刷新采集进度…")
+        self.estimate_text.set("正在更新检索计划…")
         self._schedule_preview(220)
 
     def _schedule_preview(self, milliseconds: int) -> None:
@@ -1161,15 +1146,8 @@ class CollectionPage(ttk.Frame):
         if self._checked_combinations is None:
             self._checked_combinations = set(value["all_checked"])
         self._plan_rows = value["plan_rows"]
-        self.estimate_text.set(f"当前范围 {value['full']} 组 · 已勾选 {value['selected_count']} 组 · 本次执行 {value['estimate']} 组"
-                               "（按配置顺序，规划数不是已完成数）。" + (" 未勾选组合，不能开始采集。" if not value["selected_count"] else ""))
-        editor_values = value["editor_values"]
-        descriptions = []
-        for track in ("current", "target"):
-            selected = set(editor_values[track]["experience_ids"])
-            names = [item["label"] for item in editor_values["experiences"][track] if item["id"] in selected]
-            descriptions.append(f"{TRACK_LABELS[track]}：{len(editor_values[track]['keywords'])} 个关键词，经验 {' / '.join(names) if names else '未启用'}")
-        self.scope_help.set("两套关键词与经验配置，不是岗位最终分层。" + "；".join(descriptions) + "。")
+        self.estimate_text.set(f"范围 {value['full']} 组 · 已选 {value['selected_count']} 组 · 本次计划 {value['estimate']} 组"
+                               + (" · 请至少勾选 1 组" if not value["selected_count"] else ""))
         self._render_plan_rows()
 
     def _render_plan_rows(self) -> None:
@@ -1199,17 +1177,6 @@ class CollectionPage(ttk.Frame):
             self.plan_table.selection_set(selected)
         if old_y:
             self.plan_table.yview_moveto(old_y[0])
-
-    def _plan_selected(self, _event: tk.Event | None = None) -> None:
-        if self._closing:
-            return
-        chosen = self.plan_table.selection()
-        if chosen and chosen[0] in self._plan_row_ids:
-            combination = self._plan_row_ids[chosen[0]]
-            row = next((item for item in self._plan_rows if item["combination"] == combination), None)
-            if row:
-                self.plan_detail.set(redact_log(f"{row['city_label']} · {row['track_label']} · 关键词：{row['keyword']}"
-                                               f" · {row['salary_label']} · {row['experience_label']} · {row['degree_label']} · {row['pages_requested']}页"))
 
     def _plan_click(self, event: tk.Event) -> str | None:
         if self.plan_table.identify_region(event.x, event.y) == "cell" and self.plan_table.identify_column(event.x) == "#1":
@@ -1868,7 +1835,15 @@ class CollectionPage(ttk.Frame):
         self._snapshot = value
         counts, total = value["counts"], value["total"]
         page_total = value["pages_requested"]
-        self.progress_text.set(value["message"] + f" 已记录页 {value['pages_completed']}/{page_total if page_total is not None else '未知'}。")
+        if value["manifest_state"] == "missing":
+            self.progress_text.set("")
+            self.progress_label.grid_remove()
+        else:
+            message = value["message"]
+            if value["manifest_state"] == "ok":
+                message += f" 已记录 {value['pages_completed']}/{page_total if page_total is not None else '未知'} 页。"
+            self.progress_text.set(message)
+            self.progress_label.grid()
         self.stats_text.set(f"成功 {counts['success']}　无数据 {counts['no_data']}　失败 {counts['failed']}　暂停 {counts['paused']}"
                             f"　运行中 {counts['running']}　原始条目（可重复）{value['jobs']}")
         self.progress_bar.configure(maximum=max(1, total or 1), value=value["done"] if total is not None else 0)
@@ -1893,6 +1868,7 @@ class CollectionPage(ttk.Frame):
         """Make an unreadable/new source unknown without retaining old totals."""
         self._snapshot = None
         self.progress_text.set(message)
+        self.progress_label.grid()
         self.stats_text.set("成功 —　无数据 —　失败 —　暂停 —　运行中 —　原始条目（可重复）—")
         self.progress_bar.configure(maximum=1, value=0)
         self.progress_table.delete(*self.progress_table.get_children())
@@ -2106,9 +2082,7 @@ class _CollectionPlanEditor(tk.Toplevel):
         self.rowconfigure(1, weight=1)
         header = ttk.Frame(self, padding=(14, 12, 14, 6))
         header.grid(row=0, column=0, sticky="ew")
-        ttk.Label(header, text="编辑的是新方案草稿，原方案不会被覆盖。", font=("Microsoft YaHei UI", 12, "bold")).pack(anchor="w")
-        ttk.Label(header, text="城市 / 薪资 / 经验从此方案支持的选项中多选；学历固定为本科。关键词每行一个，可增删。",
-                  style="Muted.TLabel", wraplength=860).pack(anchor="w", pady=(4, 0))
+        ttk.Label(header, text="新方案草稿", style="Section.TLabel").pack(anchor="w")
         center = ttk.Frame(self)
         center.grid(row=1, column=0, sticky="nsew", padx=14)
         center.columnconfigure(0, weight=1)
@@ -2143,7 +2117,7 @@ class _CollectionPlanEditor(tk.Toplevel):
             card.grid(row=0, column=column, sticky="nsew", padx=(0, 7) if not column else (0, 0))
             card.columnconfigure(0, weight=1)
             ttk.Label(card, text=TRACK_LABELS[track], style="Section.TLabel").grid(row=0, column=0, columnspan=2, sticky="w")
-            ttk.Label(card, text="关键词（每行一个；空行忽略）", style="Hint.TLabel").grid(row=1, column=0, columnspan=2, sticky="w", pady=(5, 3))
+            ttk.Label(card, text="关键词（每行一个）", style="Hint.TLabel").grid(row=1, column=0, columnspan=2, sticky="w", pady=(5, 3))
             text = tk.Text(card, height=7, width=1, wrap="word", undo=True, relief="flat", borderwidth=0,
                            padx=6, pady=5, font=("Microsoft YaHei UI", 10))
             text.grid(row=2, column=0, sticky="nsew")
@@ -2155,7 +2129,7 @@ class _CollectionPlanEditor(tk.Toplevel):
             text.bind("<<Modified>>", self._keywords_changed, add="+")
             self.keyword_texts[track] = text
             self._edit_controls.append(text)
-            ttk.Label(card, text="经验范围（可多选；分组不是岗位类别）", style="Hint.TLabel").grid(
+            ttk.Label(card, text="经验范围（可多选）", style="Hint.TLabel").grid(
                 row=3, column=0, columnspan=2, sticky="w", pady=(8, 3))
             experience_options = ttk.Frame(card, style="Card.TFrame")
             experience_options.grid(row=4, column=0, columnspan=2, sticky="ew")

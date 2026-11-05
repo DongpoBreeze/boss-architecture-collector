@@ -53,10 +53,8 @@ class ExportFieldDialog(tk.Toplevel):
         body.columnconfigure(0, weight=1)
         body.rowconfigure(3, weight=1)
         ttk.Label(body, text="勾选需要导出的信息", style="Section.TLabel").grid(row=0, column=0, sticky="w")
-        ttk.Label(body, text="字段列表根据当前 02 数据中实际出现的值生成，没有值的字段不会显示。父级复选框可批量选择子字段，文件名取前三个已选字段的中文名称。",
-                  style="Hint.TLabel", wraplength=width - 50).grid(row=1, column=0, sticky="ew", pady=(5, 8))
         toolbar = ttk.Frame(body)
-        toolbar.grid(row=2, column=0, sticky="ew", pady=(0, 8))
+        toolbar.grid(row=2, column=0, sticky="ew", pady=(6, 8))
         toolbar.columnconfigure(1, weight=1)
         ttk.Label(toolbar, text="搜索字段").grid(row=0, column=0, padx=(0, 8))
         self.search_entry = ttk.Entry(toolbar, textvariable=self.search, style="Workspace.TEntry")
@@ -245,12 +243,11 @@ class DeliveryPage(ttk.Frame):
         self.palette = dict(LIGHT_PALETTE)
         self.source_text = StringVar(self, "来源：02 当前任务（尚未绑定）")
         self.output_parent = StringVar(self, "")
-        self.output_hint = StringVar(self, "默认保存到来源任务 / delivery-exports，每次导出保留独立历史。")
-        self.status_text = StringVar(self, "尚未预览；只接受四步均完成且已确认的最终保留名单。")
+        self.status_text = StringVar(self, "尚未预览")
         self.summary_text = StringVar(self, "最终保留 — · 可导出 — · 阻止导出 —")
         self.latest_text = StringVar(self, "尚未导出")
-        self.fields_text = StringVar(self, "预览后仅列出当前 02 数据中实际有值的字段。")
-        self.filename_text = StringVar(self, "文件名由前三个已选且有值字段的中文名称组成。")
+        self.fields_text = StringVar(self, "")
+        self.filename_text = StringVar(self, "")
         self.search = StringVar(self, "")
         self.filter = StringVar(self, "全部")
         self.page_text = StringVar(self, "0 个岗位")
@@ -273,7 +270,6 @@ class DeliveryPage(ttk.Frame):
     def _build_ui(self) -> None:
         self.columnconfigure(0, weight=1)
         self.rowconfigure(4, weight=1)
-        ttk.Label(self, text="投递数据导出", style="Review.Title.TLabel").grid(row=0, column=0, sticky="w")
         source = ttk.Frame(self)
         source.grid(row=1, column=0, sticky="ew", pady=(6, 4))
         source.columnconfigure(0, weight=1)
@@ -332,15 +328,17 @@ class DeliveryPage(ttk.Frame):
         self.choose_parent_button.grid(row=0, column=2, padx=6)
         self.default_parent_button = ttk.Button(output, text="使用默认", style="Workspace.TButton", command=lambda: self.output_parent.set(""))
         self.default_parent_button.grid(row=0, column=3)
-        ttk.Label(output, textvariable=self.output_hint, style="Muted.TLabel", wraplength=1000).grid(row=1, column=0, columnspan=4, sticky="w", pady=4)
+        ttk.Label(output, text="默认位置：任务目录 / delivery-exports", style="Muted.TLabel").grid(
+            row=1, column=1, sticky="w", pady=4)
         fields = ttk.Frame(self)
         fields.grid(row=6, column=0, sticky="ew", pady=(0, 4))
         fields.columnconfigure(1, weight=1)
         self.choose_fields_button = ttk.Button(fields, text="选择导出字段…", style="Workspace.TButton", command=self.choose_fields)
         self.choose_fields_button.grid(row=0, column=0, padx=(0, 8))
         ttk.Label(fields, textvariable=self.fields_text, style="Hint.TLabel", wraplength=700).grid(row=0, column=1, sticky="w")
-        ttk.Label(fields, textvariable=self.filename_text, style="Hint.TLabel", wraplength=1000).grid(
-            row=1, column=0, columnspan=2, sticky="w", pady=(3, 0))
+        self.filename_label = ttk.Label(fields, textvariable=self.filename_text, style="Hint.TLabel", wraplength=1000)
+        self.filename_label.grid(row=1, column=0, columnspan=2, sticky="w", pady=(3, 0))
+        self.filename_label.grid_remove()
         footer = ttk.Frame(self)
         footer.grid(row=7, column=0, sticky="ew", pady=(2, 4))
         self.export_button = ttk.Button(footer, text="导出指定信息", style="Workspace.Primary.TButton", command=self.export)
@@ -377,8 +375,8 @@ class DeliveryPage(ttk.Frame):
             self._render_fields()
             self._page, self._focus = 0, None
             self.summary_text.set("最终保留 — · 可导出 — · 阻止导出 —")
-        self.source_text.set(("来源：手动任务（不影响 02 绑定）\n" if manual else "来源：02 当前任务\n") + (str(path) if path else "尚未绑定任务"))
-        self._invalidate("请刷新预览；四步均须完成且已确认。" if path else "02 尚未绑定任务，也可显式打开其他任务。")
+        self.source_text.set(("来源：其他任务\n" if manual else "来源：02 当前任务\n") + (str(path) if path else "尚未绑定任务"))
+        self._invalidate("请刷新预览。" if path else "请选择导出任务。")
         self._render_rows()
 
     def _invalidate(self, message: str) -> None:
@@ -471,12 +469,14 @@ class DeliveryPage(ttk.Frame):
 
     def _render_fields(self) -> None:
         if self._export_fields:
-            self.fields_text.set(f"当前 02 数据有值字段：已选 {len(self._selected_fields or ())} / {len(self._export_fields)} 项；无值字段不列入选项。")
+            self.fields_text.set(f"已选 {len(self._selected_fields or ())} / {len(self._export_fields)} 项")
             selected_name = delivery_export.field_filename(self._selected_fields) if self._selected_fields else "请先选择字段"
             self.filename_text.set(f"指定信息：{selected_name}  ·  完整 JSON：{delivery_export.field_filename(self._export_fields)}")
+            self.filename_label.grid()
         else:
-            self.fields_text.set("预览后仅列出当前 02 数据中实际有值的字段。")
-            self.filename_text.set("文件名由前三个已选且有值字段的中文名称组成。")
+            self.fields_text.set("")
+            self.filename_text.set("")
+            self.filename_label.grid_remove()
 
     def export(self) -> None:
         if self._selected_fields is None:
@@ -620,7 +620,7 @@ class DeliveryPage(ttk.Frame):
                 self._render_fields()
                 summary = self._preview["summary"]
                 self.summary_text.set(f"最终保留 {summary['selected_count']} · 可导出 {summary['ready_count']} · 阻止导出 {summary['blocked_count']}")
-                self.status_text.set("按已确认的最终保留名单导出；AI 判断与状态仅作记录。")
+                self.status_text.set("预览就绪")
                 self._latest_current = (self._latest_export is not None and self._latest_source == self._source_path
                                         and self._latest_snapshot == self._preview["snapshot_token"])
                 if published:
@@ -691,7 +691,7 @@ class DeliveryPage(ttk.Frame):
         if selection:
             self._focus = selection[0]
         row = self._rows.get(self._focus or "")
-        text = "选择岗位查看导出字段、JD 与阻止原因。"
+        text = "选择岗位查看详情"
         if row:
             text = ("可导出" if row["ready"] else "阻止导出：" + row["reasons"]) + "\n\n" + json.dumps(desktop_data._redact(row["job"]), ensure_ascii=False, indent=2)
         self.detail.configure(state="normal")
